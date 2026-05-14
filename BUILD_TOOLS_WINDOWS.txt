@@ -1,0 +1,11 @@
+Note (AceIt OCR)
+================
+
+AceIt no longer uses EasyOCR, so you do not need Visual Studio Build Tools or MSVC
+(link.exe) just to install Python dependencies for OCR.
+
+If you still see this file from an older setup: follow INSTALL_WINDOWS.txt instead
+(Tesseract installer).
+
+You would only need MSVC Build Tools if some other package in your environment fails to
+build from source — that is unrelated to AceIt's current OCR stack.

@@ -1,0 +1,52 @@
+AceIt on Windows — install Tesseract (OCR)
+==========================================
+
+AceIt uses the Tesseract OCR engine through the Python package "pytesseract". Pip only
+installs the Python wrapper; you must install the Tesseract program once.
+
+1) Download the Windows installer (64-bit) from the UB Mannheim build page:
+   https://github.com/UB-Mannheim/tesseract/wiki
+
+2) Run the installer. Recommended options:
+   - Note the install folder (default: C:\Program Files\Tesseract-OCR\).
+   - Enable "English" language data (usually selected by default).
+
+3) On the installer screen that offers "Add to PATH", enable it if you can. If you skip
+   it, AceIt will still try the default path C:\Program Files\Tesseract-OCR\tesseract.exe.
+
+4) Close and reopen your terminal, then in your project folder:
+
+      python -m pip install -U pip
+      python -m pip install -r requirements.txt
+      python main.py
+
+If OCR fails with "tesseract is not installed": fix the path — either add the Tesseract
+folder to your user PATH or set the environment variable TESSERACT_CMD to the full path
+of tesseract.exe, for example:
+
+      C:\Program Files\Tesseract-OCR\tesseract.exe
+
+
+If pip fails while "Building wheel for python-bidi" (EasyOCR)
+============================================================
+
+That error comes from the **EasyOCR** stack, not from current AceIt. This repo uses
+**pytesseract** + the Tesseract app instead, so pip should not pull in python-bidi.
+
+Do this:
+
+1) Open your project folder and confirm **requirements.txt** lists **pytesseract** (not
+   easyocr). If you still see easyocr, update the file from the repo / latest copy.
+
+2) Remove EasyOCR and its chain if they were installed earlier:
+
+      python -m pip uninstall -y easyocr
+      python -m pip install -r requirements.txt
+
+3) Run a quick check (from the project folder):
+
+      python verify_env.py
+
+You do **not** need Visual Studio Build Tools for AceIt's OCR with the current
+requirements. See BUILD_TOOLS_WINDOWS.txt for the rare case where some other package
+still builds from source.
