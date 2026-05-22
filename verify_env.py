@@ -17,7 +17,7 @@ def main() -> None:
         ("Pillow", "PIL"),
         ("pytesseract", "pytesseract"),
         ("python-dotenv", "dotenv"),
-        ("google-genai", "google.genai"),
+        ("google-generativeai", "google.generativeai"),
         ("keyboard", "keyboard"),
     ):
         try:
