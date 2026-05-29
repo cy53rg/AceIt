@@ -1,9 +1,7 @@
-# AceIt dependencies (Windows). OCR uses Tesseract via pytesseract — no EasyOCR / python-bidi.
+﻿# AceIt dependencies (Windows)
 #
 # One-time: install Tesseract for Windows (see INSTALL_WINDOWS.txt), then:
 #   python -m pip install -r requirements.txt
-#
-# Legacy Gemini SDK (stable for older model ids). If you had google-genai: pip uninstall -y google-genai
 #
 pyautogui>=0.9.54
 Pillow>=10.0.0
@@ -11,3 +9,7 @@ pytesseract>=0.3.10
 google-generativeai>=0.8.0
 python-dotenv>=1.0.0
 keyboard>=0.13.5
+groq>=0.9.0
+numpy>=1.24.0
+sounddevice>=0.4.6
+soundfile>=0.12.1

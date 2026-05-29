@@ -92,33 +92,35 @@ except ImportError:
 # THEME ENGINE  — Dark (goldish-black) + Light
 # ─────────────────────────────────────────────────────────────────────────────
 THEMES = {
+    # ── Dark: Elite Goldish-Black ─────────────────────────────────────────────
     "dark": {
-        "BASE":       "#050505",
-        "SURFACE":    "#0f0f0f",
-        "PANEL":      "#141414",
-        "RAISED":     "#1a1a1a",
-        "BORDER":     "#262626",
-        "ACCENT":     "#D4AF37",   # primary gold
-        "ACCENT_HI":  "#F0CF6A",   # hover gold
-        "ACCENT_DIM": "#6b5a28",   # muted gold
-        "ACCENT_SUB": "#1e190a",   # dark gold tint bg
-        "TEXT_MAIN":  "#EAEAEA",
-        "MUTED":      "#808080",
-        "DIM":        "#2e2e2e",
+        "BASE":       "#050505",   # Obsidian Black  — root / outermost bg
+        "SURFACE":    "#0F0F0F",   # Card structures — mode bar, panels
+        "PANEL":      "#141414",   # Control panels  — settings body, resp box
+        "RAISED":     "#1A1A1A",   # Elevated tiles  — entry fields, icon btns
+        "BORDER":     "#262626",   # Hairline dividers
+        "ACCENT":     "#D4AF37",   # Metallic Gold   — primary CTAs, headings
+        "ACCENT_HI":  "#F0CF6A",   # Hover Gold      — button hover state
+        "ACCENT_DIM": "#6B5A28",   # Muted Gold      — subtle highlights
+        "ACCENT_SUB": "#1E190A",   # Dark Gold tint  — active tab bg, pill bg
+        "TEXT_MAIN":  "#EAEAEA",   # Crisp body text
+        "MUTED":      "#808080",   # Secondary / placeholder text
+        "DIM":        "#2E2E2E",   # Disabled / very faint elements
     },
+    # ── Light: Minimal ────────────────────────────────────────────────────────
     "light": {
-        "BASE":       "#F5F5F7",
-        "SURFACE":    "#FFFFFF",
-        "PANEL":      "#F0F0F0",
-        "RAISED":     "#E5E5E5",
-        "BORDER":     "#D1D1D1",
-        "ACCENT":     "#B8860B",
-        "ACCENT_HI":  "#C9960C",
-        "ACCENT_DIM": "#8B6914",
-        "ACCENT_SUB": "#FFF8DC",
-        "TEXT_MAIN":  "#111111",
-        "MUTED":      "#666666",
-        "DIM":        "#C0C0C0",
+        "BASE":       "#F5F5F7",   # Clean light grey — root bg
+        "SURFACE":    "#FFFFFF",   # Pure white cards — mode bar, panels
+        "PANEL":      "#F0F0F0",   # Slightly inset panels
+        "RAISED":     "#E5E5E5",   # Elevated tiles  — entry fields, icon btns
+        "BORDER":     "#D1D1D1",   # Hairline dividers
+        "ACCENT":     "#B8860B",   # Dark Goldenrod  — primary CTAs, headings
+        "ACCENT_HI":  "#C9960C",   # Slightly warmer — hover state
+        "ACCENT_DIM": "#8B6914",   # Mid-tone gold   — subtle highlights
+        "ACCENT_SUB": "#FFF8DC",   # Cornsilk tint   — active tab bg, pill bg
+        "TEXT_MAIN":  "#111111",   # Deep near-black text
+        "MUTED":      "#666666",   # Secondary / placeholder
+        "DIM":        "#C0C0C0",   # Disabled / very faint elements
     },
 }
 
@@ -725,6 +727,13 @@ class AceItApp:
         self.highlight_thread = None
         self.last_clipboard   = ""
         self._float_win       = None
+        self._float_canvas    = None
+        self._float_accent    = GOLD
+        self._float_glyph_id  = None
+        self._pill_win        = None
+        self._pill_after_id   = None
+        self._pill_current_w  = 0
+        self._pill_label      = None
         self._drag_x = self._drag_y = 0
         self._drag_start_x = self._drag_start_y = 0
         self._float_did_drag  = False
@@ -774,10 +783,20 @@ class AceItApp:
     # THEME ENGINE
     # ─────────────────────────────────────────────────────────────────────────
     def _apply_theme(self):
-        """Swap the global palette and repaint every registered widget."""
+        """
+        Swap the active palette and repaint every initialised widget in-place.
+
+        Order: globals → root → header → mode bar → response area →
+               dock → status bar → settings modal (if open).
+
+        Every widget access is guarded with hasattr / winfo_exists so this
+        is safe to call at any construction stage, including the very first
+        call from __init__ before all widgets exist.
+        """
         global BASE, SURFACE, PANEL, RAISED, BORDER
         global GOLD, GOLD_HI, GOLD_DIM, GOLD_SUB, CREAM, MUTED, DIM
 
+        # ── 1. Rebind module-level colour aliases ─────────────────────────────
         t = THEMES["dark"] if self.is_dark_mode.get() else THEMES["light"]
 
         BASE      = t["BASE"]
@@ -793,26 +812,17 @@ class AceItApp:
         MUTED     = t["MUTED"]
         DIM       = t["DIM"]
 
-        # Sync Win32 titlebar tint
+        # ── 2. Win32 titlebar tint ────────────────────────────────────────────
         self._dark_titlebar()
 
-        # ── Theme-toggle button label ─────────────────────────────────────────
-        # Shows ☀️ when in dark mode (click → go light) and 🌙 when in light mode
-        if hasattr(self, "_theme_btn"):
-            self._theme_btn.config(
-                text="☀️" if self.is_dark_mode.get() else "🌙",
-                bg=BASE, fg=MUTED,
-                activebackground=RAISED, activeforeground=GOLD,
-            )
-
-        # ── Root ─────────────────────────────────────────────────────────────
+        # ── 3. Root window ────────────────────────────────────────────────────
         self.root.configure(bg=BASE)
 
-        # ── Header ───────────────────────────────────────────────────────────
+        # ── 4. Header ─────────────────────────────────────────────────────────
         if hasattr(self, "_hdr_frame"):
             self._hdr_frame.configure(bg=BASE)
         if hasattr(self, "_hdr_accent_line"):
-            self._hdr_accent_line.configure(bg=GOLD_DIM)
+            self._hdr_accent_line.configure(bg=BORDER)
         if hasattr(self, "_hdr_icon_lbl"):
             self._hdr_icon_lbl.configure(bg=BASE, fg=GOLD)
         if hasattr(self, "_hdr_title_lbl"):
@@ -821,45 +831,219 @@ class AceItApp:
             self._hdr_sub_lbl.configure(bg=BASE, fg=MUTED)
         if hasattr(self, "_hdr_right"):
             self._hdr_right.configure(bg=BASE)
-        for attr in ("_float_btn", "_gear_btn"):
-            if hasattr(self, attr):
-                getattr(self, attr).configure(
-                    bg=BASE, fg=MUTED,
-                    activebackground=RAISED, activeforeground=GOLD)
+        if hasattr(self, "_mode_pill"):
+            mode_clr = MODE_COLORS.get(self.engine.mode, GOLD)
+            self._mode_pill.configure(bg=GOLD_SUB, fg=mode_clr)
         if hasattr(self, "_opacity_hdr_lbl"):
             self._opacity_hdr_lbl.configure(bg=BASE, fg=MUTED)
         if hasattr(self, "_opacity_val_lbl"):
             self._opacity_val_lbl.configure(bg=BASE, fg=CREAM)
-        if hasattr(self, "_mode_pill"):
-            mode_clr = MODE_COLORS.get(self.engine.mode, GOLD)
-            self._mode_pill.configure(bg=GOLD_SUB, fg=mode_clr)
+        for attr in ("_gear_btn", "_float_btn"):
+            if hasattr(self, attr):
+                getattr(self, attr).configure(
+                    bg=BASE, fg=MUTED,
+                    activebackground=RAISED, activeforeground=GOLD)
+        if hasattr(self, "_theme_btn"):
+            self._theme_btn.configure(
+                text="☀️" if self.is_dark_mode.get() else "🌙",
+                bg=BASE, fg=MUTED,
+                activebackground=RAISED, activeforeground=GOLD)
 
-        # ── Controls wrapper & panel ──────────────────────────────────────────
-        if hasattr(self, "_ctrl_wrapper"):
-            self._ctrl_wrapper.configure(bg=BASE)
-        if hasattr(self, "_ctrl_frame"):
-            self._ctrl_frame.configure(
-                bg=PANEL,
-                highlightbackground=GOLD_DIM,
-                highlightthickness=1,
-            )
+        # ── 5. Mode selector bar ──────────────────────────────────────────────
+        if hasattr(self, "_mode_bar"):
+            self._mode_bar.configure(bg=SURFACE)
+        if hasattr(self, "_mode_btns"):
+            self._refresh_mode_btns()
 
-        # ── Ask bar ───────────────────────────────────────────────────────────
-        if hasattr(self, "ask_entry"):
-            self.ask_entry.configure(
-                bg=RAISED, fg=CREAM, insertbackground=GOLD)
+        # ── 6. Response area ──────────────────────────────────────────────────
+        if hasattr(self, "response_box") and self.response_box.winfo_exists():
+            # Structural frames
+            resp_outer     = self.response_box.master   # 1-px BORDER ring
+            resp_container = resp_outer.master           # BASE outer frame
+            if resp_container.winfo_exists():
+                resp_container.configure(bg=BASE)
+            if resp_outer.winfo_exists():
+                resp_outer.configure(bg=BORDER)
 
-        # ── Response area ─────────────────────────────────────────────────────
-        if hasattr(self, "response_box"):
+            # Header bar — first child of resp_container
+            children = resp_container.winfo_children()
+            if children:
+                resp_hdr = children[0]
+                if resp_hdr.winfo_exists():
+                    resp_hdr.configure(bg=BASE)
+                    for child in resp_hdr.winfo_children():
+                        if not child.winfo_exists():
+                            continue
+                        cls = child.winfo_class()
+                        if cls == "Label":
+                            txt = str(child.cget("text"))
+                            fg  = GOLD_DIM if "RESPONSE" in txt else MUTED
+                            child.configure(bg=BASE, fg=fg)
+                        elif cls == "Button":
+                            child.configure(
+                                bg=BASE, fg=MUTED,
+                                activebackground=RAISED, activeforeground=GOLD)
+
+            # The scrolled text widget itself
             self.response_box.configure(
                 bg=PANEL, fg=CREAM,
                 selectbackground=GOLD_DIM,
-                insertbackground=GOLD,
-            )
+                insertbackground=GOLD)
 
-        # ── Status bar ────────────────────────────────────────────────────────
-        if hasattr(self, "_status_bar"):
+        # ── 7. Action dock ────────────────────────────────────────────────────
+        if hasattr(self, "_dock_frame") and self._dock_frame.winfo_exists():
+            self._dock_frame.configure(bg=BASE)
+            # Recursively repaint all plain Frame children of the dock
+            def _paint_frames(widget):
+                for child in widget.winfo_children():
+                    if not child.winfo_exists():
+                        continue
+                    if child.winfo_class() == "Frame":
+                        child.configure(bg=BASE)
+                        _paint_frames(child)
+            _paint_frames(self._dock_frame)
+
+        # Ask entry
+        if hasattr(self, "ask_entry") and self.ask_entry.winfo_exists():
+            self.ask_entry.configure(
+                bg=RAISED, fg=CREAM,
+                insertbackground=GOLD,
+                disabledforeground=MUTED)
+
+        # Audio feed rolling label
+        if hasattr(self, "_audio_feed") and self._audio_feed.winfo_exists():
+            self._audio_feed.configure(bg=BASE, fg=MUTED)
+
+        # Icon buttons — reset to idle state first, then restore active tints
+        for attr in ("btn_capture", "btn_hl", "btn_watch",
+                     "_dock_mic_btn", "_dock_spk_btn"):
+            if hasattr(self, attr):
+                btn = getattr(self, attr)
+                if btn.winfo_exists():
+                    btn.configure(
+                        bg=RAISED, fg=CREAM,
+                        activebackground=GOLD_DIM, activeforeground=GOLD)
+        # Re-apply active-state tints (cyan/purple/gold) on top
+        if hasattr(self, "btn_capture"):
+            self._sync_dock_buttons()
+
+        # ── 8. Status bar ──────────────────────────────────────────────────────
+        if hasattr(self, "_status_bar") and self._status_bar.winfo_exists():
             self._status_bar.configure(bg=BASE, fg=MUTED)
+
+        # ── 9. Settings modal (live repaint if currently open) ─────────────────
+        if hasattr(self, "_settings_win") and self._settings_win and \
+                self._settings_win.winfo_exists():
+            self._repaint_widget_tree(self._settings_win)
+
+    # ── Settings / generic recursive repainter ────────────────────────────────
+    def _repaint_widget_tree(self, widget) -> None:
+        """
+        Depth-first walk of any Tkinter widget subtree.
+        Applies the current global palette based on each widget's class.
+        Silently skips destroyed or ttk-managed widgets.
+
+        Widget → colour keys applied
+        ─────────────────────────────
+        Toplevel / Frame  → bg (semantic: BASE / PANEL / RAISED by current bg)
+        Label             → bg, fg
+        Button            → bg, fg, activebackground, activeforeground
+        Entry             → bg, fg, insertbackground, disabledforeground
+        Text              → bg, fg, selectbackground, insertbackground
+        Radiobutton       → bg, fg, activebackground, activeforeground, selectcolor
+        Canvas            → bg, highlightthickness=0
+        """
+        if not widget.winfo_exists():
+            return
+
+        cls = widget.winfo_class()
+
+        try:
+            if cls in ("Frame", "Toplevel"):
+                try:
+                    cur = widget.cget("bg").lower()
+                except Exception:
+                    cur = ""
+                # Map old colour → new semantic slot
+                _base_vals    = {"#050505", "#f5f5f7", "#0f0f0f", "#ffffff"}
+                _surface_vals = {"#0f0f0f", "#ffffff"}
+                _panel_vals   = {"#141414", "#f0f0f0"}
+                _raised_vals  = {"#1a1a1a", "#e5e5e5"}
+                if cur in _base_vals:
+                    widget.configure(bg=BASE)
+                elif cur in _panel_vals:
+                    widget.configure(bg=PANEL)
+                elif cur in _raised_vals:
+                    widget.configure(bg=RAISED)
+                else:
+                    widget.configure(bg=PANEL)   # safe default for modal frames
+
+            elif cls == "Label":
+                try:
+                    fg_cur = widget.cget("fg").lower()
+                except Exception:
+                    fg_cur = ""
+                _gold_vals = {"#6b5a28", "#8b6914", GOLD_DIM.lower()}
+                _muted_vals = {"#808080", "#666666", MUTED.lower()}
+                fg = GOLD_DIM if fg_cur in _gold_vals else \
+                     MUTED     if fg_cur in _muted_vals else CREAM
+                try:
+                    bg_cur = widget.cget("bg").lower()
+                except Exception:
+                    bg_cur = ""
+                bg = BASE if bg_cur in {"#050505", "#f5f5f7"} else PANEL
+                widget.configure(bg=bg, fg=fg)
+
+            elif cls == "Button":
+                try:
+                    bg_cur = widget.cget("bg").lower()
+                except Exception:
+                    bg_cur = ""
+                _gold_vals = {"#d4af37", "#b8860b"}
+                _red_vals  = {"#b84040"}
+                if bg_cur in _gold_vals:
+                    widget.configure(
+                        bg=GOLD, fg=BASE,
+                        activebackground=GOLD_HI, activeforeground=BASE)
+                elif bg_cur in _red_vals:
+                    pass   # danger buttons keep their red
+                else:
+                    widget.configure(
+                        bg=RAISED, fg=MUTED,
+                        activebackground=GOLD_DIM, activeforeground=CREAM)
+
+            elif cls == "Entry":
+                widget.configure(
+                    bg=RAISED, fg=CREAM,
+                    insertbackground=GOLD,
+                    disabledforeground=MUTED)
+
+            elif cls == "Text":
+                widget.configure(
+                    bg=PANEL, fg=CREAM,
+                    selectbackground=GOLD_DIM,
+                    insertbackground=GOLD)
+
+            elif cls == "Radiobutton":
+                widget.configure(
+                    bg=PANEL, fg=CREAM,
+                    activebackground=PANEL, activeforeground=GOLD,
+                    selectcolor=GOLD_DIM)
+
+            elif cls == "Canvas":
+                widget.configure(bg=PANEL, highlightthickness=0)
+
+            # ttk.Scale / ttk.Scrollbar → style-engine managed; skip
+
+        except Exception:
+            pass   # never crash on a partially destroyed or ttk widget
+
+        # Recurse
+        try:
+            for child in widget.winfo_children():
+                self._repaint_widget_tree(child)
+        except Exception:
+            pass
 
     # ═════════════════════════════════════════════════════════════════════════
     # UI BUILD
@@ -867,21 +1051,15 @@ class AceItApp:
     def _build_ui(self):
         r = self.root
         self._build_header(r)
-        self._build_primary_actions(r)
-        # Controls wrapper — always in the pack order, content toggles
-        self._ctrl_wrapper = tk.Frame(r, bg=BASE)
-        self._ctrl_wrapper.pack(fill="x")
-        self._ctrl_frame = tk.Frame(self._ctrl_wrapper, bg=PANEL)
-        # NOT packed until user clicks ⚙
-        self._build_controls_panel()
-        self._build_ask_bar(r)
-        self._build_response_area(r)
+        self._build_mode_selector(r)      # Stage 2: persistent top-level mode bar
+        self._build_response_area(r)      # response area expands to fill middle
+        self._build_action_dock(r)        # unified bottom dock
         self._build_status_bar(r)
 
     # ── Header ────────────────────────────────────────────────────────────────
     def _build_header(self, r):
-        # Outer bar
-        hdr = tk.Frame(r, bg=BASE, pady=8)
+        # Outer bar — generous vertical padding for premium breathing room
+        hdr = tk.Frame(r, bg=BASE, pady=12)
         hdr.pack(fill="x")
         self._hdr_frame = hdr
 
@@ -889,7 +1067,7 @@ class AceItApp:
         self._hdr_icon_lbl = tk.Label(
             hdr, text="⚡", bg=BASE, fg=GOLD,
             font=("Segoe UI", 14, "bold"))
-        self._hdr_icon_lbl.pack(side="left", padx=(12, 4))
+        self._hdr_icon_lbl.pack(side="left", padx=(16, 4))
 
         self._hdr_title_lbl = tk.Label(
             hdr, text="AceIt", bg=BASE, fg=CREAM,
@@ -911,18 +1089,20 @@ class AceItApp:
 
         # ── Right: tool cluster ───────────────────────────────────────────────
         right = tk.Frame(hdr, bg=BASE)
-        right.pack(side="right", padx=(0, 8))
+        right.pack(side="right", padx=(0, 16))
         self._hdr_right = right
 
-        # ⚙  Settings gear — opens/closes controls panel
+        # ⚙  Settings gear — opens Settings modal
         self._gear_btn = tk.Button(
             right, text="⚙",
-            command=self._toggle_controls,
+            command=self._open_settings,
             bg=BASE, fg=MUTED,
             activebackground=RAISED, activeforeground=GOLD,
             relief="flat", font=("Segoe UI", 13),
             padx=6, cursor="hand2", bd=0)
         self._gear_btn.pack(side="right", padx=2)
+        self._gear_btn.bind("<Enter>", lambda e: self._gear_btn.config(bg=RAISED, fg=GOLD))
+        self._gear_btn.bind("<Leave>", lambda e: self._gear_btn.config(bg=BASE,  fg=MUTED))
 
         # Opacity: label + compact slider (72 px) + live % readout
         self._opacity_val_lbl = tk.Label(
@@ -956,6 +1136,8 @@ class AceItApp:
             relief="flat", font=("Segoe UI", 12),
             padx=6, cursor="hand2", bd=0)
         self._float_btn.pack(side="right", padx=2)
+        self._float_btn.bind("<Enter>", lambda e: self._float_btn.config(bg=RAISED, fg=GOLD))
+        self._float_btn.bind("<Leave>", lambda e: self._float_btn.config(bg=BASE,  fg=MUTED))
 
         # ☀️ / 🌙  Theme toggle
         def _toggle_theme():
@@ -970,39 +1152,118 @@ class AceItApp:
             relief="flat", font=("Segoe UI", 11),
             padx=6, cursor="hand2", bd=0)
         self._theme_btn.pack(side="right", padx=2)
+        self._theme_btn.bind("<Enter>", lambda e: self._theme_btn.config(bg=RAISED, fg=GOLD))
+        self._theme_btn.bind("<Leave>", lambda e: self._theme_btn.config(bg=BASE,  fg=MUTED))
 
-        # Accent divider line
-        self._hdr_accent_line = tk.Frame(r, bg=GOLD_DIM, height=1)
+        # Structural accent divider — separates branding from workspace
+        # Uses BORDER (#262626) for a clean, non-distracting workspace boundary
+        self._hdr_accent_line = tk.Frame(r, bg=BORDER, height=1)
         self._hdr_accent_line.pack(fill="x")
 
-    # ── Primary action row ────────────────────────────────────────────────────
-    def _build_primary_actions(self, r):
-        act = tk.Frame(r, bg=SURFACE, pady=10)
-        act.pack(fill="x", padx=12)
-        act.columnconfigure(0, weight=3)
-        act.columnconfigure(1, weight=2)
+    # ── Top-level Mode Selector ───────────────────────────────────────────────
+    def _build_mode_selector(self, r):
+        """
+        Persistent horizontal tab row below the header.
+        Four modes: Active · Ambient · Guided · Interview
+        Interview is a first-class mode — clicking it calls _activate_interview.
+        """
+        bar = tk.Frame(r, bg=SURFACE, pady=6)
+        bar.pack(fill="x", padx=12, pady=(4, 0))
+        self._mode_bar = bar
 
-        self.btn_capture = tk.Button(
-            act, text="  📷  Capture Screen", command=self._do_capture,
-            bg=GOLD, fg=BASE, activebackground=GOLD_HI, activeforeground=BASE,
-            relief="flat", font=("Segoe UI", 11, "bold"),
-            pady=10, cursor="hand2", bd=0)
-        self.btn_capture.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        # (mode_key, label, accent_color)
+        # None = Interview pseudo-mode handled separately
+        _TABS = [
+            (ModeState.ACTIVE,  "⚡  Active",    GOLD),
+            (ModeState.AMBIENT, "🌙  Ambient",   CYAN),
+            (ModeState.GUIDED,  "🎯  Guided",    IVEW_CLR),
+            (None,              "🎙  Interview", MIC_CLR),
+        ]
 
-        self.btn_hl = tk.Button(
-            act, text="  🔍  Highlight", command=self._toggle_highlight,
-            bg=RAISED, fg=MUTED, activebackground=GOLD_DIM, activeforeground=CREAM,
-            relief="flat", font=("Segoe UI", 11),
-            pady=10, cursor="hand2", bd=0)
-        self.btn_hl.grid(row=0, column=1, sticky="ew")
+        self._mode_btns = {}
+        for mode, label, clr in _TABS:
+            key = mode if mode is not None else "interview"
+            cmd = (lambda m=mode: self._switch_mode(m)) if mode is not None \
+                  else self._activate_interview
+            btn = tk.Button(
+                bar, text=label, command=cmd,
+                bg=RAISED, fg=MUTED,
+                activebackground=SURFACE, activeforeground=CREAM,
+                relief="flat", font=("Segoe UI", 9),
+                padx=10, pady=6, cursor="hand2", bd=0)
+            btn.pack(side="left", padx=(0, 3))
+            self._mode_btns[key] = btn
 
-        tk.Label(r, text="Ctrl+Shift+S  capture  ·  Ctrl+Shift+H  highlight",
-                 bg=SURFACE, fg=DIM, font=FONT_TINY).pack(pady=(0, 2))
+        self._refresh_mode_btns()
 
-    # ── Ask bar ───────────────────────────────────────────────────────────────
-    def _build_ask_bar(self, r):
-        ask_wrap = tk.Frame(r, bg=BORDER, pady=1)
-        ask_wrap.pack(fill="x", padx=12, pady=(4, 0))
+        # Thin separator beneath the tab row
+        tk.Frame(r, bg=BORDER, height=1).pack(fill="x", padx=12, pady=(4, 0))
+
+    # ── Unified Action Dock (bottom of window) ────────────────────────────────
+    def _build_action_dock(self, r):
+        """
+        Single docked panel at the bottom:
+          • Icon row — [📷] [🔍] [👁] [🎤] [🔊]
+          • Text bar — ask_entry + Send button
+        """
+        # ── Outer dock frame (border top) ─────────────────────────────────────
+        dock = tk.Frame(r, bg=BASE)
+        dock.pack(fill="x", side="bottom")
+        self._dock_frame = dock
+
+        # thin top border
+        tk.Frame(dock, bg=GOLD_DIM, height=1).pack(fill="x")
+
+        inner = tk.Frame(dock, bg=BASE, pady=12)
+        inner.pack(fill="x", padx=16)
+
+        # ── Icon button row ────────────────────────────────────────────────────
+        icon_row = tk.Frame(inner, bg=BASE)
+        icon_row.pack(fill="x", pady=(0, 6))
+
+        def _icon_btn(parent, icon, tip_text, cmd):
+            btn = tk.Button(
+                parent, text=icon, command=cmd,
+                bg=RAISED, fg=CREAM,
+                activebackground=GOLD_DIM, activeforeground=GOLD,
+                relief="flat", font=("Segoe UI", 15),
+                padx=10, pady=6, cursor="hand2", bd=0,
+                width=2)
+            btn.pack(side="left", padx=(0, 4))
+            # Basic Tkinter tooltip
+            tip = tk.Label(r, text=tip_text, bg=GOLD_SUB, fg=CREAM,
+                           font=FONT_TINY, relief="flat", padx=6, pady=3)
+            def _enter(e, t=tip, b=btn):
+                x = b.winfo_rootx() - r.winfo_rootx()
+                y = b.winfo_rooty() - r.winfo_rooty() - 28
+                t.place(x=x, y=y)
+                t.lift()
+            def _leave(e, t=tip):
+                t.place_forget()
+            btn.bind("<Enter>", _enter)
+            btn.bind("<Leave>", _leave)
+            return btn
+
+        self.btn_capture = _icon_btn(
+            icon_row, "📷", "Capture Screen  (Ctrl+Shift+S)", self._do_capture)
+        self.btn_hl = _icon_btn(
+            icon_row, "🔍", "Highlight / Clipboard Watch  (Ctrl+Shift+H)", self._toggle_highlight)
+        self.btn_watch = _icon_btn(
+            icon_row, "👁", "Screen Watcher  (Ctrl+Shift+W)", self._toggle_watch)
+        self._dock_mic_btn = _icon_btn(
+            icon_row, "🎤", "Microphone", self._toggle_mic)
+        self._dock_spk_btn = _icon_btn(
+            icon_row, "🔊", "Speaker Loopback", self._toggle_speaker)
+
+        # Spacer then audio-feed label (rolling transcript, right-aligned)
+        self._audio_feed = tk.Label(
+            icon_row, text="", bg=BASE, fg=MUTED,
+            font=FONT_TINY, anchor="e", justify="right")
+        self._audio_feed.pack(side="right", fill="x", expand=True)
+
+        # ── Text bar ──────────────────────────────────────────────────────────
+        ask_wrap = tk.Frame(inner, bg=BORDER, pady=1)
+        ask_wrap.pack(fill="x")
         ask_inner = tk.Frame(ask_wrap, bg=RAISED)
         ask_inner.pack(fill="x")
         self.ask_entry = tk.Entry(
@@ -1020,31 +1281,245 @@ class AceItApp:
             padx=10, pady=4, cursor="hand2", bd=0,
         ).pack(side="right")
 
+    # ── Settings Modal ────────────────────────────────────────────────────────
+    def _open_settings(self):
+        """Open the Settings Toplevel. Raises it if already open."""
+        if hasattr(self, "_settings_win") and self._settings_win and \
+                self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            self._settings_win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.geometry("440x540")
+        win.minsize(380, 320)
+        win.resizable(True, True)               # allow vertical resize
+        win.configure(bg=BASE)
+        win.attributes("-topmost", True)
+        win.pack_propagate(True)                # ← explicit layout propagation
+        try:
+            import ctypes
+            hwnd  = ctypes.windll.user32.GetParent(win.winfo_id())
+            value = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+        except Exception:
+            pass
+        self._settings_win = win
+
+        # ── Helper: gold-ruled section header ─────────────────────────────────
+        def _section(parent, text):
+            row = tk.Frame(parent, bg=PANEL)
+            row.pack(fill="x", padx=16, pady=(14, 2))
+            tk.Label(row, text=text, bg=PANEL, fg=GOLD_DIM,
+                     font=("Segoe UI", 7, "bold")).pack(side="left")
+            tk.Frame(row, bg=GOLD_DIM, height=1).pack(
+                side="left", fill="x", expand=True, padx=(6, 0))
+
+        # ── Helper: flat button with hover highlight ───────────────────────────
+        def _flat_btn(parent, text, cmd, fg=MUTED, afg=CREAM, abg=None, **kw):
+            _abg = abg or GOLD_DIM
+            btn = tk.Button(
+                parent, text=text, command=cmd,
+                bg=RAISED, fg=fg,
+                activebackground=_abg, activeforeground=afg,
+                relief="flat", font=FONT_TINY,
+                padx=10, pady=5, cursor="hand2", bd=0, **kw)
+            btn.bind("<Enter>", lambda e: btn.config(bg=_abg, fg=afg))
+            btn.bind("<Leave>", lambda e: btn.config(bg=RAISED, fg=fg))
+            return btn
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Outer chrome — fixed title-bar + scrollable body
+        # ══════════════════════════════════════════════════════════════════════
+        outer = tk.Frame(win, bg=PANEL)
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+        outer.configure(highlightbackground=GOLD_DIM, highlightthickness=1)
+
+        # ── Title bar (fixed, never scrolls) ──────────────────────────────────
+        hdr = tk.Frame(outer, bg=RAISED, pady=8)
+        hdr.pack(fill="x", side="top")
+        tk.Label(hdr, text="⚙  Settings", bg=RAISED, fg=CREAM,
+                 font=("Segoe UI", 12, "bold")).pack(side="left", padx=16)
+        tk.Button(hdr, text="✕", command=win.destroy,
+                  bg=RAISED, fg=MUTED, activebackground=RED,
+                  activeforeground=CREAM, relief="flat",
+                  font=("Segoe UI", 11), padx=8, cursor="hand2", bd=0
+                  ).pack(side="right", padx=6)
+
+        # Accent divider beneath settings title bar
+        tk.Frame(outer, bg=BORDER, height=1).pack(fill="x", side="top")
+
+        # ── Scrollable region: Canvas + Scrollbar ──────────────────────────────
+        scroll_area = tk.Frame(outer, bg=PANEL)
+        scroll_area.pack(fill="both", expand=True, side="top")
+        scroll_area.pack_propagate(True)         # ← propagation on scroll host
+
+        canvas = tk.Canvas(scroll_area, bg=PANEL, highlightthickness=0,
+                           bd=0, relief="flat")
+        vbar   = tk.Scrollbar(scroll_area, orient="vertical",
+                              command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        # Inner frame — all settings content lives here
+        body = tk.Frame(canvas, bg=PANEL)
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _on_body_resize(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_resize(e):
+            canvas.itemconfig(body_id, width=e.width)
+
+        body.bind("<Configure>", _on_body_resize)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Mouse-wheel scroll (Windows + Linux)
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        def _on_mousewheel_linux(e):
+            canvas.yview_scroll(-1 if e.num == 4 else 1, "units")
+
+        win.bind("<MouseWheel>",  _on_mousewheel)
+        win.bind("<Button-4>",    _on_mousewheel_linux)
+        win.bind("<Button-5>",    _on_mousewheel_linux)
+
+        # ── Fixed footer (Done button, never scrolls) ──────────────────────────
+        footer = tk.Frame(outer, bg=PANEL, pady=8)
+        footer.pack(fill="x", side="bottom")
+        tk.Frame(footer, bg=BORDER, height=1).pack(fill="x")
+        done_btn = tk.Button(
+            footer, text="Done", command=win.destroy,
+            bg=GOLD, fg=BASE, activebackground=GOLD_HI, activeforeground=BASE,
+            relief="flat", font=("Segoe UI", 10, "bold"),
+            padx=24, pady=7, cursor="hand2", bd=0)
+        done_btn.pack(pady=(10, 4))
+        done_btn.bind("<Enter>", lambda e: done_btn.config(bg=GOLD_HI))
+        done_btn.bind("<Leave>", lambda e: done_btn.config(bg=GOLD))
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SETTINGS CONTENT  (all packed into `body`, the scrollable inner frame)
+        # ══════════════════════════════════════════════════════════════════════
+
+        # ── AUDIO DEVICES ─────────────────────────────────────────────────────
+        _section(body, "AUDIO DEVICES")
+        dev_frame = tk.Frame(body, bg=PANEL)
+        dev_frame.pack(fill="x", padx=16, pady=(6, 4))
+
+        mic_name = self.audio._mic_device_name
+        spk_name = self.audio._spk_device_name
+        for icon, name in [("🎤  Mic", mic_name), ("🔊  Speaker", spk_name)]:
+            row = tk.Frame(dev_frame, bg=RAISED, pady=6)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=icon, bg=RAISED, fg=MUTED,
+                     font=FONT_SM, width=11, anchor="w").pack(side="left", padx=(10, 0))
+            tk.Label(row, text=name or "(not found)",
+                     bg=RAISED, fg=CREAM if name else AMBER,
+                     font=FONT_TINY, wraplength=270, justify="left"
+                     ).pack(side="left", padx=8)
+
+        list_btn = _flat_btn(body, "📋  List All Devices", self._show_device_list)
+        list_btn.pack(anchor="w", padx=16, pady=(6, 2))
+
+        if not HAS_AUDIO:
+            tk.Label(body, text="⚠  pip install sounddevice numpy soundfile",
+                     bg=PANEL, fg=AMBER, font=FONT_TINY).pack(padx=16, pady=4, anchor="w")
+
+        # ── SCREEN WATCHER ────────────────────────────────────────────────────
+        _section(body, "SCREEN WATCHER")
+
+        int_row = tk.Frame(body, bg=PANEL)
+        int_row.pack(fill="x", padx=16, pady=(8, 4))
+        tk.Label(int_row, text="Scan interval", bg=PANEL, fg=MUTED,
+                 font=FONT_SM).pack(side="left")
+        self._interval_lbl = tk.Label(int_row, text=f"{self._watch_interval.get()} s",
+                                      bg=PANEL, fg=CREAM, font=FONT_SM, width=5)
+        self._interval_lbl.pack(side="right")
+        ttk.Scale(int_row, from_=3, to=15, orient="horizontal",
+                  variable=self._watch_interval,
+                  command=lambda v: self._interval_lbl.config(text=f"{int(float(v))} s"),
+                  length=210
+                  ).pack(side="left", padx=8)
+
+        sens_row = tk.Frame(body, bg=PANEL)
+        sens_row.pack(fill="x", padx=16, pady=(4, 4))
+        tk.Label(sens_row, text="Sensitivity", bg=PANEL, fg=MUTED,
+                 font=FONT_SM).pack(side="left")
+        for lbl in ("Low", "Medium", "High"):
+            tk.Radiobutton(
+                sens_row, text=lbl, variable=self._sensitivity_var, value=lbl,
+                bg=PANEL, fg=CREAM, selectcolor=GOLD_DIM,
+                activebackground=PANEL, activeforeground=GOLD,
+                font=FONT_SM, cursor="hand2").pack(side="left", padx=8)
+
+        watcher_stat_row = tk.Frame(body, bg=PANEL)
+        watcher_stat_row.pack(fill="x", padx=16, pady=(2, 4))
+        self._watch_scans_lbl = tk.Label(watcher_stat_row, text="Scans: 0  Triggers: 0",
+                                         bg=PANEL, fg=MUTED, font=FONT_TINY)
+        self._watch_scans_lbl.pack(side="left")
+        self._watch_diff_lbl = tk.Label(watcher_stat_row, text="",
+                                        bg=PANEL, fg=CYAN, font=FONT_TINY)
+        self._watch_diff_lbl.pack(side="right")
+
+        # ── DISPLAY ───────────────────────────────────────────────────────────
+        _section(body, "DISPLAY")
+
+        op_row = tk.Frame(body, bg=PANEL)
+        op_row.pack(fill="x", padx=16, pady=(8, 12))
+        tk.Label(op_row, text="Opacity", bg=PANEL, fg=MUTED, font=FONT_SM).pack(side="left")
+        self._opacity_lbl = tk.Label(op_row, text=f"{self.opacity_var.get()}%",
+                                     bg=PANEL, fg=CREAM, font=FONT_SM, width=5)
+        self._opacity_lbl.pack(side="right")
+        ttk.Scale(op_row, from_=20, to=100, orient="horizontal",
+                  variable=self.opacity_var,
+                  command=lambda v: (self._apply_opacity(int(float(v))),
+                                     self._opacity_lbl.config(text=f"{int(float(v))}%")),
+                  length=210
+                  ).pack(side="left", padx=8)
+
     # ── Response area ─────────────────────────────────────────────────────────
     def _build_response_area(self, r):
-        resp_hdr = tk.Frame(r, bg=SURFACE)
-        resp_hdr.pack(fill="x", padx=12, pady=(6, 0))
-        tk.Label(resp_hdr, text="AI RESPONSE", bg=SURFACE, fg=GOLD_DIM,
+        # Outer container expands to fill all remaining vertical space
+        resp_container = tk.Frame(r, bg=BASE)
+        resp_container.pack(fill="both", expand=True, padx=16, pady=(4, 0))
+
+        # ── Floating header bar (source label + action buttons) ───────────────
+        resp_hdr = tk.Frame(resp_container, bg=BASE)
+        resp_hdr.pack(fill="x", pady=(0, 2))
+
+        tk.Label(resp_hdr, text="AI RESPONSE", bg=BASE, fg=GOLD_DIM,
                  font=("Segoe UI", 7, "bold")).pack(side="left")
-        self._source_lbl = tk.Label(resp_hdr, text="", bg=SURFACE, fg=MUTED,
+        self._source_lbl = tk.Label(resp_hdr, text="", bg=BASE, fg=MUTED,
                                     font=FONT_TINY)
         self._source_lbl.pack(side="left", padx=8)
-        tk.Button(resp_hdr, text="⎘ Copy", command=self._copy_response,
-                  bg=SURFACE, fg=MUTED, activebackground=RAISED, activeforeground=GOLD,
-                  relief="flat", font=FONT_TINY, padx=4, cursor="hand2", bd=0
-                  ).pack(side="right")
-        tk.Button(resp_hdr, text="🗑", command=self._clear,
-                  bg=SURFACE, fg=MUTED, activebackground=RAISED, activeforeground=RED,
-                  relief="flat", font=FONT_TINY, padx=4, cursor="hand2", bd=0
-                  ).pack(side="right", padx=2)
 
-        resp_outer = tk.Frame(r, bg=BORDER, pady=1, padx=1)
-        resp_outer.pack(fill="both", expand=True, padx=12, pady=(2, 0))
+        # Action buttons float to the top-right of the response box
+        tk.Button(resp_hdr, text="⎘ Copy", command=self._copy_response,
+                  bg=BASE, fg=MUTED,
+                  activebackground=RAISED, activeforeground=GOLD,
+                  relief="flat", font=FONT_TINY, padx=6, pady=2,
+                  cursor="hand2", bd=0
+                  ).pack(side="right", padx=(2, 0))
+        tk.Button(resp_hdr, text="🗑 Clear", command=self._clear,
+                  bg=BASE, fg=MUTED,
+                  activebackground=RAISED, activeforeground=RED,
+                  relief="flat", font=FONT_TINY, padx=6, pady=2,
+                  cursor="hand2", bd=0
+                  ).pack(side="right")
+
+        # ── Scrolled text — dominant element ─────────────────────────────────
+        resp_outer = tk.Frame(resp_container, bg=BORDER, pady=1, padx=1)
+        resp_outer.pack(fill="both", expand=True)
         self.response_box = scrolledtext.ScrolledText(
             resp_outer, bg=PANEL, fg=CREAM, font=FONT_MONO,
             relief="flat", wrap="word", padx=14, pady=12,
             state="disabled", insertbackground=GOLD,
-            selectbackground=GOLD_DIM, height=14)   # min height guarantee
+            selectbackground=GOLD_DIM)
         self.response_box.pack(fill="both", expand=True)
 
     # ── Status bar ────────────────────────────────────────────────────────────
@@ -1054,180 +1529,8 @@ class AceItApp:
             font=FONT_TINY, anchor="w", pady=6)
         self._status_bar.pack(fill="x")
 
-    # ── Controls panel (inside _ctrl_wrapper, toggled) ────────────────────────
-    def _build_controls_panel(self):
-        f = self._ctrl_frame
-        f.configure(highlightbackground=GOLD_DIM, highlightthickness=1)
-        tk.Frame(f, bg=GOLD_DIM, height=1).pack(fill="x")
-
-        # MODE ─────────────────────────────────────────────────────────────────
-        self._section_label(f, "MODE")
-        mode_row = tk.Frame(f, bg=PANEL)
-        mode_row.pack(fill="x", padx=10, pady=(2, 6))
-        self._mode_btns = {}
-        for mode, label, clr in [
-            (ModeState.ACTIVE,  "⚡ Active",  GOLD),
-            (ModeState.AMBIENT, "🌙 Ambient", CYAN),
-            (ModeState.GUIDED,  "🎯 Guided",  IVEW_CLR),
-        ]:
-            btn = tk.Button(
-                mode_row, text=label,
-                command=lambda m=mode: self._switch_mode(m),
-                bg=RAISED, fg=MUTED, activebackground=GOLD_DIM, activeforeground=CREAM,
-                relief="flat", font=FONT_SM, padx=8, pady=4, cursor="hand2", bd=0)
-            btn.pack(side="left", padx=(0, 4))
-            self._mode_btns[mode] = btn
-        self._refresh_mode_btns()
-
-        # SESSION ──────────────────────────────────────────────────────────────
-        self._section_label(f, "SESSION MEMORY")
-        sess_row = tk.Frame(f, bg=PANEL)
-        sess_row.pack(fill="x", padx=10, pady=(2, 2))
-        self._btn_sess_start = tk.Button(
-            sess_row, text="▶ Start", command=self._start_session,
-            bg=RAISED, fg=GOLD, activebackground=GREEN, activeforeground=CREAM,
-            relief="flat", font=FONT_SM, padx=8, pady=3, cursor="hand2", bd=0)
-        self._btn_sess_start.pack(side="left", padx=(0, 4))
-        self._btn_sess_end = tk.Button(
-            sess_row, text="⏹ End", command=self._end_session,
-            bg=RAISED, fg=MUTED, activebackground=RED, activeforeground=CREAM,
-            relief="flat", font=FONT_SM, padx=8, pady=3, cursor="hand2", bd=0)
-        self._btn_sess_end.pack(side="left", padx=(0, 8))
-        self._session_lbl = tk.Label(sess_row, text="No session",
-                                     bg=PANEL, fg=MUTED, font=FONT_TINY)
-        self._session_lbl.pack(side="left")
-        self.root.after(2000, self._tick_session_label)
-
-        # AUDIO ────────────────────────────────────────────────────────────────
-        self._section_label(f, "AUDIO LISTENER")
-
-        # Device info
-        dev_row = tk.Frame(f, bg=PANEL)
-        dev_row.pack(fill="x", padx=10, pady=(0, 2))
-        mic_name = self.audio._mic_device_name[:28] + "…" \
-            if len(self.audio._mic_device_name) > 30 else self.audio._mic_device_name
-        spk_name = self.audio._spk_device_name[:28] + "…" \
-            if len(self.audio._spk_device_name) > 30 else self.audio._spk_device_name
-        tk.Label(dev_row,
-                 text=f"🎤 {mic_name}   🔊 {spk_name}",
-                 bg=PANEL, fg=MUTED, font=FONT_TINY,
-                 wraplength=380, justify="left").pack(side="left")
-
-        audio_row = tk.Frame(f, bg=PANEL)
-        audio_row.pack(fill="x", padx=10, pady=(2, 4))
-
-        self._btn_mic = tk.Button(
-            audio_row, text="🎤  Mic  OFF",
-            command=self._toggle_mic,
-            bg=RAISED, fg=MUTED,
-            activebackground=MIC_CLR, activeforeground=CREAM,
-            relief="flat", font=FONT_SM, padx=8, pady=4, cursor="hand2", bd=0)
-        self._btn_mic.pack(side="left", padx=(0, 6))
-
-        self._btn_spk = tk.Button(
-            audio_row, text="🔊  Speaker  OFF",
-            command=self._toggle_speaker,
-            bg=RAISED, fg=MUTED,
-            activebackground=SPK_CLR, activeforeground=BASE,
-            relief="flat", font=FONT_SM, padx=8, pady=4, cursor="hand2", bd=0)
-        self._btn_spk.pack(side="left", padx=(0, 6))
-
-        tk.Button(audio_row, text="📋 Devices",
-                  command=self._show_device_list,
-                  bg=RAISED, fg=MUTED, activebackground=RAISED, activeforeground=GOLD,
-                  relief="flat", font=FONT_TINY, padx=4, pady=4, cursor="hand2", bd=0
-                  ).pack(side="left")
-
-        # Interview mode toggle
-        ivw_row = tk.Frame(f, bg=PANEL)
-        ivw_row.pack(fill="x", padx=10, pady=(2, 4))
-        self._btn_ivw = tk.Button(
-            ivw_row, text="🎙 Interview Mode  OFF",
-            command=self._toggle_interview,
-            bg=RAISED, fg=MUTED,
-            activebackground=IVEW_CLR, activeforeground=CREAM,
-            relief="flat", font=FONT_SM, padx=8, pady=4, cursor="hand2", bd=0)
-        self._btn_ivw.pack(side="left")
-        tk.Label(ivw_row,
-                 text=" Speaker=interviewer  ·  Mic=you",
-                 bg=PANEL, fg=MUTED, font=FONT_TINY).pack(side="left", padx=6)
-
-        # Live transcript feed
-        feed_row = tk.Frame(f, bg=RAISED)
-        feed_row.pack(fill="x", padx=10, pady=(0, 4))
-        self._audio_feed = tk.Label(
-            feed_row, text="Audio off — enable Mic or Speaker above",
-            bg=RAISED, fg=MUTED, font=FONT_TINY,
-            anchor="w", justify="left", wraplength=380, pady=4)
-        self._audio_feed.pack(fill="x", padx=6)
-
-        if not HAS_AUDIO:
-            tk.Label(f, text="⚠  pip install sounddevice numpy soundfile",
-                     bg=PANEL, fg=AMBER, font=FONT_TINY).pack(padx=10, pady=(0,4), anchor="w")
-
-        # SCREEN WATCHER ───────────────────────────────────────────────────────
-        self._section_label(f, "SCREEN WATCHER  ·  Ctrl+Shift+W")
-        watch_row = tk.Frame(f, bg=PANEL)
-        watch_row.pack(fill="x", padx=10, pady=(2, 2))
-        self.btn_watch = tk.Button(
-            watch_row, text="▶ Start Watching", command=self._toggle_watch,
-            bg=RAISED, fg=CYAN, activebackground=CYAN, activeforeground=BASE,
-            relief="flat", font=FONT_SM, padx=8, pady=3, cursor="hand2", bd=0)
-        self.btn_watch.pack(side="left", padx=(0, 8))
-        self._watch_scans_lbl = tk.Label(watch_row, text="Scans: 0  Triggers: 0",
-                                         bg=PANEL, fg=MUTED, font=FONT_TINY)
-        self._watch_scans_lbl.pack(side="left")
-        self._watch_diff_lbl = tk.Label(watch_row, text="",
-                                        bg=PANEL, fg=CYAN, font=FONT_TINY)
-        self._watch_diff_lbl.pack(side="right")
-
-        int_row = tk.Frame(f, bg=PANEL)
-        int_row.pack(fill="x", padx=10, pady=(4, 2))
-        tk.Label(int_row, text="Scan every", bg=PANEL, fg=MUTED,
-                 font=FONT_TINY).pack(side="left")
-        self._interval_lbl = tk.Label(int_row, text="5 s", bg=PANEL,
-                                      fg=CREAM, font=FONT_TINY, width=4)
-        self._interval_lbl.pack(side="right")
-        ttk.Scale(int_row, from_=3, to=15, orient="horizontal",
-                  variable=self._watch_interval,
-                  command=lambda v: self._interval_lbl.config(text=f"{int(float(v))} s")
-                  ).pack(side="left", fill="x", expand=True, padx=6)
-
-        sens_row = tk.Frame(f, bg=PANEL)
-        sens_row.pack(fill="x", padx=10, pady=(2, 2))
-        tk.Label(sens_row, text="Sensitivity", bg=PANEL, fg=MUTED,
-                 font=FONT_TINY).pack(side="left")
-        for lbl in ("Low", "Medium", "High"):
-            tk.Radiobutton(
-                sens_row, text=lbl, variable=self._sensitivity_var, value=lbl,
-                bg=PANEL, fg=CREAM, selectcolor=GOLD_DIM,
-                activebackground=PANEL, activeforeground=GOLD,
-                font=FONT_TINY, cursor="hand2").pack(side="left", padx=6)
-
-        # TOOLS ────────────────────────────────────────────────────────────────
-        self._section_label(f, "TOOLS")
-        util_row = tk.Frame(f, bg=PANEL)
-        util_row.pack(fill="x", padx=10, pady=(2, 4))
-        for lbl, cmd in [("🔄 Refresh", self._hot_reload),
-                          ("🗗 Float",   self._enter_float),
-                          ("🗑 Clear",   self._clear)]:
-            tk.Button(util_row, text=lbl, command=cmd,
-                      bg=RAISED, fg=MUTED, activebackground=GOLD_DIM, activeforeground=CREAM,
-                      relief="flat", font=FONT_TINY, padx=6, pady=3, cursor="hand2", bd=0
-                      ).pack(side="left", padx=(0, 4))
-
-        op_row = tk.Frame(f, bg=PANEL)
-        op_row.pack(fill="x", padx=10, pady=(2, 8))
-        tk.Label(op_row, text="Opacity", bg=PANEL, fg=MUTED, font=FONT_TINY).pack(side="left")
-        self._opacity_lbl = tk.Label(op_row, text="95%", bg=PANEL,
-                                     fg=CREAM, font=FONT_TINY, width=4)
-        self._opacity_lbl.pack(side="right")
-        ttk.Scale(op_row, from_=20, to=100, orient="horizontal",
-                  variable=self.opacity_var,
-                  command=lambda v: self._apply_opacity(int(float(v)))
-                  ).pack(side="left", fill="x", expand=True, padx=6)
-
     def _section_label(self, parent, text):
+        """Utility for settings modal section headers."""
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x", padx=10, pady=(8, 0))
         tk.Label(row, text=text, bg=PANEL, fg=GOLD_DIM,
@@ -1235,36 +1538,43 @@ class AceItApp:
         tk.Frame(row, bg=GOLD_DIM, height=1).pack(
             side="left", fill="x", expand=True, padx=(6, 0))
 
-    def _toggle_controls(self):
-        if self._ctrl_frame.winfo_viewable():
-            self._ctrl_frame.pack_forget()
-        else:
-            self._ctrl_frame.pack(fill="x", in_=self._ctrl_wrapper)
+    def _sync_dock_buttons(self):
+        """Update dock icon button colours to reflect active/inactive state."""
+        # Screen watcher
+        if hasattr(self, "btn_watch"):
+            active = self.watch_active.get()
+            self.btn_watch.config(
+                bg=CYAN if active else RAISED,
+                fg=BASE if active else CREAM)
+        # Mic
+        if hasattr(self, "_dock_mic_btn"):
+            active = self.audio.mic_active
+            self._dock_mic_btn.config(
+                bg=MIC_CLR if active else RAISED,
+                fg=CREAM)
+        # Speaker
+        if hasattr(self, "_dock_spk_btn"):
+            active = self.audio.speaker_active
+            self._dock_spk_btn.config(
+                bg=SPK_CLR if active else RAISED,
+                fg=BASE if active else CREAM)
+        # Highlight
+        if hasattr(self, "btn_hl"):
+            active = self.highlight_mode.get()
+            self.btn_hl.config(
+                bg=GOLD if active else RAISED,
+                fg=BASE if active else CREAM)
 
     # ═════════════════════════════════════════════════════════════════════════
     # INTERVIEW MODE
     # ═════════════════════════════════════════════════════════════════════════
     def _toggle_interview(self):
-        on = not self._interview_mode.get()
-        self._interview_mode.set(on)
-        self.audio.interview_mode = on
-
-        if on:
-            self._btn_ivw.config(bg=IVEW_CLR, fg=CREAM, text="🎙 Interview Mode  ON")
-            # Inject specialist system prompt into session
-            if not self.engine.session.is_active:
-                self.engine.session.start(INTERVIEW_SYSTEM)
-            else:
-                self.engine.session.set_system(INTERVIEW_SYSTEM)
-            self._set_status("🎙 Interview Mode ON — start Mic + Speaker")
-            # Auto-start both audio sources
-            self._set_mic(True)
-            self._set_speaker(True)
+        """Legacy toggle — delegates to the unified activate/deactivate helpers."""
+        if self._interview_mode.get():
+            self._deactivate_interview()
+            self._refresh_mode_btns()
         else:
-            self._btn_ivw.config(bg=RAISED, fg=MUTED, text="🎙 Interview Mode  OFF")
-            # Restore mode system prompt
-            self.engine.session.set_system(MODE_SYSTEMS[self.engine.mode])
-            self._set_status("🎙 Interview Mode OFF")
+            self._activate_interview()
 
     # ═════════════════════════════════════════════════════════════════════════
     # AUDIO CONTROLS
@@ -1273,19 +1583,19 @@ class AceItApp:
         if on and not self.audio.mic_active:
             ok = self.audio.start_mic()
             if ok:
-                self._btn_mic.config(bg=MIC_CLR, fg=CREAM, text="🎤  Mic  ON")
+                self.root.after(0, self._sync_dock_buttons)
         elif not on and self.audio.mic_active:
             self.audio.stop_mic()
-            self._btn_mic.config(bg=RAISED, fg=MUTED, text="🎤  Mic  OFF")
+            self.root.after(0, self._sync_dock_buttons)
 
     def _set_speaker(self, on: bool):
         if on and not self.audio.speaker_active:
             ok = self.audio.start_speaker()
             if ok:
-                self._btn_spk.config(bg=SPK_CLR, fg=BASE, text="🔊  Speaker  ON")
+                self.root.after(0, self._sync_dock_buttons)
         elif not on and self.audio.speaker_active:
             self.audio.stop_speaker()
-            self._btn_spk.config(bg=RAISED, fg=MUTED, text="🔊  Speaker  OFF")
+            self.root.after(0, self._sync_dock_buttons)
 
     def _toggle_mic(self):
         self._set_mic(not self.audio.mic_active)
@@ -1346,26 +1656,64 @@ class AceItApp:
     # MODE / SESSION
     # ═════════════════════════════════════════════════════════════════════════
     def _switch_mode(self, mode: ModeState):
-        # Don't allow mode switch while interview is active
+        """Switch to a standard engine mode, deactivating Interview if needed."""
         if self._interview_mode.get():
-            self._set_status("⚠  End Interview Mode before switching modes")
-            return
+            # Cleanly exit interview mode first
+            self._deactivate_interview()
         self.engine.set_mode(mode)
         self._refresh_mode_btns()
         clr = MODE_COLORS[mode]
-        self._mode_pill.config(
-            text=f"  {mode.name}  ",
-            fg=clr, bg=GOLD_SUB)
+        self._mode_pill.config(text=f"  {mode.name}  ", fg=clr, bg=GOLD_SUB)
         self._set_status(f"Mode → {mode.name.capitalize()}")
 
+    def _activate_interview(self):
+        """Promote Interview to a first-class top-level mode."""
+        self._interview_mode.set(True)
+        self.audio.interview_mode = True
+        # Inject specialist system prompt
+        if not self.engine.session.is_active:
+            self.engine.session.start(INTERVIEW_SYSTEM)
+        else:
+            self.engine.session.set_system(INTERVIEW_SYSTEM)
+        # Auto-start both audio sources
+        self._set_mic(True)
+        self._set_speaker(True)
+        self._refresh_mode_btns()
+        self._mode_pill.config(text="  INTERVIEW  ", fg=MIC_CLR, bg=GOLD_SUB)
+        self.root.after(0, self._sync_dock_buttons)
+        self._set_status("🎙 Interview Mode ON — Mic + Speaker active")
+
+    def _deactivate_interview(self):
+        """Turn off interview mode and restore the current engine mode's prompt."""
+        self._interview_mode.set(False)
+        self.audio.interview_mode = False
+        self.engine.session.set_system(MODE_SYSTEMS[self.engine.mode])
+        self.root.after(0, self._sync_dock_buttons)
+        self._set_status("🎙 Interview Mode OFF")
+
     def _refresh_mode_btns(self):
-        current = self.engine.mode
-        for mode, btn in self._mode_btns.items():
-            if mode == current:
-                clr = MODE_COLORS[mode]
+        """Repaint all four mode-selector tabs to reflect the active state."""
+        current_engine_mode = self.engine.mode
+        is_interview = self._interview_mode.get()
+
+        _ACCENT = {
+            ModeState.ACTIVE:  GOLD,
+            ModeState.AMBIENT: CYAN,
+            ModeState.GUIDED:  IVEW_CLR,
+            "interview":       MIC_CLR,
+        }
+
+        for key, btn in self._mode_btns.items():
+            if not btn.winfo_exists():
+                continue
+            active = (key == "interview" and is_interview) or \
+                     (key is not None and key != "interview"
+                      and key == current_engine_mode and not is_interview)
+            if active:
+                clr = _ACCENT.get(key, GOLD)
                 btn.config(bg=GOLD_SUB, fg=clr, font=("Segoe UI", 9, "bold"))
             else:
-                btn.config(bg=RAISED, fg=MUTED, font=FONT_SM)
+                btn.config(bg=RAISED, fg=MUTED, font=("Segoe UI", 9))
 
     def _on_engine_event(self, event_type: str, payload: dict):
         if event_type == "mode_changed":
@@ -1376,23 +1724,14 @@ class AceItApp:
             self._set_status(f"🌙  Ambient cooldown — {rem}s")
 
     def _start_session(self):
-        system = INTERVIEW_SYSTEM if self._interview_mode.get() else MODE_SYSTEMS[self.engine.mode]
+        system = INTERVIEW_SYSTEM if self._interview_mode.get() \
+                 else MODE_SYSTEMS[self.engine.mode]
         self.engine.session.start(system)
-        self._btn_sess_start.config(bg=GOLD_SUB, fg=GREEN)
         self._set_status("Session started ✓  AI will remember context")
 
     def _end_session(self):
         self.engine.session.end()
-        self._btn_sess_start.config(bg=RAISED, fg=GOLD)
         self._set_status("Session ended — memory cleared")
-
-    def _tick_session_label(self):
-        s = self.engine.session
-        if s.is_active:
-            self._session_lbl.config(text=f"● {s.summary}", fg=GREEN)
-        else:
-            self._session_lbl.config(text="No session", fg=MUTED)
-        self.root.after(2000, self._tick_session_label)
 
     # ═════════════════════════════════════════════════════════════════════════
     # AI QUERY
@@ -1407,6 +1746,14 @@ class AceItApp:
             answer = f"[Groq error]\n{exc}"
         self.engine.store_ai_response(answer)
         self._show_response(answer)
+        # ── Float-mode notification pill ──────────────────────────────────────
+        # When the main window is hidden (float active), push a preview snippet
+        # into the sliding pill instead of silently dropping the response.
+        if getattr(self, "_float_win", None) and self._float_win.winfo_exists():
+            snippet = answer.strip().replace("\n", " ")[:100]
+            if len(answer.strip()) > 100:
+                snippet += "…"
+            self.float_notify(snippet)
         if self.watch_active.get():
             rem = max(0, int(self._watch_next_scan_at - time.time()))
             self._set_status(f"👁  Watching · next scan in {rem}s  [{self.engine.mode_label}]")
@@ -1448,11 +1795,11 @@ class AceItApp:
     def _toggle_highlight(self):
         if self.highlight_mode.get():
             self.highlight_mode.set(False)
-            self.btn_hl.config(bg=RAISED, fg=MUTED, text="  🔍  Highlight")
+            self._sync_dock_buttons()
             self._set_status("Highlight OFF")
         else:
             self.highlight_mode.set(True)
-            self.btn_hl.config(bg=GOLD_DIM, fg=GOLD, text="  ✅  Highlight ON")
+            self._sync_dock_buttons()
             self._set_status("Highlight ON — select text anywhere")
             self.last_clipboard = ""
             if self.highlight_thread is None or not self.highlight_thread.is_alive():
@@ -1504,7 +1851,7 @@ class AceItApp:
         self._last_ocr_hash  = ""
         self._scan_count     = 0
         self._trigger_count  = 0
-        self.btn_watch.config(text="⏸ Pause Watching", bg=AMBER, fg=BASE)
+        self._sync_dock_buttons()
         self._set_status("👁  Watcher started")
         if self._watch_thread is None or not self._watch_thread.is_alive():
             self._watch_thread = threading.Thread(target=self._watch_loop, daemon=True)
@@ -1515,9 +1862,9 @@ class AceItApp:
     def _stop_watch(self):
         self.watch_active.set(False)
         self._watcher_stop.set()
-        self.btn_watch.config(text="▶ Start Watching", bg=RAISED, fg=CYAN)
+        self._sync_dock_buttons()
         self._set_status("⏸  Watcher paused")
-        self.root.after(0, lambda: self._watch_diff_lbl.config(text=""))
+        self.root.after(0, lambda: self._watch_diff_lbl.config(text="") if hasattr(self, "_watch_diff_lbl") and self._watch_diff_lbl.winfo_exists() else None)
 
     def _watch_loop(self):
         while not self._watcher_stop.is_set():
@@ -1584,35 +1931,198 @@ class AceItApp:
         self.root.after(0, lambda: self._watch_scans_lbl.config(text=f"Scans: {s}  Triggers: {t}"))
 
     # ═════════════════════════════════════════════════════════════════════════
-    # FLOAT MODE
+    # FLOAT MODE  —  Circular Morph + Notification Pill
     # ═════════════════════════════════════════════════════════════════════════
+    #
+    # Architecture overview
+    # ─────────────────────
+    # _float_win          : frameless Toplevel — the 60×60 circle host
+    # _float_canvas       : Canvas inside _float_win, draws the circle + glyph
+    # _pill_win           : second frameless Toplevel anchored to the right of
+    #                       the circle; slides in/out horizontally for toasts
+    #
+    # Transparency trick (Windows-safe)
+    # ──────────────────────────────────
+    # We set -transparentcolor to a specific chroma-key ("magenta" / #FF00FF).
+    # The circle is drawn on the canvas; everything outside the arc stays chroma-
+    # key so the OS compositing layer punches it to fully transparent.  Alpha
+    # (-alpha 0.88) still applies to the circle region itself.
+    #
+    # Morph animation
+    # ────────────────
+    # Starting geometry 480×940 → target 60×60.
+    # _float_morph_step() interpolates width/height/position over MORPH_STEPS
+    # frames, each MORPH_DELAY ms apart, using a cosine ease-out curve.
+    #
+    # Pill animation
+    # ───────────────
+    # The pill is always zero-width at rest.  _pill_slide_out() expands it
+    # rightward over PILL_STEPS frames, holds for 5 s, then _pill_slide_in()
+    # collapses it.  Concurrent calls cancel the previous timer chain.
+
+    _CHROMA_KEY   = "#FF00FF"   # transparent punch-out colour (avoid in palette)
+    _CIRCLE_D     = 60          # final circle diameter (px)
+    _MORPH_STEPS  = 18          # morph animation frame count
+    _MORPH_DELAY  = 16          # ms between frames  (~60 fps)
+    _PILL_MAX_W   = 280         # expanded pill width (px)
+    _PILL_H       = 40          # pill height (px)
+    _PILL_STEPS   = 16          # slide animation frame count
+    _PILL_DELAY   = 14          # ms between pill frames
+    _PILL_HOLD_MS = 5000        # how long pill stays fully open
+
+    # ── Public entry/exit ────────────────────────────────────────────────────
     def _enter_float(self):
-        self.root.withdraw()
+        """Shrink main window → 60×60 circle with morph animation."""
+        # Snapshot geometry before hiding
+        self.root.update_idletasks()
+        start_x = self.root.winfo_x()
+        start_y = self.root.winfo_y()
+        start_w = self.root.winfo_width()
+        start_h = self.root.winfo_height()
+
+        # Determine accent colour for this session
+        icon_color = IVEW_CLR if self._interview_mode.get() else (
+            CYAN if self.watch_active.get() else GOLD)
+        self._float_accent = icon_color
+
+        # Target position: park circle near where the window left edge was
+        target_x = start_x
+        target_y = start_y + (start_h - self._CIRCLE_D) // 2
+
+        # Build the frameless circle window — hidden until morph begins
         fw = tk.Toplevel(self.root)
         fw.overrideredirect(True)
         fw.attributes("-topmost", True)
-        fw.attributes("-alpha", 0.88)
-        fw.geometry("56x56+20+300")
-        icon_color = IVEW_CLR if self._interview_mode.get() else (
-            CYAN if self.watch_active.get() else GOLD)
-        fw.configure(bg=icon_color)
-        self._float_win = fw
-        self._float_did_drag = False
-        lbl = tk.Label(fw, text="⚡", font=("Segoe UI", 22),
-                       bg=icon_color, fg=BASE, cursor="hand2")
-        lbl.pack(fill="both", expand=True)
-        for w in (fw, lbl):
+        fw.attributes("-alpha", 0.0)       # start invisible; fades in during morph
+        fw.geometry(f"{start_w}x{start_h}+{start_x}+{start_y}")
+        fw.configure(bg=self._CHROMA_KEY)
+
+        # Apply OS transparency layer — chroma key punches circle shape
+        try:
+            fw.wm_attributes("-transparentcolor", self._CHROMA_KEY)
+        except tk.TclError:
+            pass   # Linux/older macOS: no chroma key; graceful fallback
+
+        # Canvas that draws the circle + glyph
+        cv = tk.Canvas(fw, width=start_w, height=start_h,
+                       bg=self._CHROMA_KEY, highlightthickness=0)
+        cv.pack(fill="both", expand=True)
+
+        self._float_win    = fw
+        self._float_canvas = cv
+        self._float_did_drag  = False
+        self._float_glyph_id  = None
+        self._pill_win        = None
+        self._pill_after_id   = None
+        self._pill_current_w  = 0
+
+        # Main window hides once the overlay is positioned
+        self.root.withdraw()
+
+        # Kick off morph
+        self._float_morph_step(
+            step=0,
+            sx=start_x, sy=start_y, sw=start_w, sh=start_h,
+            tx=target_x, ty=target_y,
+        )
+
+    def _leave_float(self):
+        """Collapse pill (if open) then restore main window."""
+        self._pill_cancel()
+        if self._float_win:
+            try:
+                self._float_win.destroy()
+            except tk.TclError:
+                pass
+            self._float_win = None
+        self._float_canvas = None
+        self.root.deiconify()
+        self.root.lift()
+
+    # ── Morph animation ──────────────────────────────────────────────────────
+    def _float_morph_step(self, step, sx, sy, sw, sh, tx, ty):
+        """
+        Cosine ease-out interpolation from full window size → 60×60 circle.
+        Each frame redraws the canvas circle at the interpolated size/position.
+        """
+        fw = self._float_win
+        if fw is None or not fw.winfo_exists():
+            return
+
+        n  = self._MORPH_STEPS
+        t  = step / n                              # 0.0 → 1.0
+        # Cosine ease-out:  fast start, gentle landing
+        ease = 1 - ((1 - t) ** 3)
+
+        d   = self._CIRCLE_D
+        cw  = int(sw + (d - sw) * ease)           # current window width
+        ch  = int(sh + (d - sh) * ease)           # current window height
+        cx  = int(sx + (tx - sx) * ease)
+        cy  = int(sy + (ty - sy) * ease)
+        alpha = min(0.88, 0.1 + 0.78 * ease)
+
+        # Reposition & resize the window
+        fw.geometry(f"{max(cw, d)}x{max(ch, d)}+{cx}+{cy}")
+        fw.attributes("-alpha", alpha)
+
+        # Resize canvas to match
+        cv = self._float_canvas
+        cv.config(width=max(cw, d), height=max(ch, d))
+
+        # Draw interpolated circle centred in window
+        cx_c = max(cw, d) // 2
+        cy_c = max(ch, d) // 2
+        r    = max(4, int(d / 2 * ease))          # radius grows from tiny → 30
+        self._float_draw_circle(cv, cx_c, cy_c, r, step, n)
+
+        if step < n:
+            fw.after(self._MORPH_DELAY,
+                     lambda: self._float_morph_step(
+                         step + 1, sx, sy, sw, sh, tx, ty))
+        else:
+            # Morph complete — lock window to exact 60×60 and wire interactions
+            fw.geometry(f"{d}x{d}+{tx}+{ty}")
+            cv.config(width=d, height=d)
+            self._float_draw_circle(cv, d // 2, d // 2, d // 2 - 2, n, n)
+            self._float_wire_events()
+
+    def _float_draw_circle(self, cv, cx, cy, r, step, total_steps):
+        """Redraw the circle arc and brand glyph on the canvas."""
+        accent = self._float_accent
+        cv.delete("all")
+        if r < 2:
+            return
+
+        # Outer glow ring (semi-transparent look via darker ring)
+        glow_r = r + 3
+        cv.create_oval(cx - glow_r, cy - glow_r, cx + glow_r, cy + glow_r,
+                       fill="", outline=GOLD_DIM, width=1)
+
+        # Filled circle
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                       fill=accent, outline=accent, width=0)
+
+        # Brand glyph — only render when circle is large enough
+        progress = step / total_steps if total_steps > 0 else 1.0
+        if progress > 0.6:
+            font_size = max(6, int(22 * ((progress - 0.6) / 0.4)))
+            self._float_glyph_id = cv.create_text(
+                cx, cy, text="⚡",
+                font=("Segoe UI", font_size),
+                fill=BASE)
+
+    def _float_wire_events(self):
+        """Attach drag / click bindings after morph completes."""
+        fw = self._float_win
+        cv = self._float_canvas
+        if fw is None or cv is None:
+            return
+        for w in (fw, cv):
             w.bind("<ButtonPress-1>",   self._float_drag_start)
             w.bind("<B1-Motion>",       self._float_drag_move)
             w.bind("<ButtonRelease-1>", self._float_click_or_snap)
 
-    def _leave_float(self):
-        if self._float_win:
-            self._float_win.destroy()
-            self._float_win = None
-        self.root.deiconify()
-        self.root.lift()
-
+    # ── Drag / snap ──────────────────────────────────────────────────────────
     def _float_drag_start(self, e):
         self._drag_x = e.x_root - self._float_win.winfo_x()
         self._drag_y = e.y_root - self._float_win.winfo_y()
@@ -1621,23 +2131,182 @@ class AceItApp:
         self._float_did_drag = False
 
     def _float_drag_move(self, e):
-        if abs(e.x_root - self._drag_start_x) > 5 or abs(e.y_root - self._drag_start_y) > 5:
+        if abs(e.x_root - self._drag_start_x) > 4 or \
+           abs(e.y_root - self._drag_start_y) > 4:
             self._float_did_drag = True
-        self._float_win.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
+        self._float_win.geometry(
+            f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
+        # Keep pill anchored to circle during drag
+        self._pill_reanchor()
 
     def _float_click_or_snap(self, e):
-        if self._float_did_drag: self._float_snap_edge()
-        else: self._leave_float()
+        if self._float_did_drag:
+            self._float_snap_edge()
+        else:
+            self._leave_float()
 
     def _float_snap_edge(self):
         fw = self._float_win
         sw, sh = fw.winfo_screenwidth(), fw.winfo_screenheight()
-        x, y = fw.winfo_x(), fw.winfo_y()
-        w, h = fw.winfo_width(), fw.winfo_height()
+        x,  y  = fw.winfo_x(), fw.winfo_y()
+        w,  h  = fw.winfo_width(), fw.winfo_height()
         dists  = {"left": x, "right": sw-x-w, "top": y, "bottom": sh-y-h}
-        coords = {"left": (0,y), "right": (sw-w,y), "top": (x,0), "bottom": (x,sh-h)}
+        coords = {"left": (0, y), "right": (sw-w, y),
+                  "top": (x, 0), "bottom": (x, sh-h)}
         nx, ny = coords[min(dists, key=dists.get)]
         fw.geometry(f"+{nx}+{ny}")
+        self._pill_reanchor()
+
+    # ── Notification pill ────────────────────────────────────────────────────
+    def float_notify(self, text: str):
+        """
+        Public hook — call from any thread to push a notification into the pill.
+        If the float window is not active this is a no-op.
+        """
+        if self._float_win is None or not self._float_win.winfo_exists():
+            return
+        # Safely schedule on the main thread
+        self.root.after(0, lambda: self._pill_show(text))
+
+    def _pill_show(self, text: str):
+        """Create/reset the pill window and trigger its slide-out animation."""
+        self._pill_cancel()   # abort any running animation
+
+        fw = self._float_win
+        if fw is None or not fw.winfo_exists():
+            return
+
+        # Position pill immediately to the right of the circle
+        cx, cy = fw.winfo_x(), fw.winfo_y()
+        d      = self._CIRCLE_D
+        px     = cx + d + 6      # 6px gap between circle and pill
+        py     = cy + (d - self._PILL_H) // 2
+
+        # Create pill window if it doesn't exist yet
+        if self._pill_win is None or not self._pill_win.winfo_exists():
+            pw = tk.Toplevel(self.root)
+            pw.overrideredirect(True)
+            pw.attributes("-topmost", True)
+            pw.attributes("-alpha", 0.93)
+            pw.configure(bg=SURFACE)
+            pw.geometry(f"0x{self._PILL_H}+{px}+{py}")
+
+            # Inner frame for padding + rounded-feel border
+            pill_frame = tk.Frame(pw, bg=SURFACE,
+                                  highlightbackground=self._float_accent,
+                                  highlightthickness=1)
+            pill_frame.pack(fill="both", expand=True, padx=1, pady=1)
+
+            # Accent left-bar (colour stripe)
+            stripe = tk.Frame(pill_frame, bg=self._float_accent, width=3)
+            stripe.pack(side="left", fill="y")
+
+            # Text label (truncates gracefully if very long)
+            self._pill_label = tk.Label(
+                pill_frame,
+                text="",
+                bg=SURFACE, fg=CREAM,
+                font=("Segoe UI", 9),
+                anchor="w",
+                padx=10, pady=0,
+                wraplength=self._PILL_MAX_W - 30,
+                justify="left",
+            )
+            self._pill_label.pack(side="left", fill="both", expand=True)
+
+            self._pill_win = pw
+        else:
+            self._pill_win.geometry(f"0x{self._PILL_H}+{px}+{py}")
+
+        # Truncate very long text to a single readable line
+        display = text if len(text) <= 120 else text[:117] + "…"
+        self._pill_label.config(text=display)
+        self._pill_current_w = 0
+
+        # Slide out
+        self._pill_slide_out(step=0, px=px, py=py)
+
+    def _pill_slide_out(self, step: int, px: int, py: int):
+        """Expand pill width from 0 → _PILL_MAX_W using ease-out."""
+        pw = self._pill_win
+        if pw is None or not pw.winfo_exists():
+            return
+        if step > self._PILL_STEPS:
+            # Fully open — schedule retract after hold period
+            self._pill_current_w = self._PILL_MAX_W
+            self._pill_after_id = self.root.after(
+                self._PILL_HOLD_MS,
+                lambda: self._pill_slide_in(step=0, px=px, py=py))
+            return
+
+        t    = step / self._PILL_STEPS
+        ease = 1 - (1 - t) ** 3               # cubic ease-out
+        w    = int(self._PILL_MAX_W * ease)
+        w    = max(w, 1)
+
+        # Recalculate anchor in case circle was dragged
+        if self._float_win and self._float_win.winfo_exists():
+            px = self._float_win.winfo_x() + self._CIRCLE_D + 6
+            py = self._float_win.winfo_y() + (self._CIRCLE_D - self._PILL_H) // 2
+
+        pw.geometry(f"{w}x{self._PILL_H}+{px}+{py}")
+        self._pill_current_w = w
+
+        self._pill_after_id = self.root.after(
+            self._PILL_DELAY,
+            lambda: self._pill_slide_out(step + 1, px, py))
+
+    def _pill_slide_in(self, step: int, px: int, py: int):
+        """Collapse pill width from _PILL_MAX_W → 0 using ease-in."""
+        pw = self._pill_win
+        if pw is None or not pw.winfo_exists():
+            return
+        if step > self._PILL_STEPS:
+            # Fully retracted — hide the window
+            try:
+                pw.geometry(f"0x{self._PILL_H}+{px}+{py}")
+            except tk.TclError:
+                pass
+            return
+
+        t    = step / self._PILL_STEPS
+        ease = t ** 2                          # quadratic ease-in
+        w    = int(self._PILL_MAX_W * (1 - ease))
+        w    = max(w, 1)
+
+        if self._float_win and self._float_win.winfo_exists():
+            px = self._float_win.winfo_x() + self._CIRCLE_D + 6
+            py = self._float_win.winfo_y() + (self._CIRCLE_D - self._PILL_H) // 2
+
+        pw.geometry(f"{w}x{self._PILL_H}+{px}+{py}")
+        self._pill_current_w = w
+
+        self._pill_after_id = self.root.after(
+            self._PILL_DELAY,
+            lambda: self._pill_slide_in(step + 1, px, py))
+
+    def _pill_cancel(self):
+        """Abort any in-flight pill animation timer."""
+        if self._pill_after_id is not None:
+            try:
+                self.root.after_cancel(self._pill_after_id)
+            except Exception:
+                pass
+            self._pill_after_id = None
+
+    def _pill_reanchor(self):
+        """Reposition the pill window when the circle is dragged."""
+        pw = getattr(self, "_pill_win", None)
+        if pw is None or not pw.winfo_exists():
+            return
+        fw = self._float_win
+        if fw is None or not fw.winfo_exists():
+            return
+        px = fw.winfo_x() + self._CIRCLE_D + 6
+        py = fw.winfo_y() + (self._CIRCLE_D - self._PILL_H) // 2
+        w  = getattr(self, "_pill_current_w", 0)
+        if w > 0:
+            pw.geometry(f"{w}x{self._PILL_H}+{px}+{py}")
 
     # ═════════════════════════════════════════════════════════════════════════
     # HOTKEYS / UTILITY
@@ -1696,7 +2365,8 @@ class AceItApp:
     def _clear(self):
         self._show_response("")
         self._set_source("")
-        self._set_status("Cleared")
+        self.engine.session.end()          # silently reset context memory
+        self._set_status("Cleared  ·  session memory reset")
 
     def _clear_placeholder(self, event):
         if self.ask_entry.get() == "Ask anything…":
@@ -1713,6 +2383,13 @@ class AceItApp:
         self.audio.stop_all()
         self.highlight_mode.set(False)
         self.engine.session.end()
+        self._pill_cancel()
+        if self._pill_win:
+            try: self._pill_win.destroy()
+            except Exception: pass
+        if self._float_win:
+            try: self._float_win.destroy()
+            except Exception: pass
         try: keyboard.unhook_all_hotkeys()
         except Exception: pass
         self.root.destroy()
