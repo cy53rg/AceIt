@@ -89,30 +89,64 @@ except ImportError:
     sf = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PALETTE  — deep obsidian, warm gold
+# THEME ENGINE  — Dark (goldish-black) + Light
 # ─────────────────────────────────────────────────────────────────────────────
-BASE      = "#060606"   # near-black — window background
-SURFACE   = "#0d0d0d"   # primary surface
-PANEL     = "#111111"   # control panels
-RAISED    = "#1c1c1c"   # buttons, inputs
-BORDER    = "#282828"   # subtle dividers
-GOLD      = "#c9a84c"   # primary accent
-GOLD_HI   = "#e8c96a"   # gold hover
-GOLD_DIM  = "#6b5a28"   # muted gold
-GOLD_SUB  = "#1e190a"   # very dark gold tint background
-CREAM     = "#ede8d8"   # readable body text
-MUTED     = "#555555"   # secondary labels
-DIM       = "#2e2e2e"   # hairlines
-GREEN     = "#4caf7d"   # success / session active
-CYAN      = "#3ab5c4"   # watcher / speaker
-AMBER     = "#e8a020"   # warnings
-RED       = "#b84040"   # danger / stop
-MIC_CLR   = "#9b59e6"   # purple — microphone
-SPK_CLR   = "#3ab5c4"   # cyan  — speaker loopback
-IVEW_CLR  = "#e07040"   # orange — interview mode
+THEMES = {
+    "dark": {
+        "BASE":       "#050505",
+        "SURFACE":    "#0f0f0f",
+        "PANEL":      "#141414",
+        "RAISED":     "#1a1a1a",
+        "BORDER":     "#262626",
+        "ACCENT":     "#D4AF37",   # primary gold
+        "ACCENT_HI":  "#F0CF6A",   # hover gold
+        "ACCENT_DIM": "#6b5a28",   # muted gold
+        "ACCENT_SUB": "#1e190a",   # dark gold tint bg
+        "TEXT_MAIN":  "#EAEAEA",
+        "MUTED":      "#808080",
+        "DIM":        "#2e2e2e",
+    },
+    "light": {
+        "BASE":       "#F5F5F7",
+        "SURFACE":    "#FFFFFF",
+        "PANEL":      "#F0F0F0",
+        "RAISED":     "#E5E5E5",
+        "BORDER":     "#D1D1D1",
+        "ACCENT":     "#B8860B",
+        "ACCENT_HI":  "#C9960C",
+        "ACCENT_DIM": "#8B6914",
+        "ACCENT_SUB": "#FFF8DC",
+        "TEXT_MAIN":  "#111111",
+        "MUTED":      "#666666",
+        "DIM":        "#C0C0C0",
+    },
+}
+
+# Live colour references — start dark, updated by AceItApp._apply_theme()
+BASE      = THEMES["dark"]["BASE"]
+SURFACE   = THEMES["dark"]["SURFACE"]
+PANEL     = THEMES["dark"]["PANEL"]
+RAISED    = THEMES["dark"]["RAISED"]
+BORDER    = THEMES["dark"]["BORDER"]
+GOLD      = THEMES["dark"]["ACCENT"]
+GOLD_HI   = THEMES["dark"]["ACCENT_HI"]
+GOLD_DIM  = THEMES["dark"]["ACCENT_DIM"]
+GOLD_SUB  = THEMES["dark"]["ACCENT_SUB"]
+CREAM     = THEMES["dark"]["TEXT_MAIN"]
+MUTED     = THEMES["dark"]["MUTED"]
+DIM       = THEMES["dark"]["DIM"]
+
+# Semantic / status colours (theme-invariant)
+GREEN    = "#4caf7d"   # success / session active
+CYAN     = "#3ab5c4"   # watcher / speaker
+AMBER    = "#e8a020"   # warnings
+RED      = "#b84040"   # danger / stop
+MIC_CLR  = "#9b59e6"   # purple — microphone
+SPK_CLR  = "#3ab5c4"   # cyan  — speaker loopback
+IVEW_CLR = "#e07040"   # orange — interview mode
 
 FONT_UI   = ("Segoe UI", 10)
-FONT_MONO = ("Consolas",  11)   # ← enlarged for readability
+FONT_MONO = ("Consolas",  11)   # enlarged for readability
 FONT_SM   = ("Segoe UI",  9)
 FONT_TINY = ("Segoe UI",  8)
 
@@ -678,11 +712,13 @@ class AceItApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("AceIt")
-        self.root.configure(bg=BASE)
         self.root.attributes("-topmost", True)
         self.root.geometry("480x940+1380+30")
         self.root.minsize(400, 600)
         self.root.resizable(True, True)
+
+        # ── Theme state (must be declared before _build_ui) ───────────────────
+        self.is_dark_mode = tk.BooleanVar(value=True)
 
         # Phase 1–3 state
         self.highlight_mode   = tk.BooleanVar(value=False)
@@ -719,6 +755,7 @@ class AceItApp:
 
         self._dark_titlebar()
         self._build_ui()
+        self._apply_theme()          # initial paint (dark)
         self._bind_hotkeys()
         self._apply_opacity(95)
 
@@ -732,6 +769,97 @@ class AceItApp:
                 hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
         except Exception:
             pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # THEME ENGINE
+    # ─────────────────────────────────────────────────────────────────────────
+    def _apply_theme(self):
+        """Swap the global palette and repaint every registered widget."""
+        global BASE, SURFACE, PANEL, RAISED, BORDER
+        global GOLD, GOLD_HI, GOLD_DIM, GOLD_SUB, CREAM, MUTED, DIM
+
+        t = THEMES["dark"] if self.is_dark_mode.get() else THEMES["light"]
+
+        BASE      = t["BASE"]
+        SURFACE   = t["SURFACE"]
+        PANEL     = t["PANEL"]
+        RAISED    = t["RAISED"]
+        BORDER    = t["BORDER"]
+        GOLD      = t["ACCENT"]
+        GOLD_HI   = t["ACCENT_HI"]
+        GOLD_DIM  = t["ACCENT_DIM"]
+        GOLD_SUB  = t["ACCENT_SUB"]
+        CREAM     = t["TEXT_MAIN"]
+        MUTED     = t["MUTED"]
+        DIM       = t["DIM"]
+
+        # Sync Win32 titlebar tint
+        self._dark_titlebar()
+
+        # ── Theme-toggle button label ─────────────────────────────────────────
+        # Shows ☀️ when in dark mode (click → go light) and 🌙 when in light mode
+        if hasattr(self, "_theme_btn"):
+            self._theme_btn.config(
+                text="☀️" if self.is_dark_mode.get() else "🌙",
+                bg=BASE, fg=MUTED,
+                activebackground=RAISED, activeforeground=GOLD,
+            )
+
+        # ── Root ─────────────────────────────────────────────────────────────
+        self.root.configure(bg=BASE)
+
+        # ── Header ───────────────────────────────────────────────────────────
+        if hasattr(self, "_hdr_frame"):
+            self._hdr_frame.configure(bg=BASE)
+        if hasattr(self, "_hdr_accent_line"):
+            self._hdr_accent_line.configure(bg=GOLD_DIM)
+        if hasattr(self, "_hdr_icon_lbl"):
+            self._hdr_icon_lbl.configure(bg=BASE, fg=GOLD)
+        if hasattr(self, "_hdr_title_lbl"):
+            self._hdr_title_lbl.configure(bg=BASE, fg=CREAM)
+        if hasattr(self, "_hdr_sub_lbl"):
+            self._hdr_sub_lbl.configure(bg=BASE, fg=MUTED)
+        if hasattr(self, "_hdr_right"):
+            self._hdr_right.configure(bg=BASE)
+        for attr in ("_float_btn", "_gear_btn"):
+            if hasattr(self, attr):
+                getattr(self, attr).configure(
+                    bg=BASE, fg=MUTED,
+                    activebackground=RAISED, activeforeground=GOLD)
+        if hasattr(self, "_opacity_hdr_lbl"):
+            self._opacity_hdr_lbl.configure(bg=BASE, fg=MUTED)
+        if hasattr(self, "_opacity_val_lbl"):
+            self._opacity_val_lbl.configure(bg=BASE, fg=CREAM)
+        if hasattr(self, "_mode_pill"):
+            mode_clr = MODE_COLORS.get(self.engine.mode, GOLD)
+            self._mode_pill.configure(bg=GOLD_SUB, fg=mode_clr)
+
+        # ── Controls wrapper & panel ──────────────────────────────────────────
+        if hasattr(self, "_ctrl_wrapper"):
+            self._ctrl_wrapper.configure(bg=BASE)
+        if hasattr(self, "_ctrl_frame"):
+            self._ctrl_frame.configure(
+                bg=PANEL,
+                highlightbackground=GOLD_DIM,
+                highlightthickness=1,
+            )
+
+        # ── Ask bar ───────────────────────────────────────────────────────────
+        if hasattr(self, "ask_entry"):
+            self.ask_entry.configure(
+                bg=RAISED, fg=CREAM, insertbackground=GOLD)
+
+        # ── Response area ─────────────────────────────────────────────────────
+        if hasattr(self, "response_box"):
+            self.response_box.configure(
+                bg=PANEL, fg=CREAM,
+                selectbackground=GOLD_DIM,
+                insertbackground=GOLD,
+            )
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        if hasattr(self, "_status_bar"):
+            self._status_bar.configure(bg=BASE, fg=MUTED)
 
     # ═════════════════════════════════════════════════════════════════════════
     # UI BUILD
@@ -752,34 +880,100 @@ class AceItApp:
 
     # ── Header ────────────────────────────────────────────────────────────────
     def _build_header(self, r):
+        # Outer bar
         hdr = tk.Frame(r, bg=BASE, pady=8)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="⚡", bg=BASE, fg=GOLD,
-                 font=("Segoe UI", 14, "bold")).pack(side="left", padx=(12, 4))
-        tk.Label(hdr, text="AceIt", bg=BASE, fg=CREAM,
-                 font=("Segoe UI", 13, "bold")).pack(side="left")
-        tk.Label(hdr, text=" Co-Pilot", bg=BASE, fg=MUTED,
-                 font=("Segoe UI", 13)).pack(side="left")
+        self._hdr_frame = hdr
 
-        # Right controls
-        right = tk.Frame(hdr, bg=BASE)
-        right.pack(side="right", padx=8)
+        # ── Left: wordmark ────────────────────────────────────────────────────
+        self._hdr_icon_lbl = tk.Label(
+            hdr, text="⚡", bg=BASE, fg=GOLD,
+            font=("Segoe UI", 14, "bold"))
+        self._hdr_icon_lbl.pack(side="left", padx=(12, 4))
 
-        tk.Button(right, text="✕", command=self.on_close,
-                  bg=BASE, fg=MUTED, activebackground=RED, activeforeground=CREAM,
-                  relief="flat", font=("Segoe UI", 10), padx=6, cursor="hand2", bd=0
-                  ).pack(side="right", padx=2)
-        tk.Button(right, text="⚙", command=self._toggle_controls,
-                  bg=BASE, fg=MUTED, activebackground=RAISED, activeforeground=GOLD,
-                  relief="flat", font=("Segoe UI", 13), padx=6, cursor="hand2", bd=0
-                  ).pack(side="right", padx=2)
+        self._hdr_title_lbl = tk.Label(
+            hdr, text="AceIt", bg=BASE, fg=CREAM,
+            font=("Segoe UI", 13, "bold"))
+        self._hdr_title_lbl.pack(side="left")
 
+        self._hdr_sub_lbl = tk.Label(
+            hdr, text=" Co-Pilot", bg=BASE, fg=MUTED,
+            font=("Segoe UI", 13))
+        self._hdr_sub_lbl.pack(side="left")
+
+        # Mode pill — sits just right of the wordmark
         self._mode_pill = tk.Label(
-            hdr, text="  ACTIVE  ", bg=GOLD_SUB, fg=GOLD,
-            font=("Segoe UI", 8, "bold"), relief="flat", padx=6, pady=3)
-        self._mode_pill.pack(side="right", padx=4)
+            hdr, text="  ACTIVE  ",
+            bg=GOLD_SUB, fg=GOLD,
+            font=("Segoe UI", 8, "bold"),
+            relief="flat", padx=6, pady=3)
+        self._mode_pill.pack(side="left", padx=(8, 0))
 
-        tk.Frame(r, bg=GOLD_DIM, height=1).pack(fill="x")
+        # ── Right: tool cluster ───────────────────────────────────────────────
+        right = tk.Frame(hdr, bg=BASE)
+        right.pack(side="right", padx=(0, 8))
+        self._hdr_right = right
+
+        # ⚙  Settings gear — opens/closes controls panel
+        self._gear_btn = tk.Button(
+            right, text="⚙",
+            command=self._toggle_controls,
+            bg=BASE, fg=MUTED,
+            activebackground=RAISED, activeforeground=GOLD,
+            relief="flat", font=("Segoe UI", 13),
+            padx=6, cursor="hand2", bd=0)
+        self._gear_btn.pack(side="right", padx=2)
+
+        # Opacity: label + compact slider (72 px) + live % readout
+        self._opacity_val_lbl = tk.Label(
+            right, text="95%", bg=BASE, fg=CREAM,
+            font=FONT_TINY, width=4)
+        self._opacity_val_lbl.pack(side="right")
+
+        self._opacity_hdr_lbl = tk.Label(
+            right, text="opacity", bg=BASE, fg=MUTED,
+            font=FONT_TINY)
+        self._opacity_hdr_lbl.pack(side="right", padx=(4, 0))
+
+        def _op_cmd(v):
+            val = int(float(v))
+            self._apply_opacity(val)
+            self._opacity_val_lbl.config(text=f"{val}%")
+
+        ttk.Scale(
+            right, from_=20, to=100, orient="horizontal",
+            variable=self.opacity_var,
+            command=_op_cmd,
+            length=72,
+        ).pack(side="right", padx=(4, 6))
+
+        # 🗗  Float button
+        self._float_btn = tk.Button(
+            right, text="🗗",
+            command=self._enter_float,
+            bg=BASE, fg=MUTED,
+            activebackground=RAISED, activeforeground=GOLD,
+            relief="flat", font=("Segoe UI", 12),
+            padx=6, cursor="hand2", bd=0)
+        self._float_btn.pack(side="right", padx=2)
+
+        # ☀️ / 🌙  Theme toggle
+        def _toggle_theme():
+            self.is_dark_mode.set(not self.is_dark_mode.get())
+            self._apply_theme()
+
+        self._theme_btn = tk.Button(
+            right, text="☀️",       # dark mode active → show sun to switch to light
+            command=_toggle_theme,
+            bg=BASE, fg=MUTED,
+            activebackground=RAISED, activeforeground=GOLD,
+            relief="flat", font=("Segoe UI", 11),
+            padx=6, cursor="hand2", bd=0)
+        self._theme_btn.pack(side="right", padx=2)
+
+        # Accent divider line
+        self._hdr_accent_line = tk.Frame(r, bg=GOLD_DIM, height=1)
+        self._hdr_accent_line.pack(fill="x")
 
     # ── Primary action row ────────────────────────────────────────────────────
     def _build_primary_actions(self, r):
