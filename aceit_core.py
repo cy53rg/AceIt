@@ -23,6 +23,25 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 groq_client  = Groq(api_key=GROQ_API_KEY)
 GROQ_MODEL   = os.getenv("ACEIT_MODEL", "llama-3.3-70b-versatile")
 
+# Available models for the model selector
+GROQ_MODELS: list[str] = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+
+GROQ_MODEL_LABELS: dict[str, str] = {
+    "llama-3.3-70b-versatile": "Llama 3.3 70B",
+    "llama-3.1-8b-instant":    "Llama 3.1 8B",
+    "llama3-70b-8192":         "Llama3 70B",
+    "llama3-8b-8192":          "Llama3 8B",
+    "mixtral-8x7b-32768":      "Mixtral 8x7B",
+    "gemma2-9b-it":            "Gemma2 9B",
+}
+
 # ── Audio imports ─────────────────────────────────────────────────────────────
 try:
     import numpy as np
@@ -49,17 +68,45 @@ SENSITIVITY = {
 MIN_TRANSCRIPT_WORDS = 4
 
 class ModeState(Enum):
-    ACTIVE   = auto()
-    AMBIENT  = auto()
-    GUIDED   = auto()
+    ACTIVE    = auto()
+    AMBIENT   = auto()
+    GUIDED    = auto()
+    INTERVIEW = auto()
 
 MODE_SYSTEMS: dict[ModeState, str] = {
     ModeState.ACTIVE: "You are AceIt in Active Mode — a razor-sharp real-time task assistant. Immediately solve any questions, debug errors, or complete explicit tasks visible on screen. Be direct, thorough, and fast. Use numbered steps for multi-step problems.",
     ModeState.AMBIENT: "You are AceIt in Ambient Mode — a silent, observant co-pilot. Only speak when you notice something genuinely actionable: a mistake, efficiency tip, or important pattern. If nothing is noteworthy, respond with exactly: NOTHING\nOtherwise prefix with '💡 Tip:' / '⚠️ Notice:' and use at most 2 sentences.",
     ModeState.GUIDED: "You are AceIt in Guided Mode — an expert interactive mentor. Guide the user step-by-step. Break every explanation into numbered steps. After each response, ask one focused follow-up question. Never skip steps. Acknowledge completed milestones.",
+    ModeState.INTERVIEW: (
+        "You are AceIt in Interview Coach Mode. You receive live transcripts from two sources:\n"
+        "[SPEAKER] = the interviewer speaking\n"
+        "[MIC]     = the user (interviewee) speaking\n\n"
+        "When you receive [SPEAKER] content:\n"
+        "• If it contains a question: provide 3 concise bullet-point talking points the user should hit, "
+        "then a 2-sentence model answer example.\n"
+        "• If it's context/statement: note it briefly and suggest how to build on it.\n\n"
+        "When you receive [MIC] content:\n"
+        "• Evaluate the response in 1 sentence (what was strong).\n"
+        "• Suggest 1-2 specific improvements or stronger phrasings.\n"
+        "• Keep feedback constructive, brief, and actionable.\n\n"
+        "If USER CONTEXT (résumé / job description) is available in the session, tailor every coaching "
+        "response to the candidate's stated background and target role.\n\n"
+        "Be fast — the conversation is live. Lead every response with the source label."
+    ),
 }
 
-INTERVIEW_SYSTEM = "You are AceIt in Interview Coach Mode. You receive transcripts from two sources:\n[SPEAKER] = the interviewer speaking\n[MIC] = the user (interviewee) speaking\n\nWhen you receive [SPEAKER] content:\n• If it contains a question: provide 3 concise bullet-point talking points the user should hit, then a 2-sentence model answer example.\n• If it's context/statement: note it briefly and suggest how to build on it.\n\nWhen you receive [MIC] content:\n• Evaluate the response in 1 sentence (what was strong).\n• Suggest 1-2 specific improvements or stronger phrasings.\n• Keep feedback constructive, brief, and actionable.\n\nBe fast — the conversation is live. Lead every response with the source label."
+# Backwards-compat alias (referenced by AudioEngine interview_mode flag elsewhere)
+INTERVIEW_SYSTEM = MODE_SYSTEMS[ModeState.INTERVIEW]
+
+# ── Response Style Definitions ────────────────────────────────────────────────
+RESPONSE_STYLES = ["Terse", "Direct", "Balanced", "Detailed"]
+
+STYLE_SUFFIXES: dict[str, str] = {
+    "Terse":    "\n\n[RESPONSE STYLE: Terse] Reply in 1–3 sentences maximum. No preamble, no caveats, no filler. Raw signal only.",
+    "Direct":   "\n\n[RESPONSE STYLE: Direct] Be concise and clear. Lead with the answer. Skip pleasantries. Use short paragraphs or bullets only when they genuinely aid clarity.",
+    "Balanced": "\n\n[RESPONSE STYLE: Balanced] Provide a complete answer with appropriate context. Use structure where helpful. Neither too brief nor verbose.",
+    "Detailed": "\n\n[RESPONSE STYLE: Detailed] Give a thorough, comprehensive answer. Include relevant context, edge cases, examples, and reasoning. Prefer numbered steps for procedures.",
+}
 
 @dataclass
 class ContextEntry:
@@ -86,6 +133,7 @@ class SessionManager:
         self._active   = False
         self._started: Optional[float] = None
         self._lock     = threading.Lock()
+        self.response_style: str = "Balanced"   # Terse | Direct | Balanced | Detailed
 
     def start(self, system: str = "") -> None:
         with self._lock:
@@ -118,17 +166,59 @@ class SessionManager:
     def add_ai(self, content: str) -> None:
         self.add(ContextEntry(role="assistant", content=content, source="ai"))
 
+    def add_pinned_context(self, content: str, source: str = "context") -> None:
+        """
+        Inject a permanently-pinned entry (e.g. résumé / job description) that
+        survives buffer rotation and is always included near the top of every
+        build_messages() call.  Calling this again with the same source label
+        replaces the previous pinned entry for that source to avoid duplication.
+        """
+        # Remove any existing pinned entry from the same source so re-uploads
+        # don't pile up.
+        with self._lock:
+            to_remove = [e for e in self._buffer if e.pinned and e.source == source]
+            for e in to_remove:
+                try:
+                    self._buffer.remove(e)
+                except ValueError:
+                    pass
+        entry = ContextEntry(role="user", content=content, source=source, pinned=True)
+        # Bypass the is_active guard — context can be injected before the first
+        # live query arrives.
+        with self._lock:
+            self._buffer.append(entry)
+            if not self._active:
+                self._active  = True
+                self._started = time.time()
+
     def build_messages(self) -> List[dict]:
-        msgs = [{"role": "system", "content": self._system}]
+        style_suffix = STYLE_SUFFIXES.get(self.response_style, "")
+        msgs = [{"role": "system", "content": self._system + style_suffix}]
         with self._lock: buf = list(self._buffer)
         if not buf: return msgs
-        msgs.append(buf[0].to_chat_message())
+
+        seen_ids: set[int] = set()
+
+        def _add(entry: ContextEntry) -> None:
+            eid = id(entry)
+            if eid in seen_ids:
+                return
+            seen_ids.add(eid)
+            msgs.append(entry.to_chat_message())
+
+        # Always include the oldest (anchor) entry first
+        _add(buf[0])
+
+        # Pinned entries: walk the full buffer so nothing is missed
         for e in buf[1:]:
-            if e.pinned: msgs.append(e.to_chat_message())
-        anchor_content = buf[0].content
+            if e.pinned:
+                _add(e)
+
+        # Recent tail: skip the anchor and any pinned entries already added
         for e in buf[-self.RECENT_TURNS:]:
-            if e.content != anchor_content and not e.pinned:
-                msgs.append(e.to_chat_message())
+            if not e.pinned:
+                _add(e)
+
         return msgs
 
     @property
@@ -142,6 +232,7 @@ class SessionManager:
 
 class StateEngine:
     ACTIVE_DEDUP_S = 5; AMBIENT_COOLDOWN_S = 30; AMBIENT_MIN_CHARS = 60; GUIDED_MAX_TURNS = 60
+    INTERVIEW_MAX_TURNS = 200   # effectively unlimited for a real interview session
 
     def __init__(self, raw_query_fn: Callable[[List[dict]], None]):
         self._query = raw_query_fn
@@ -152,11 +243,17 @@ class StateEngine:
         self._active_last_text = ""; self._active_last_time = 0.0
         self._ambient_last_fire = 0.0; self._ambient_last_text = ""
         self.guided_turns = 0
+        self.interview_turns = 0
+        # When True the ambient cooldown is skipped (set automatically in Interview mode)
+        self.interview_cooldown_disabled: bool = False
 
     def set_mode(self, mode: ModeState) -> None:
         with self._lock:
             if mode == self._mode: return
-            old, self._mode, self.guided_turns = self._mode, mode, 0
+            old, self._mode = self._mode, mode
+            self.guided_turns = 0
+            self.interview_turns = 0
+            self.interview_cooldown_disabled = (mode == ModeState.INTERVIEW)
         self.session.set_system(MODE_SYSTEMS[mode])
         self._emit("mode_changed", {"from": old.name, "to": mode.name})
 
@@ -165,9 +262,10 @@ class StateEngine:
         if not text: return "suppressed:empty"
         if not self.session.is_active: self.session.start(MODE_SYSTEMS[self._mode])
         mode = self._mode
-        if mode == ModeState.ACTIVE: return self._active(text, source)
+        if mode == ModeState.ACTIVE:    return self._active(text, source)
         elif mode == ModeState.AMBIENT: return self._ambient(text, source)
-        else: return self._guided(text, source)
+        elif mode == ModeState.GUIDED:  return self._guided(text, source)
+        else:                           return self._interview(text, source)
 
     def store_ai_response(self, answer: str) -> None: self.session.add_ai(answer)
 
@@ -183,7 +281,8 @@ class StateEngine:
         if source == "ask":
             self.session.add_user(text, source); self._query(self.session.build_messages()); return "fired"
         now = time.time()
-        if (now - self._ambient_last_fire) < self.AMBIENT_COOLDOWN_S: return "suppressed:cooldown"
+        if not self.interview_cooldown_disabled:
+            if (now - self._ambient_last_fire) < self.AMBIENT_COOLDOWN_S: return "suppressed:cooldown"
         if sum(len(l) for l in (set(text.splitlines()) - set(self._ambient_last_text.splitlines()))) < self.AMBIENT_MIN_CHARS: return "suppressed:low_delta"
         self._ambient_last_fire, self._ambient_last_text = now, text
         self.session.add_user(f"[AMBIENT] Screen content:\n\n{text}\n\nSurface anything useful.", source)
@@ -197,6 +296,72 @@ class StateEngine:
         self._query(self.session.build_messages())
         return "fired"
 
+    def _interview(self, text: str, source: str) -> str:
+        """
+        Interview Mode dispatcher.
+
+        Audio sources ("mic" / "speaker") are prefixed with the canonical
+        [MIC] / [SPEAKER] labels the interview system prompt expects.
+        Direct "ask" messages (typed by the user) are passed through untagged
+        so the user can inject ad-hoc questions to the coach mid-interview.
+        """
+        if self.interview_turns >= self.INTERVIEW_MAX_TURNS:
+            return "suppressed:max_turns"
+        self.interview_turns += 1
+
+        if source == "mic":
+            labelled = f"[MIC] {text}"
+        elif source == "speaker":
+            labelled = f"[SPEAKER] {text}"
+        else:
+            labelled = text   # typed "ask" — no label needed
+
+        self.session.add_user(labelled, source)
+        self._query(self.session.build_messages())
+        return "fired"
+
+    def get_debug_state(self) -> str:
+        """
+        Compile a formatted diagnostic report of the current engine state.
+        Returned as a plain string ready to be printed into the UI response area.
+        """
+        import aceit_core as _self_mod   # runtime reference for the live GROQ_MODEL value
+
+        # ── Session buffer stats ──────────────────────────────────────────────
+        with self.session._lock:
+            buf_snapshot = list(self.session._buffer)
+        total_entries = len(buf_snapshot)
+        total_tokens  = sum(len(e.content) for e in buf_snapshot) // 6
+
+        # ── Audio status ──────────────────────────────────────────────────────
+        # StateEngine holds no direct reference to AudioEngine; we report what
+        # we know from the interview_cooldown_disabled flag as a proxy.
+        audio_hint = "Enabled (Interview cooldown bypassed)" if self.interview_cooldown_disabled else "Standard"
+
+        # ── Watcher sensitivity — stored on the session via SENSITIVITY keys ──
+        # We expose the raw SENSITIVITY dict keys for reference.
+        sens_keys = ", ".join(SENSITIVITY.keys())
+
+        lines = [
+            "╔══════════════════════════════════════╗",
+            "║         AceIt  Debug State           ║",
+            "╚══════════════════════════════════════╝",
+            "",
+            f"  Active Mode        : {self.mode_label}",
+            f"  Current Groq Model : {_self_mod.GROQ_MODEL}",
+            f"  Response Style     : {self.session.response_style}",
+            f"  Watcher Sensitivity: (available levels: {sens_keys})",
+            f"  Audio Status       : {audio_hint}",
+            "",
+            "  ── Session Buffer ──────────────────",
+            f"  Total Entries      : {total_entries}",
+            f"  Approx Tokens      : ~{total_tokens}",
+            f"  Session Active     : {self.session.is_active}",
+            f"  Session Summary    : {self.session.summary}",
+            "",
+        ]
+        return "\n".join(lines)
+
     def on_event(self, cb: Callable) -> None: self._listeners.append(cb)
     def _emit(self, t: str, p: dict | None = None) -> None:
         for cb in self._listeners:
@@ -205,7 +370,12 @@ class StateEngine:
     @property
     def mode(self) -> ModeState: return self._mode
     @property
-    def mode_label(self) -> str: return self._mode.name + (f" T{self.guided_turns}" if self._mode == ModeState.GUIDED else "")
+    def mode_label(self) -> str:
+        if self._mode == ModeState.GUIDED:
+            return f"GUIDED T{self.guided_turns}"
+        if self._mode == ModeState.INTERVIEW:
+            return f"INTERVIEW T{self.interview_turns}"
+        return self._mode.name
 
 class AudioEngine:
     SAMPLE_RATE = 16_000; CHUNK_SECS = 8; SILENCE_RMS = 0.004
