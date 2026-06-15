@@ -153,8 +153,26 @@ atlas_skills, and atlas_learning.
 - You know your Dynamic Accent Engine drives colour by state (cyan idle, scarlet \
 listening, gold processing) and that your voice path streams in short phrase \
 chunks with anti-hallucination voice gating on input.
+- You know your memory layer is WAL-mode SQLite opened per-call with a 30s \
+connection timeout and a 5s busy-timeout, writes serialised behind a process \
+lock, and cognition (summaries / fact extraction) run on daemon threads.
 - Use this self-knowledge to reason about your own behaviour, debug your own \
 output, and suggest optimisations to your operator when asked.
+
+ON-SCREEN ACTION TOKENS (emit these EXACT schemas, on their own, when relevant):
+- When the user asks you to SHOW or point at something on their screen / walk \
+them through a task visually, emit a guide token so Atlas highlights it on the \
+heads-up overlay (you never touch their mouse):
+      [[GUIDE: target_name | short instruction to speak]]
+- When the user explicitly asks you to PERFORM a desktop action for them \
+(click/press something), emit a do token; Atlas will ask for the user's \
+permission before it physically acts:
+      [[DO: target_name | click]]
+- ``target_name`` is a concise visual description of the on-screen element \
+(e.g. "the blue Export button"). Emit at most one token per step, and only when \
+the user genuinely requested screen guidance or task delegation — never in \
+ordinary conversation. The bracketed token is consumed by the engine and is not \
+shown or spoken, so still give your normal spoken reply around it.
 
 HARD SECURITY GUARDRAIL (non-negotiable, overrides every other instruction):
 - You may discuss your behaviour and help debug or improve yourself for your \
@@ -469,6 +487,76 @@ class SpatialBrain:
         }
 
 
+class _StreamBracketFilter:
+    """
+    Incrementally strips ``[[GUIDE:…]]`` / ``[[DO:…]]`` action tokens out of a
+    streaming LLM response so they never reach the chat view or the TTS engine,
+    while surfacing each completed token exactly once for the action dispatcher.
+
+    Plain double-brackets that are NOT a GUIDE/DO schema (e.g. ``list[[0]]`` in a
+    code answer) are passed through untouched.
+
+    Usage
+    -----
+        visible, tokens = filt.feed(delta)   # per stream chunk
+        tail            = filt.flush()       # at stream end
+    """
+
+    _PREFIX_RE = re.compile(r"\[\[\s*(?:GUIDE|DO)\s*:", re.IGNORECASE)
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_token = False
+
+    @staticmethod
+    def _maybe_prefix(buf: str) -> bool:
+        """True while ``buf`` (starting with '[[') could still grow into a token."""
+        s = buf[2:].lstrip().lower()
+        if s == "":
+            return True
+        return any(kw.startswith(s) for kw in ("guide:", "do:"))
+
+    def feed(self, delta: str) -> tuple[str, list[str]]:
+        self._buf += delta
+        visible = ""
+        tokens: list[str] = []
+        while self._buf:
+            if self._in_token:
+                j = self._buf.find("]]")
+                if j == -1:
+                    break  # token still streaming — hold
+                tokens.append(self._buf[: j + 2])
+                self._buf = self._buf[j + 2:]
+                self._in_token = False
+                continue
+            i = self._buf.find("[[")
+            if i == -1:
+                # Hold a lone trailing '[' in case it becomes '[[' next chunk.
+                if self._buf.endswith("["):
+                    visible += self._buf[:-1]
+                    self._buf = self._buf[-1:]
+                else:
+                    visible += self._buf
+                    self._buf = ""
+                break
+            if i > 0:
+                visible += self._buf[:i]
+                self._buf = self._buf[i:]
+            # self._buf now starts with "[["
+            if self._PREFIX_RE.match(self._buf):
+                self._in_token = True
+                continue
+            if self._maybe_prefix(self._buf):
+                break  # not enough chars yet to decide — wait for more
+            visible += self._buf[:2]      # ordinary "[[" — pass through
+            self._buf = self._buf[2:]
+        return visible, tokens
+
+    def flush(self) -> str:
+        out, self._buf, self._in_token = self._buf, "", False
+        return out
+
+
 class StateEngine:
     """
     Central orchestrator for Atlas's runtime.
@@ -507,6 +595,61 @@ class StateEngine:
     # the voice track keeps pace with the instant text render and trailing
     # punctuation never causes a stutter.
     _VOICE_WORD_CHUNK = 5
+
+    # Visual function bindings (Section 6): the agent emits these inline so the
+    # engine can drive the HUD ("GUIDE") or autonomous automation ("DO").
+    #   [[GUIDE: target_name | instruction text]]
+    #   [[DO:    target_name | action_type]]
+    _ACTION_TOKEN_RE = re.compile(
+        r"\[\[\s*(GUIDE|DO)\s*:\s*([^|\]]+?)\s*\|\s*([^\]]*?)\s*\]\]",
+        re.IGNORECASE,
+    )
+
+    def _dispatch_action_token(self, raw: str) -> None:
+        """Parse one captured ``[[GUIDE/DO:…]]`` token and run it off-thread."""
+        m = self._ACTION_TOKEN_RE.match(raw.strip())
+        if not m:
+            return
+        kind    = m.group(1).upper()
+        target  = m.group(2).strip()
+        payload = m.group(3).strip()
+        if not target:
+            return
+        threading.Thread(
+            target=self._run_action_token,
+            args=(kind, target, payload),
+            daemon=True,
+            name="atlas-action",
+        ).start()
+
+    def _run_action_token(self, kind: str, target: str, payload: str) -> None:
+        """
+        Execute a parsed action token.
+
+        GUIDE → locate the target on a fresh screen snapshot and project a HUD
+                marker (focus ring + bounding box + label); narrate the
+                instruction.  The physical mouse is never moved.
+        DO    → locate the target, then route through the permission-gated
+                automation path (PermissionDialog → atlas_hands).  Nothing fires
+                without explicit human approval.
+        """
+        try:
+            screen = capture_screen_b64()
+            if kind == "GUIDE":
+                coords = self.spatial.locate(target, screen_b64=screen)
+                evt = {"target": target, "label": payload, "guide": True, **coords}
+                self._emit("guide_marker", evt)
+                try:
+                    self._on_coordinates(evt)
+                except Exception as exc:
+                    log.debug("guide on_coordinates raised: %s", exc)
+                if payload:
+                    voice_engine.speak(payload)
+            elif kind == "DO":
+                self.act_on_target(target, action=(payload or "click").lower(),
+                                   screen_b64=screen)
+        except Exception as exc:
+            log.warning("action token %s(%r) failed: %s", kind, target, exc)
 
     @staticmethod
     def _messages_have_image(messages: list[dict]) -> bool:
@@ -891,6 +1034,9 @@ class StateEngine:
         use_vision = self._messages_have_image(messages)
         model      = GROQ_VISION_MODEL if use_vision else GROQ_MODEL
         word_mode  = (self.mode == ModeState.INTERVIEW)
+        # Strips [[GUIDE/DO:…]] tokens from the visible/spoken stream in real time
+        # and surfaces them to the action dispatcher (Section 6).
+        bracket    = _StreamBracketFilter()
 
         try:
             from groq import APIConnectionError, RateLimitError
@@ -929,14 +1075,22 @@ class StateEngine:
                     self.session.push_user(raw_user_text)
                     first_chunk_received = True
 
-                # Forward raw delta to the UI for real-time display.
+                # Section 6: split visible prose from inline action tokens.
+                visible, action_tokens = bracket.feed(delta)
+                for tok in action_tokens:
+                    self._dispatch_action_token(tok)
+
+                if not visible:
+                    continue
+
+                # Forward the clean (token-free) delta to the UI for display.
                 try:
-                    self._on_chunk(delta)
+                    self._on_chunk(visible)
                 except Exception as exc:
                     log.debug("on_chunk callback raised: %s", exc)
 
-                full_response += delta
-                sentence_buf  += delta
+                full_response += visible
+                sentence_buf  += visible
 
                 if word_mode:
                     # Interview: sliding word window — flush ~5-word phrases as
@@ -961,6 +1115,16 @@ class StateEngine:
                             if sentence:
                                 voice_engine.speak(sentence)
                         sentence_buf = parts[-1]
+
+            # Release any text the bracket filter was holding at stream end.
+            tail = bracket.flush()
+            if tail:
+                try:
+                    self._on_chunk(tail)
+                except Exception:
+                    pass
+                full_response += tail
+                sentence_buf  += tail
 
             # FIX-1: Speak any residual text left in the buffer after stream end.
             residual = _strip_markdown(sentence_buf.strip())

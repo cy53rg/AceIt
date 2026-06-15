@@ -1956,22 +1956,20 @@ class AtlasWindow(QMainWindow):
         self.setCentralWidget(self.root_widget)
 
         self.main_lay = QVBoxLayout(self.root_widget)
-        # Top margin reserves the strip the Ghost Ribbon fades into, keeping the
-        # orb centered directly below the (normally invisible) control matrix.
-        self.main_lay.setContentsMargins(10, 50, 10, 10)
-        self.main_lay.setSpacing(10)
+        self.main_lay.setContentsMargins(10, 10, 10, 10)
+        self.main_lay.setSpacing(8)
 
-        # ══ GHOST RIBBON ══════════════════════════════════════════════════════
-        # All window controls live here as a single ribbon overlaid on the top
-        # margin (not in the vertical flow).  It rests at 0.0 opacity and fades
-        # to 1.0 only while the cursor is within the top 45px of the window.
-        self.header = QFrame(self.root_widget)
+        # ══ CONTROL RIBBON ════════════════════════════════════════════════════
+        # Docked in the flow directly above the dialogue box (below the orb).  It
+        # rests dim (~20% opacity) and brightens to full while hovered, so it's
+        # always discoverable without cluttering the voice-first hero.
+        self.header = QFrame()
         self.header.setObjectName("titlebar")
-        self.header.setFixedHeight(44)
+        self.header.setFixedHeight(40)
 
         hdr_lay = QHBoxLayout(self.header)
         hdr_lay.setContentsMargins(12, 0, 10, 0)
-        hdr_lay.setSpacing(6)
+        hdr_lay.setSpacing(7)
 
         self.logo = QLabel("⚡ ATLAS")
         self.logo.setStyleSheet(
@@ -2020,34 +2018,44 @@ class AtlasWindow(QMainWindow):
             f"QComboBox QAbstractItemView {{ background: {PAL['surface_2']};"
             f"border: 1px solid {PAL['border']}; selection-background-color: {PAL['border']}; }}"
         )
+        self.mode_combo.setToolTip("Conversation mode")
         self.mode_combo.currentTextChanged.connect(self._on_mode_combo_changed)
         hdr_lay.addWidget(self.mode_combo)
+
+        # ── Opacity control (icon + slider) ───────────────────────────────────
+        op_icon = QLabel("◑")
+        op_icon.setToolTip("Window transparency")
+        op_icon.setStyleSheet(f"color: {PAL['muted']}; font-size: 13px; background: transparent;")
+        hdr_lay.addWidget(op_icon)
 
         self.op_slider = QSlider(Qt.Horizontal)
         self.op_slider.setRange(20, 100)
         self.op_slider.setValue(95)
-        self.op_slider.setFixedWidth(54)
-        self.op_slider.setToolTip("Window opacity")
+        self.op_slider.setFixedWidth(58)
+        self.op_slider.setToolTip("Window transparency")
         self.op_slider.valueChanged.connect(self.set_window_opacity_pct)
         hdr_lay.addWidget(self.op_slider)
 
-        self.btn_float   = self._make_hdr_btn("🗗", "Float Mode — dock to a screen edge as a small bubble. Click the bubble to restore.", self._toggle_float, PAL["cyan"])
-        self.btn_stealth = self._make_hdr_btn("🥷", "Stealth Mode — hide from screen capture", self._toggle_stealth, PAL["muted"])
-        self.btn_refresh  = self._make_hdr_btn("🔄", "Hot-Reload",     self._hot_reload)
-        self.btn_settings = self._make_hdr_btn("⚙",  "Control Center", self._open_control_center)
-        self.btn_close    = self._make_hdr_btn("✕",  "Close",           self.close)
+        hdr_lay.addWidget(self._hdr_separator())
+
+        # Clearer, function-accurate glyphs for the action cluster.
+        self.btn_float   = self._make_hdr_btn("🫧", "Float — shrink Atlas into a small floating bubble (click the bubble to restore)", self._toggle_float, PAL["cyan"])
+        self.btn_stealth = self._make_hdr_btn("🫥", "Stealth — hide Atlas from screen capture / screen sharing", self._toggle_stealth, PAL["muted"])
+        self.btn_refresh  = self._make_hdr_btn("⟳", "Hot-reload Atlas", self._hot_reload)
+        self.btn_settings = self._make_hdr_btn("⚙", "Settings & Control Center", self._open_control_center)
+        self.btn_close    = self._make_hdr_btn("✕", "Close Atlas", self.close, PAL["danger"])
         for b in [self.btn_float, self.btn_stealth, self.btn_refresh, self.btn_settings, self.btn_close]:
             hdr_lay.addWidget(b)
 
-        # ── Ghost Ribbon opacity engine ───────────────────────────────────────
+        # ── Control Ribbon opacity engine (dim at rest, full on hover) ─────────
+        self._RIBBON_REST = 0.20
         self._ribbon_opacity = QGraphicsOpacityEffect(self.header)
-        self._ribbon_opacity.setOpacity(0.0)
+        self._ribbon_opacity.setOpacity(self._RIBBON_REST)
         self.header.setGraphicsEffect(self._ribbon_opacity)
         self._ribbon_anim = QPropertyAnimation(self._ribbon_opacity, b"opacity", self)
         self._ribbon_anim.setDuration(200)
         self._ribbon_anim.setEasingCurve(QEasingCurve.InOutCubic)
         self._ribbon_visible = False
-        self.header.raise_()
         # Poll the cursor so the reveal works regardless of which child widget is
         # under the mouse (child widgets would otherwise swallow hover events).
         self._ribbon_timer = QTimer(self)
@@ -2083,6 +2091,8 @@ class AtlasWindow(QMainWindow):
         oz_lay.addWidget(self.orb_hint_lbl)
 
         self.main_lay.addWidget(self.orb_zone)
+        # Control ribbon docks here — below the orb, directly atop the dialogue box.
+        self.main_lay.addWidget(self.header)
 
         # ══ WORKSPACE ═════════════════════════════════════════════════════════
         self.workspace = QFrame()
@@ -2265,19 +2275,11 @@ class AtlasWindow(QMainWindow):
         self._orb_state = "idle"
         self._position_ribbon()
 
-    # ── Ghost Ribbon geometry + hover reveal ──────────────────────────────────
+    # ── Control Ribbon hover reveal ───────────────────────────────────────────
 
     def _position_ribbon(self) -> None:
-        """Span the ribbon across the top margin of the window."""
-        if not hasattr(self, "header"):
-            return
-        w = max(0, self.root_widget.width() - 20)
-        self.header.setGeometry(10, 6, w, 44)
-        self.header.raise_()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._position_ribbon()
+        """No-op retained for call-site compatibility (ribbon is layout-managed)."""
+        return
 
     def _animate_ribbon(self, target: float) -> None:
         self._ribbon_anim.stop()
@@ -2286,23 +2288,31 @@ class AtlasWindow(QMainWindow):
         self._ribbon_anim.start()
 
     def _check_ribbon_hover(self) -> None:
-        """Reveal the ribbon while the cursor is in the top 45px of the window."""
+        """Brighten the ribbon to full while the cursor is over it; rest dim otherwise."""
         if self._is_floating or not self.isVisible():
             if self._ribbon_visible:
-                self._animate_ribbon(0.0)
+                self._animate_ribbon(self._RIBBON_REST)
                 self._ribbon_visible = False
             return
-        pos = self.mapFromGlobal(QCursor.pos())
-        near_top = self.rect().contains(pos) and 0 <= pos.y() <= 45
-        if near_top and not self._ribbon_visible:
+        top_left = self.header.mapToGlobal(QPoint(0, 0))
+        rect = QRect(top_left, self.header.size()).adjusted(-6, -6, 6, 8)
+        over = rect.contains(QCursor.pos())
+        if over and not self._ribbon_visible:
             self._ribbon_visible = True
-            self.header.raise_()
             self._animate_ribbon(1.0)
-        elif not near_top and self._ribbon_visible:
+        elif not over and self._ribbon_visible:
             self._ribbon_visible = False
-            self._animate_ribbon(0.0)
+            self._animate_ribbon(self._RIBBON_REST)
 
     # ── Widget factories ──────────────────────────────────────────────────────
+
+    def _hdr_separator(self) -> QFrame:
+        """Thin vertical divider between the ribbon's control groups."""
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFixedHeight(20)
+        sep.setStyleSheet(f"color: {PAL['border']}; background: {PAL['border']}; max-width: 1px;")
+        return sep
 
     def _make_hdr_btn(self, icon, tip, cmd=None, accent: str = ""):
         btn = QPushButton(icon)
@@ -3015,13 +3025,16 @@ class AtlasWindow(QMainWindow):
 
     @Slot(dict)
     def _on_spatial_coords(self, coords: dict) -> None:
-        if coords.get("found") and self.overlay:
-            self.overlay.focus_on(
-                int(coords["x"]),
-                int(coords["y"]),
-                int(coords.get("w", 0)),
-                int(coords.get("h", 0)),
-            )
+        if not (coords.get("found") and self.overlay):
+            return
+        x, y = int(coords["x"]), int(coords["y"])
+        w, h = int(coords.get("w", 0)), int(coords.get("h", 0))
+        if coords.get("guide"):
+            # GUIDING marker: bounding box + ring + label. Instruction is spoken
+            # by the core action dispatcher, so don't double-speak here.
+            self.overlay.mark_target(x, y, w, h, label=str(coords.get("label", "")))
+        else:
+            self.overlay.focus_on(x, y, w, h)
             if voice_engine:
                 voice_engine.speak("Right here")
 
@@ -3621,15 +3634,23 @@ class AtlasWindow(QMainWindow):
 
     # ── Geometric Vortex Morph (Float Mode transition) ────────────────────────
 
+    def _orb_center_in_root(self) -> QPoint:
+        """Absolute geometric centre of the StatusOrb in workspace-parent coords."""
+        return self.orb.mapTo(
+            self.root_widget,
+            QPoint(self.orb.width() // 2, self.orb.height() // 2),
+        )
+
     def _run_vortex(self, collapsing: bool, on_done: Optional[Callable] = None) -> None:
         """
-        Warp the workspace into / out of the central StatusOrb.
+        Warp the workspace card into / out of the central StatusOrb.
 
-        A QParallelAnimationGroup drives a layout-safe height collapse (the card
-        scales down and slides up toward the orb that sits above it) together
-        with a QGraphicsOpacityEffect fade.  Collapse uses InBack (vortex pull);
-        the reverse uses OutCubic (project back out).  The orb itself never
-        moves — it stays pinned while the workspace converges on it.
+        A QParallelAnimationGroup drives the actual QRect geometry of the card —
+        scaling it down and sliding it up so its bounding centre converges on the
+        orb's absolute centre — paired with a QGraphicsOpacityEffect fade.
+        Collapse uses InBack (sucked into the vortex over 350ms); the reverse
+        uses OutCubic (projected back out).  The orb never moves; the layout is
+        frozen for the duration so it can't fight the geometry animation.
         """
         ws = self.workspace
         old = getattr(self, "_vortex_group", None)
@@ -3642,34 +3663,44 @@ class AtlasWindow(QMainWindow):
             self._ws_vortex_effect = eff
         ws.setGraphicsEffect(eff)
 
-        full_h = getattr(self, "_ws_full_h", 0) or ws.height() or 420
+        # Freeze the layout so it doesn't reassert the card's geometry mid-warp.
+        self.main_lay.setEnabled(False)
 
-        grp = QParallelAnimationGroup(self)
-        op  = QPropertyAnimation(eff, b"opacity", self)
-        op.setDuration(350)
-        hh  = QPropertyAnimation(ws, b"maximumHeight", self)
-        hh.setDuration(350)
+        c = self._orb_center_in_root()
+        small = QRect(c.x() - 12, c.y() - 12, 24, 24)
 
         if collapsing:
-            eff.setOpacity(1.0)
-            op.setStartValue(1.0); op.setEndValue(0.0)
-            op.setEasingCurve(QEasingCurve.InBack)
-            hh.setStartValue(full_h); hh.setEndValue(0)
-            hh.setEasingCurve(QEasingCurve.InBack)
+            full = ws.geometry()
+            self._ws_full_rect = QRect(full)
+            start_rect, end_rect = full, small
+            start_op, end_op, curve = 1.0, 0.0, QEasingCurve.InBack
         else:
-            eff.setOpacity(0.0)
-            ws.setMaximumHeight(0)
-            op.setStartValue(0.0); op.setEndValue(1.0)
-            op.setEasingCurve(QEasingCurve.OutCubic)
-            hh.setStartValue(0); hh.setEndValue(full_h)
-            hh.setEasingCurve(QEasingCurve.OutCubic)
+            full = getattr(self, "_ws_full_rect", None) or ws.geometry()
+            ws.setGeometry(small)
+            start_rect, end_rect = small, full
+            start_op, end_op, curve = 0.0, 1.0, QEasingCurve.OutCubic
 
+        eff.setOpacity(start_op)
+
+        grp = QParallelAnimationGroup(self)
+        geo = QPropertyAnimation(ws, b"geometry", self)
+        geo.setDuration(350)
+        geo.setStartValue(start_rect)
+        geo.setEndValue(end_rect)
+        geo.setEasingCurve(curve)
+        op = QPropertyAnimation(eff, b"opacity", self)
+        op.setDuration(350)
+        op.setStartValue(start_op)
+        op.setEndValue(end_op)
+        op.setEasingCurve(curve)
+        grp.addAnimation(geo)
         grp.addAnimation(op)
-        grp.addAnimation(hh)
 
         def _cleanup() -> None:
             if not collapsing:
-                ws.setMaximumHeight(16777215)
+                # Hand geometry management back to the layout and drop the effect.
+                self.main_lay.setEnabled(True)
+                self.main_lay.activate()
                 ws.setGraphicsEffect(None)
             if on_done:
                 on_done()
