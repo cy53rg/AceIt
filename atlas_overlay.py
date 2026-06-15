@@ -1,18 +1,25 @@
 """
-atlas_overlay.py — HoloOverlay transparent focus ring (PySide6 only).
+atlas_overlay.py — HoloOverlay transparent HUD (PySide6 only).
+
+The HUD is the "GUIDING" surface: it draws non-interactive virtual markers over
+the live screen (focus rings, target bounding boxes, trajectory path lines) so
+Atlas can teach a task step-by-step WITHOUT ever moving the physical mouse.
+Physical automation ("DOING") lives entirely in atlas_core.AtlasHands behind the
+permission gate — the two never mix.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import (
     QEasingCurve,
     QPointF,
+    QRectF,
     Property,
     QPropertyAnimation,
     QSequentialAnimationGroup,
     Qt,
     QTimer,
 )
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 
@@ -42,6 +49,14 @@ class HoloOverlay(QWidget):
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._start_fade_out)
+
+        # GUIDING marker state (drawn alongside the focus ring).
+        self._box: QRectF | None = None     # highlighted target bounding box
+        self._label: str = ""               # caption shown above the box/ring
+        self._path: list[QPointF] = []       # trajectory vector path points
+        self._marker_timer = QTimer(self)
+        self._marker_timer.setSingleShot(True)
+        self._marker_timer.timeout.connect(self.clear_markers)
 
     def get_ring_pos(self) -> QPointF:
         return self._ring_pos
@@ -121,6 +136,44 @@ class HoloOverlay(QWidget):
 
         move.finished.connect(_pulse)
 
+    # ── GUIDING markers (no mouse control — purely visual tutorial overlay) ────
+
+    def mark_target(
+        self, x: int, y: int, w: int, h: int,
+        label: str = "", hold_ms: int = 4000,
+    ) -> None:
+        """
+        Highlight a UI target with a bounding box + focus ring + optional label.
+
+        Used by GUIDING mode to point at a control while a voice tutorial plays —
+        Atlas never clicks it for the user, it shows them where to go.
+        """
+        self._marker_timer.stop()
+        self._box = QRectF(float(x), float(y), float(max(1, w)), float(max(1, h)))
+        self._label = str(label or "")
+        self.focus_on(x, y, w, h)
+        if hold_ms > 0:
+            self._marker_timer.start(hold_ms)
+
+    def draw_path(self, points: list[tuple[int, int]], hold_ms: int = 4500) -> None:
+        """Draw a trajectory vector path (connected arrowed line) over the screen."""
+        self._marker_timer.stop()
+        self._path = [QPointF(float(px), float(py)) for px, py in points]
+        if self._ring_opacity <= 0.01:
+            self.set_ring_opacity(1.0)
+        if not self.isVisible():
+            self.show()
+        self.update()
+        if hold_ms > 0:
+            self._marker_timer.start(hold_ms)
+
+    def clear_markers(self) -> None:
+        """Drop boxes/paths/labels and fade the HUD out."""
+        self._box = None
+        self._label = ""
+        self._path = []
+        self._start_fade_out()
+
     def _start_fade_out(self) -> None:
         fade = QPropertyAnimation(self, b"ring_opacity")
         fade.setDuration(500)
@@ -165,3 +218,33 @@ class HoloOverlay(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 212, 255, 255))
         painter.drawEllipse(QPointF(cx, cy), 3, 3)
+
+        # ── GUIDING bounding box ──────────────────────────────────────────────
+        if self._box is not None:
+            box_pen = QPen(QColor(0, 212, 255, alpha_inner), 2.0)
+            box_pen.setStyle(Qt.DashLine)
+            painter.setPen(box_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(self._box, 6, 6)
+
+        # ── GUIDING caption ───────────────────────────────────────────────────
+        if self._label:
+            painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
+            painter.setPen(QPen(QColor(212, 175, 55, alpha_inner)))
+            anchor = self._box if self._box is not None else QRectF(cx - 100, cy - 60, 200, 20)
+            painter.drawText(
+                QRectF(anchor.left(), anchor.top() - 26, max(220.0, anchor.width()), 22),
+                Qt.AlignLeft | Qt.AlignVCenter, self._label,
+            )
+
+        # ── GUIDING trajectory path ───────────────────────────────────────────
+        if len(self._path) >= 2:
+            path_pen = QPen(QColor(212, 175, 55, alpha_inner), 2.5)
+            path_pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(path_pen)
+            for i in range(len(self._path) - 1):
+                painter.drawLine(self._path[i], self._path[i + 1])
+            # Endpoint node so the destination reads clearly.
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(212, 175, 55, alpha_inner))
+            painter.drawEllipse(self._path[-1], 5, 5)

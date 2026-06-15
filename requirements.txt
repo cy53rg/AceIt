@@ -21,3 +21,6 @@ mss
 pyperclip
 markdown-it-py
 pymupdf
+# Optional premium streaming TTS — used only when ELEVENLABS_API_KEY + VOICE_ID
+# are set; Atlas falls back to offline Kokoro automatically when absent.
+elevenlabs

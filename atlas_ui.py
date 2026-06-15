@@ -41,12 +41,13 @@ import keyboard
 import pyperclip
 
 from PySide6.QtCore import (
-    Qt, QPoint, QSize, QPropertyAnimation, QVariantAnimation, QEasingCurve, QRect,
+    Qt, QPoint, QSize, QPropertyAnimation, QVariantAnimation, QParallelAnimationGroup,
+    QEasingCurve, QRect,
     QRectF, QPointF, QTimer, Signal, QObject, Slot, QThread, Property, QUrl, QStringListModel,
 )
 from PySide6.QtGui import (
     QColor, QFont, QIcon, QTextCursor, QPainter, QPen, QBrush, QAction, QDragEnterEvent, QDropEvent,
-    QRadialGradient,
+    QRadialGradient, QCursor,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
@@ -1955,13 +1956,18 @@ class AtlasWindow(QMainWindow):
         self.setCentralWidget(self.root_widget)
 
         self.main_lay = QVBoxLayout(self.root_widget)
-        self.main_lay.setContentsMargins(10, 10, 10, 10)
+        # Top margin reserves the strip the Ghost Ribbon fades into, keeping the
+        # orb centered directly below the (normally invisible) control matrix.
+        self.main_lay.setContentsMargins(10, 50, 10, 10)
         self.main_lay.setSpacing(10)
 
-        # ══ TITLE BAR ═════════════════════════════════════════════════════════
-        self.header = QFrame()
+        # ══ GHOST RIBBON ══════════════════════════════════════════════════════
+        # All window controls live here as a single ribbon overlaid on the top
+        # margin (not in the vertical flow).  It rests at 0.0 opacity and fades
+        # to 1.0 only while the cursor is within the top 45px of the window.
+        self.header = QFrame(self.root_widget)
         self.header.setObjectName("titlebar")
-        self.header.setFixedHeight(48)
+        self.header.setFixedHeight(44)
 
         hdr_lay = QHBoxLayout(self.header)
         hdr_lay.setContentsMargins(12, 0, 10, 0)
@@ -2033,7 +2039,21 @@ class AtlasWindow(QMainWindow):
         for b in [self.btn_float, self.btn_stealth, self.btn_refresh, self.btn_settings, self.btn_close]:
             hdr_lay.addWidget(b)
 
-        self.main_lay.addWidget(self.header)
+        # ── Ghost Ribbon opacity engine ───────────────────────────────────────
+        self._ribbon_opacity = QGraphicsOpacityEffect(self.header)
+        self._ribbon_opacity.setOpacity(0.0)
+        self.header.setGraphicsEffect(self._ribbon_opacity)
+        self._ribbon_anim = QPropertyAnimation(self._ribbon_opacity, b"opacity", self)
+        self._ribbon_anim.setDuration(200)
+        self._ribbon_anim.setEasingCurve(QEasingCurve.InOutCubic)
+        self._ribbon_visible = False
+        self.header.raise_()
+        # Poll the cursor so the reveal works regardless of which child widget is
+        # under the mouse (child widgets would otherwise swallow hover events).
+        self._ribbon_timer = QTimer(self)
+        self._ribbon_timer.setInterval(90)
+        self._ribbon_timer.timeout.connect(self._check_ribbon_hover)
+        self._ribbon_timer.start()
 
         # ══ ORB ZONE — voice-first hero ═══════════════════════════════════════
         self.orb_zone = QFrame()
@@ -2243,6 +2263,44 @@ class AtlasWindow(QMainWindow):
         self.setStyleSheet(QSS_BASE)
         self.setWindowOpacity(0.95)
         self._orb_state = "idle"
+        self._position_ribbon()
+
+    # ── Ghost Ribbon geometry + hover reveal ──────────────────────────────────
+
+    def _position_ribbon(self) -> None:
+        """Span the ribbon across the top margin of the window."""
+        if not hasattr(self, "header"):
+            return
+        w = max(0, self.root_widget.width() - 20)
+        self.header.setGeometry(10, 6, w, 44)
+        self.header.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_ribbon()
+
+    def _animate_ribbon(self, target: float) -> None:
+        self._ribbon_anim.stop()
+        self._ribbon_anim.setStartValue(self._ribbon_opacity.opacity())
+        self._ribbon_anim.setEndValue(target)
+        self._ribbon_anim.start()
+
+    def _check_ribbon_hover(self) -> None:
+        """Reveal the ribbon while the cursor is in the top 45px of the window."""
+        if self._is_floating or not self.isVisible():
+            if self._ribbon_visible:
+                self._animate_ribbon(0.0)
+                self._ribbon_visible = False
+            return
+        pos = self.mapFromGlobal(QCursor.pos())
+        near_top = self.rect().contains(pos) and 0 <= pos.y() <= 45
+        if near_top and not self._ribbon_visible:
+            self._ribbon_visible = True
+            self.header.raise_()
+            self._animate_ribbon(1.0)
+        elif not near_top and self._ribbon_visible:
+            self._ribbon_visible = False
+            self._animate_ribbon(0.0)
 
     # ── Widget factories ──────────────────────────────────────────────────────
 
@@ -3561,8 +3619,77 @@ class AtlasWindow(QMainWindow):
             f"border: 1px solid #{alpha}{PAL['cyan_dim'].lstrip('#')}; }}"
         )
 
+    # ── Geometric Vortex Morph (Float Mode transition) ────────────────────────
+
+    def _run_vortex(self, collapsing: bool, on_done: Optional[Callable] = None) -> None:
+        """
+        Warp the workspace into / out of the central StatusOrb.
+
+        A QParallelAnimationGroup drives a layout-safe height collapse (the card
+        scales down and slides up toward the orb that sits above it) together
+        with a QGraphicsOpacityEffect fade.  Collapse uses InBack (vortex pull);
+        the reverse uses OutCubic (project back out).  The orb itself never
+        moves — it stays pinned while the workspace converges on it.
+        """
+        ws = self.workspace
+        old = getattr(self, "_vortex_group", None)
+        if old is not None:
+            old.stop()
+
+        eff = getattr(self, "_ws_vortex_effect", None)
+        if eff is None:
+            eff = QGraphicsOpacityEffect(ws)
+            self._ws_vortex_effect = eff
+        ws.setGraphicsEffect(eff)
+
+        full_h = getattr(self, "_ws_full_h", 0) or ws.height() or 420
+
+        grp = QParallelAnimationGroup(self)
+        op  = QPropertyAnimation(eff, b"opacity", self)
+        op.setDuration(350)
+        hh  = QPropertyAnimation(ws, b"maximumHeight", self)
+        hh.setDuration(350)
+
+        if collapsing:
+            eff.setOpacity(1.0)
+            op.setStartValue(1.0); op.setEndValue(0.0)
+            op.setEasingCurve(QEasingCurve.InBack)
+            hh.setStartValue(full_h); hh.setEndValue(0)
+            hh.setEasingCurve(QEasingCurve.InBack)
+        else:
+            eff.setOpacity(0.0)
+            ws.setMaximumHeight(0)
+            op.setStartValue(0.0); op.setEndValue(1.0)
+            op.setEasingCurve(QEasingCurve.OutCubic)
+            hh.setStartValue(0); hh.setEndValue(full_h)
+            hh.setEasingCurve(QEasingCurve.OutCubic)
+
+        grp.addAnimation(op)
+        grp.addAnimation(hh)
+
+        def _cleanup() -> None:
+            if not collapsing:
+                ws.setMaximumHeight(16777215)
+                ws.setGraphicsEffect(None)
+            if on_done:
+                on_done()
+
+        grp.finished.connect(_cleanup)
+        self._vortex_group = grp
+        grp.start()
+
     def _enter_float(self):
+        if self._is_floating:
+            return
+        self._ws_full_h = self.workspace.height()
         self._is_floating = True
+        if getattr(self, "_ribbon_visible", False):
+            self._animate_ribbon(0.0)
+            self._ribbon_visible = False
+        # Collapse the card into the orb, THEN dock the bubble.
+        self._run_vortex(collapsing=True, on_done=self._finish_enter_float)
+
+    def _finish_enter_float(self):
         self.hide()
         bright, _ = self._get_pulse_accent()
         center = self.geometry().center()
@@ -3577,11 +3704,15 @@ class AtlasWindow(QMainWindow):
 
     def _leave_float(self):
         self._stop_pulse()
-        self._is_floating = False
         self._pill_win.hide()
         self._bubble.hide()
         self.show()
         self.raise_()
+        # Project the workspace back out of the orb, then clear the float flag.
+        self._run_vortex(
+            collapsing=False,
+            on_done=lambda: setattr(self, "_is_floating", False),
+        )
 
     def _toggle_float(self):
         if self._is_floating:
