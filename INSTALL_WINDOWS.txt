@@ -1,7 +1,7 @@
-AceIt on Windows — install Tesseract (OCR)
+Atlas on Windows — install Tesseract (OCR)
 ==========================================
 
-AceIt uses the Tesseract OCR engine through the Python package "pytesseract". Pip only
+Atlas uses the Tesseract OCR engine through the Python package "pytesseract". Pip only
 installs the Python wrapper; you must install the Tesseract program once.
 
 1) Download the Windows installer (64-bit) from the UB Mannheim build page:
@@ -12,13 +12,24 @@ installs the Python wrapper; you must install the Tesseract program once.
    - Enable "English" language data (usually selected by default).
 
 3) On the installer screen that offers "Add to PATH", enable it if you can. If you skip
-   it, AceIt will still try the default path C:\Program Files\Tesseract-OCR\tesseract.exe.
+   it, Atlas will still try the default path C:\Program Files\Tesseract-OCR\tesseract.exe.
 
 4) Close and reopen your terminal, then in your project folder:
 
       python -m pip install -U pip
       python -m pip install -r requirements.txt
-      python main.py
+
+5) Create a `.env` file with your Groq API key:
+
+      GROQ_API_KEY=your_key_here
+
+6) Verify the environment:
+
+      python verify_env.py
+
+7) Launch Atlas:
+
+      python atlas_ui.py
 
 If OCR fails with "tesseract is not installed": fix the path — either add the Tesseract
 folder to your user PATH or set the environment variable TESSERACT_CMD to the full path
@@ -30,7 +41,7 @@ of tesseract.exe, for example:
 If pip fails while "Building wheel for python-bidi" (EasyOCR)
 ============================================================
 
-That error comes from the **EasyOCR** stack, not from current AceIt. This repo uses
+That error comes from the **EasyOCR** stack, not from Atlas. This repo uses
 **pytesseract** + the Tesseract app instead, so pip should not pull in python-bidi.
 
 Do this:
@@ -47,6 +58,6 @@ Do this:
 
       python verify_env.py
 
-You do **not** need Visual Studio Build Tools for AceIt's OCR with the current
+You do **not** need Visual Studio Build Tools for Atlas OCR with the current
 requirements. See BUILD_TOOLS_WINDOWS.txt for the rare case where some other package
 still builds from source.
