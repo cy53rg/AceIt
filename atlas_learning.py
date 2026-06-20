@@ -33,7 +33,14 @@ class LearningEngine:
         return self.memory._get_groq()
 
     def on_turn_complete(self, user_text: str, ai_text: str) -> None:
-        """Loop 1 + 3 bookkeeping after each assistant response."""
+        """
+        Single post-turn cognition pass: extract durable facts (reinforcing
+        known ones, learning new ones) and run periodic persona-drift checks.
+
+        This is the ONLY fact-extraction path per turn — StateEngine no longer
+        also calls extract_and_store_facts_async, so each turn costs one Groq
+        extraction instead of two.
+        """
         facts = self.memory.extract_facts_from_turn(user_text, ai_text)
         existing = {
             (str(f["category"]).lower(), str(f["key"]).lower()): f
@@ -53,6 +60,12 @@ class LearningEngine:
                     confidence=0.6,
                     source="learned",
                 )
+        # Preserve the Qt signal so UI indicators can still react to learning.
+        if facts and getattr(self.memory, "signals", None) is not None:
+            try:
+                self.memory.signals.facts_extracted.emit(self.user_id, facts)
+            except Exception:
+                pass
 
         with self._lock:
             self._recent_responses.append(ai_text)

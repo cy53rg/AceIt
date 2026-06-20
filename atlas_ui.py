@@ -101,6 +101,13 @@ except ImportError:
     HoloOverlay = None  # type: ignore
     HAS_OVERLAY = False
 
+try:
+    from atlas_accounts import AccountManager
+    HAS_ACCOUNTS = True
+except Exception:
+    AccountManager = None  # type: ignore
+    HAS_ACCOUNTS = False
+
 AUTOSAVE_PATH = Path.home() / ".atlas" / "autosave.json"
 
 
@@ -439,7 +446,7 @@ class ChatInputEntry(QLineEdit):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class SettingsDialog(QDialog):
-    """Six-tab settings: Model, Audio, Appearance, Skills, Memory, Hotkeys."""
+    """Settings: Model, Audio, Appearance, Skills, Memory, Context, Account, Hotkeys."""
 
     W, H = 520, 580
 
@@ -463,6 +470,9 @@ class SettingsDialog(QDialog):
         self._build_appearance_tab()
         self._build_skills_tab()
         self._build_memory_tab()
+        self._build_context_tab()
+        self._build_account_tab()
+        self._build_security_tab()
         self._build_hotkeys_tab()
 
         done = QPushButton("Close")
@@ -550,7 +560,25 @@ class SettingsDialog(QDialog):
         if current_voice in voices:
             self.voice_combo.setCurrentText(current_voice)
         self.voice_combo.currentTextChanged.connect(self._on_voice_changed)
-        lay.addWidget(QLabel("Voice"))
+
+        # Premium ElevenLabs voice picker — named free-tier defaults; Brian on
+        # launch.  Changing it switches the live streaming voice immediately.
+        self.eleven_combo = QComboBox()
+        eleven_voices = dict(getattr(_core_mod, "ELEVEN_VOICES", {})) if _CORE else {}
+        if eleven_voices:
+            for name, vid in eleven_voices.items():
+                self.eleven_combo.addItem(name, vid)
+            cur_id = getattr(voice_engine, "eleven_voice_id", "") if voice_engine else ""
+            for i in range(self.eleven_combo.count()):
+                if self.eleven_combo.itemData(i) == cur_id:
+                    self.eleven_combo.setCurrentIndex(i)
+                    break
+            self.eleven_combo.currentIndexChanged.connect(self._on_eleven_voice_changed)
+            lay.addWidget(QLabel("Voice (ElevenLabs)"))
+            lay.addWidget(self.eleven_combo)
+            lay.addWidget(QLabel("Fallback voice (offline Kokoro)"))
+        else:
+            lay.addWidget(QLabel("Voice"))
         lay.addWidget(self.voice_combo)
         self.speed_sld = QSlider(Qt.Horizontal)
         self.speed_sld.setRange(50, 200)
@@ -570,6 +598,20 @@ class SettingsDialog(QDialog):
         if voice_engine is not None and name:
             voice_engine.set_voice(name)
             self.ui.bridge.set_status.emit(f"Voice → {name}")
+
+    def _on_eleven_voice_changed(self, index: int) -> None:
+        if voice_engine is None or index < 0:
+            return
+        name = self.eleven_combo.itemText(index)
+        vid  = self.eleven_combo.itemData(index)
+        if not vid:
+            return
+        try:
+            voice_engine.set_eleven_voice(vid)
+            self.ui.bridge.set_status.emit(f"Voice → {name} (ElevenLabs)")
+            voice_engine.speak(f"This is {name}, your new Atlas voice.")
+        except Exception as exc:
+            self.ui.bridge.set_status.emit(f"Voice change failed: {exc}")
 
     def _on_speed_changed(self, pct: int) -> None:
         if voice_engine is not None:
@@ -642,6 +684,310 @@ class SettingsDialog(QDialog):
         lay.addLayout(btn_row)
         self.tabs.addTab(w, "Memory")
         self.tabs.currentChanged.connect(lambda i: self._refresh_memory() if i == 4 else None)
+
+    def _build_context_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "<b>Standing context</b> — notes Atlas applies to every reply, "
+            "in all modes. e.g. <i>\"I'm a left-handed designer; prefer concise "
+            "answers.\"</i>"))
+        self.context_list = QListWidget()
+        self.context_list.setWordWrap(True)
+        lay.addWidget(self.context_list, 1)
+        add_row = QHBoxLayout()
+        self.context_in = QLineEdit()
+        self.context_in.setPlaceholderText("Add a standing note…")
+        self.context_in.returnPressed.connect(self._add_context)
+        btn_add = QPushButton("Add")
+        btn_add.clicked.connect(self._add_context)
+        add_row.addWidget(self.context_in, 1)
+        add_row.addWidget(btn_add)
+        lay.addLayout(add_row)
+        btn_del = QPushButton("Delete selected")
+        btn_del.clicked.connect(self._del_context)
+        lay.addWidget(btn_del)
+        self.tabs.addTab(w, "Context")
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_context() if i == 5 else None)
+
+    def _refresh_context(self) -> None:
+        self.context_list.clear()
+        if not self.engine:
+            return
+        try:
+            items = self.engine.list_global_context()
+        except Exception:
+            items = []
+        if not items:
+            placeholder = QListWidgetItem("No standing notes yet.")
+            placeholder.setFlags(Qt.NoItemFlags)
+            self.context_list.addItem(placeholder)
+            return
+        for c in items:
+            item = QListWidgetItem(c.get("content", ""))
+            item.setData(Qt.UserRole, c.get("id"))
+            self.context_list.addItem(item)
+
+    def _add_context(self) -> None:
+        if not self.engine:
+            return
+        text = self.context_in.text().strip()
+        if not text:
+            return
+        try:
+            self.engine.add_global_context(text)
+            self.context_in.clear()
+            self._refresh_context()
+            self.ui.bridge.set_status.emit("Standing note added ✓")
+        except Exception as exc:
+            self.ui.bridge.set_status.emit(f"Couldn't add note: {exc}")
+
+    def _del_context(self) -> None:
+        if not self.engine:
+            return
+        item = self.context_list.currentItem()
+        cid = item.data(Qt.UserRole) if item else None
+        if cid is None:
+            return
+        try:
+            self.engine.delete_global_context(int(cid))
+            self._refresh_context()
+            self.ui.bridge.set_status.emit("Standing note removed")
+        except Exception as exc:
+            self.ui.bridge.set_status.emit(f"Couldn't remove note: {exc}")
+
+    def _build_account_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(12)
+        self.account_lbl = QLabel("")
+        self.account_lbl.setWordWrap(True)
+        lay.addWidget(self.account_lbl)
+        self.btn_sync = QPushButton("Sync now")
+        self.btn_sync.clicked.connect(self._account_sync)
+        lay.addWidget(self.btn_sync)
+        btn_switch = QPushButton("Switch account…")
+        btn_switch.clicked.connect(self._account_switch)
+        lay.addWidget(btn_switch)
+        lay.addStretch()
+        self.tabs.addTab(w, "Account")
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_account() if i == 6 else None)
+
+    def _refresh_account(self) -> None:
+        acct = getattr(self.ui, "account", None)
+        name = os.environ.get("ATLAS_USER", "guest")
+        if acct and acct.cloud_available:
+            who = acct.email or name
+            self.account_lbl.setText(
+                f"<b>{who}</b><br><span style='color:{PAL['success']}'>"
+                f"☁ Cloud sync ON</span>")
+            self.btn_sync.setEnabled(bool(getattr(acct.cloud, "cloud_id", None)))
+        else:
+            self.account_lbl.setText(
+                f"<b>{name}</b><br><span style='color:{PAL['muted']}'>"
+                f"Local profile (offline)</span>")
+            self.btn_sync.setEnabled(False)
+
+    def _account_sync(self) -> None:
+        acct = getattr(self.ui, "account", None)
+        if not (acct and self.engine):
+            return
+        self.ui.bridge.set_status.emit("Syncing…")
+
+        def _work():
+            try:
+                acct.sync_up(self.engine.user_id)
+                acct.sync_down(self.engine.user_id)
+                self.ui.bridge.set_status.emit("Synced ✓")
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(f"Sync failed: {exc}")
+
+        threading.Thread(target=_work, daemon=True, name="atlas-sync").start()
+
+    def _account_switch(self) -> None:
+        acct = getattr(self.ui, "account", None)
+        if not acct:
+            return
+        acct.sign_out()
+        dlg = LoginDialog(acct, self)
+        if dlg.exec() == QDialog.Accepted and dlg.user_id and self.engine:
+            os.environ["ATLAS_USER"] = dlg.user_name
+            self.engine.set_user(dlg.user_id, dlg.user_name)
+            self._refresh_account()
+            self.ui.bridge.set_status.emit(f"Signed in as {dlg.user_name}")
+
+    def _build_security_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        lay.addWidget(QLabel(
+            "<b>Two-step verification</b> — extra check when signing in."))
+        self.twofa_combo = QComboBox()
+        self.twofa_combo.addItems(["Off", "Email code", "Authenticator app"])
+        lay.addWidget(self.twofa_combo)
+        self.btn_twofa_apply = QPushButton("Apply 2FA setting")
+        self.btn_twofa_apply.clicked.connect(self._apply_twofa)
+        lay.addWidget(self.btn_twofa_apply)
+        self.twofa_status = QLabel("")
+        self.twofa_status.setWordWrap(True)
+        lay.addWidget(self.twofa_status)
+
+        lay.addWidget(QLabel("<b>Change password</b> (local profile)"))
+        self.sec_old_pw = QLineEdit()
+        self.sec_old_pw.setPlaceholderText("Current password")
+        self.sec_old_pw.setEchoMode(QLineEdit.Password)
+        self.sec_new_pw = QLineEdit()
+        self.sec_new_pw.setPlaceholderText("New password")
+        self.sec_new_pw.setEchoMode(QLineEdit.Password)
+        for f in (self.sec_old_pw, self.sec_new_pw):
+            lay.addWidget(f)
+        btn_pw = QPushButton("Update password")
+        btn_pw.clicked.connect(self._change_password)
+        lay.addWidget(btn_pw)
+
+        lay.addWidget(QLabel("<b>App lock</b> — PIN required after idle (optional)"))
+        self.sec_pin = QLineEdit()
+        self.sec_pin.setPlaceholderText("4+ digit PIN")
+        self.sec_pin.setEchoMode(QLineEdit.Password)
+        self.sec_pin.setMaxLength(12)
+        lay.addWidget(self.sec_pin)
+        btn_pin = QPushButton("Set app lock PIN")
+        btn_pin.clicked.connect(self._set_app_lock)
+        lay.addWidget(btn_pin)
+
+        self.chk_pause_sensing = QCheckBox("Pause all sensing (mic, screen watch, camera)")
+        self.chk_pause_sensing.toggled.connect(self._toggle_pause_sensing)
+        lay.addWidget(self.chk_pause_sensing)
+
+        btn_clear = QPushButton("Clear all my remembered facts")
+        btn_clear.clicked.connect(self._security_clear_memory)
+        lay.addWidget(btn_clear)
+        btn_export = QPushButton("Export my data (JSON)")
+        btn_export.clicked.connect(self._security_export_data)
+        lay.addWidget(btn_export)
+
+        lay.addStretch()
+        self.tabs.addTab(w, "Security")
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_security() if i == 7 else None)
+
+    def _refresh_security(self) -> None:
+        acct = getattr(self.ui, "account", None)
+        if not (acct and self.engine):
+            return
+        sec = acct.get_security(self.engine.user_id)
+        method = sec.get("twofa_method", "none")
+        idx = {"none": 0, "email": 1, "totp": 2}.get(method, 0)
+        self.twofa_combo.setCurrentIndex(idx)
+        self.chk_pause_sensing.blockSignals(True)
+        self.chk_pause_sensing.setChecked(sec.get("pause_sensing", False))
+        self.chk_pause_sensing.blockSignals(False)
+        if sec.get("twofa_enabled"):
+            self.twofa_status.setText(
+                f"2FA active via {'email' if method == 'email' else 'authenticator app'}.")
+        else:
+            self.twofa_status.setText("Two-step verification is off.")
+
+    def _apply_twofa(self) -> None:
+        acct = getattr(self.ui, "account", None)
+        if not (acct and self.engine):
+            return
+        uid = self.engine.user_id
+        choice = self.twofa_combo.currentText()
+        if choice == "Off":
+            acct.disable_2fa(uid)
+            self.ui.bridge.set_status.emit("Two-step verification disabled.")
+            self._refresh_security()
+            return
+        if choice == "Email code":
+            ok, msg = acct.enable_email_2fa(uid)
+        else:
+            secret, uri = acct.setup_totp_secret(uid)
+            from PySide6.QtWidgets import QInputDialog
+            code, ok_d = QInputDialog.getText(
+                self, "Link authenticator",
+                f"Add this secret to Google Authenticator / Authy:\n\n{secret}\n\n"
+                f"Or scan URI:\n{uri}\n\nEnter the 6-digit code to confirm:")
+            if not ok_d:
+                return
+            ok, msg = acct.confirm_totp_setup(uid, code)
+        self.twofa_status.setText(msg)
+        self.ui.bridge.set_status.emit(msg)
+        self._refresh_security()
+
+    def _change_password(self) -> None:
+        acct = getattr(self.ui, "account", None)
+        if not (acct and self.engine):
+            return
+        ok, msg = acct.change_password_local(
+            self.engine.user_id, self.sec_old_pw.text(), self.sec_new_pw.text())
+        self.ui.bridge.set_status.emit(msg)
+        if ok:
+            self.sec_old_pw.clear()
+            self.sec_new_pw.clear()
+
+    def _set_app_lock(self) -> None:
+        acct = getattr(self.ui, "account", None)
+        if not (acct and self.engine):
+            return
+        ok, msg = acct.set_app_lock_pin(self.engine.user_id, self.sec_pin.text())
+        self.ui.bridge.set_status.emit(msg)
+        if ok:
+            self.sec_pin.clear()
+
+    def _toggle_pause_sensing(self, checked: bool) -> None:
+        acct = getattr(self.ui, "account", None)
+        if not (acct and self.engine):
+            return
+        acct.set_security(self.engine.user_id, pause_sensing=checked)
+        if checked:
+            if self.ui.audio:
+                try:
+                    self.ui.audio.stop_mic()
+                    self.ui.audio.stop_speaker()
+                except Exception:
+                    pass
+            self.ui._stop_watch()
+            self.ui._action_cam.setChecked(False)
+            self.ui.bridge.set_status.emit("All sensing paused.")
+        else:
+            self.ui.bridge.set_status.emit("Sensing resumed — enable mic/watch manually.")
+
+    def _security_clear_memory(self) -> None:
+        if not self.engine:
+            return
+        from PySide6.QtWidgets import QMessageBox
+        if QMessageBox.question(
+                self, "Clear memory",
+                "Delete all remembered facts for this profile?") != QMessageBox.Yes:
+            return
+        facts = self.engine.memory.recall(self.engine.user_id, 0.0)
+        for f in facts:
+            self.engine.memory.forget(
+                self.engine.user_id, f["category"], f["key"])
+        self.ui.bridge.set_status.emit("Memory cleared.")
+
+    def _security_export_data(self) -> None:
+        if not self.engine:
+            return
+        import json
+        uid = self.engine.user_id
+        payload = {
+            "profile": self.engine.memory.get_profile(uid),
+            "facts": self.engine.memory.recall(uid, 0.0),
+            "context": self.engine.memory.list_context(uid),
+            "routines": self.engine.memory.list_routines(uid),
+            "prefs": self.engine.memory.get_prefs(uid),
+        }
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export my data", "atlas-export.json", "JSON (*.json)")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, default=str)
+        self.ui.bridge.set_status.emit(f"Exported → {Path(path).name}")
 
     def _build_hotkeys_tab(self) -> None:
         w = QWidget()
@@ -1142,13 +1488,11 @@ class ControlCenter(QDialog):
 
     def _toggle_fs_access(self, checked: bool):
         self.ui.fs_access_active = checked
-        if atlas_fs:
-            if checked:
-                atlas_fs.register_permission_callback(self.ui._fs_permission_callback)
-                self.ui.bridge.set_status.emit("File System Access ENABLED — prompts on write/exec")
-            else:
-                atlas_fs.register_permission_callback(None)
-                self.ui.bridge.set_status.emit("File System Access DISABLED")
+        self.ui.bridge.set_status.emit(
+            "File System Access ENABLED — prompts on write/exec"
+            if checked else
+            "File System Access DISABLED — screen clicks still prompt separately"
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1794,6 +2138,443 @@ class StatusOrb(QWidget):
 # MAIN APPLICATION WINDOW
 # ═════════════════════════════════════════════════════════════════════════════
 
+PASSWORD_RULES = [
+    ("len", "At least 8 characters", lambda p: len(p) >= 8),
+    ("upper", "An uppercase letter (A-Z)", lambda p: any(c.isupper() for c in p)),
+    ("lower", "A lowercase letter (a-z)", lambda p: any(c.islower() for c in p)),
+    ("digit", "A number (0-9)", lambda p: any(c.isdigit() for c in p)),
+    ("special", "A special character (!@#$…)",
+     lambda p: any(not c.isalnum() for c in p)),
+]
+
+
+class TwoFactorDialog(QDialog):
+    """Second-step verification after password sign-in."""
+
+    def __init__(self, account_mgr, user_id: int, method: str, email: str = "",
+                 parent=None) -> None:
+        super().__init__(parent)
+        self.account = account_mgr
+        self.user_id = user_id
+        self.setWindowTitle("Two-step verification")
+        self.setFixedWidth(360)
+        self.setStyleSheet(LoginDialog._qss_static())
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 18)
+        hint = ("Enter the 6-digit code from your authenticator app."
+                if method == "totp"
+                else f"Enter the code sent to {email or 'your email'}.")
+        lay.addWidget(QLabel(hint))
+        self.code_in = QLineEdit()
+        self.code_in.setObjectName("login_field")
+        self.code_in.setPlaceholderText("6-digit code")
+        self.code_in.setMaxLength(8)
+        lay.addWidget(self.code_in)
+        self.msg = QLabel("")
+        self.msg.setStyleSheet(f"color: {PAL['danger']}; font-size: 11px;")
+        lay.addWidget(self.msg)
+        btn = QPushButton("Verify")
+        btn.setObjectName("primary")
+        btn.clicked.connect(self._verify)
+        self.code_in.returnPressed.connect(self._verify)
+        lay.addWidget(btn)
+        if method == "email":
+            resend = QPushButton("Resend code")
+            resend.setObjectName("link")
+            resend.clicked.connect(self._resend)
+            lay.addWidget(resend, alignment=Qt.AlignCenter)
+        self.verified = False
+
+    def _verify(self) -> None:
+        ok, msg, uid = self.account.complete_pending_2fa(self.code_in.text().strip())
+        if ok:
+            self.verified = True
+            self.accept()
+        else:
+            self.msg.setText(msg)
+
+    def _resend(self) -> None:
+        ok, msg = self.account.start_2fa_challenge(
+            self.user_id, getattr(self.account, "_pending_2fa_email", ""))
+        self.msg.setStyleSheet(f"color: {PAL['success'] if ok else PAL['danger']}; "
+                               f"font-size: 11px;")
+        self.msg.setText(msg)
+
+
+class LoginDialog(QDialog):
+    """
+    Local-first auth gate with separate Sign In and Create Account views.
+
+    Create Account enforces a strong password with a live criteria checklist and
+    a confirm-password field. When Supabase is configured the dialog authenticates
+    against the cloud and syncs the user's data; otherwise it uses a local
+    profile. On success, ``user_id`` / ``user_name`` are set.
+    """
+
+    def __init__(self, account_mgr, parent=None) -> None:
+        super().__init__(parent)
+        self.account = account_mgr
+        self.user_id: int | None = None
+        self.user_name: str = "default"
+        self._busy = False
+        self.cloud_on = bool(account_mgr and account_mgr.cloud_available)
+
+        self.setWindowTitle("Welcome to Atlas")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setFixedWidth(400)
+        self.setStyleSheet(self._qss())
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 24, 28, 22)
+        outer.setSpacing(10)
+
+        title = QLabel("ATLAS")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            f"font-size: 26px; font-weight: 700; letter-spacing: 6px; "
+            f"color: {PAL['cyan']};")
+        outer.addWidget(title)
+
+        self.subtitle = QLabel("")
+        self.subtitle.setAlignment(Qt.AlignCenter)
+        self.subtitle.setStyleSheet(f"font-size: 13px; color: {PAL['text']};")
+        outer.addWidget(self.subtitle)
+
+        status = QLabel("☁  Cloud sync ON" if self.cloud_on
+                        else "⛶  Local profile (offline)")
+        status.setAlignment(Qt.AlignCenter)
+        status.setStyleSheet(
+            f"font-size: 11px; color: "
+            f"{PAL['success'] if self.cloud_on else PAL['muted']};")
+        outer.addWidget(status)
+        outer.addSpacing(4)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_signin_view())   # index 0
+        self.stack.addWidget(self._build_create_view())   # index 1
+        if self.cloud_on:
+            self.stack.addWidget(self._build_otp_view())    # index 2
+        outer.addWidget(self.stack)
+
+        self.msg = QLabel("")
+        self.msg.setWordWrap(True)
+        self.msg.setStyleSheet(f"font-size: 11px; color: {PAL['danger']};")
+        outer.addWidget(self.msg)
+
+        self.btn_google = QPushButton("Continue with Google  (soon)")
+        self.btn_google.setObjectName("ghost")
+        self.btn_google.setEnabled(False)
+        self.btn_google.setToolTip("Google sign-in is coming after the trial.")
+        outer.addWidget(self.btn_google)
+
+        self.btn_guest = QPushButton("Continue as guest")
+        self.btn_guest.setObjectName("link")
+        self.btn_guest.clicked.connect(self._guest)
+        outer.addWidget(self.btn_guest, alignment=Qt.AlignCenter)
+
+        self._show_signin()
+
+    # ── views ───────────────────────────────────────────────────────────────────
+
+    def _build_signin_view(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        self.si_id = QLineEdit()
+        self.si_id.setObjectName("login_field")
+        self.si_id.setPlaceholderText("Email" if self.cloud_on else "Display name")
+        self.si_pass = QLineEdit()
+        self.si_pass.setObjectName("login_field")
+        self.si_pass.setPlaceholderText("Password")
+        self.si_pass.setEchoMode(QLineEdit.Password)
+        self.si_pass.returnPressed.connect(self._sign_in)
+        lay.addWidget(self.si_id)
+        lay.addWidget(self.si_pass)
+        btn = QPushButton("Sign In")
+        btn.setObjectName("primary")
+        btn.clicked.connect(self._sign_in)
+        lay.addWidget(btn)
+        self.btn_signin = btn
+        switch = QPushButton("New here?  Create an account")
+        switch.setObjectName("link")
+        switch.clicked.connect(self._show_create)
+        lay.addWidget(switch, alignment=Qt.AlignCenter)
+        if self.cloud_on:
+            otp_link = QPushButton("Sign in with email code instead")
+            otp_link.setObjectName("link")
+            otp_link.clicked.connect(self._show_otp)
+            lay.addWidget(otp_link, alignment=Qt.AlignCenter)
+        return w
+
+    def _build_otp_view(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        self.otp_email = QLineEdit()
+        self.otp_email.setObjectName("login_field")
+        self.otp_email.setPlaceholderText("Email")
+        self.otp_code = QLineEdit()
+        self.otp_code.setObjectName("login_field")
+        self.otp_code.setPlaceholderText("6-digit code from email")
+        self.otp_code.setMaxLength(8)
+        lay.addWidget(self.otp_email)
+        self.btn_send_code = QPushButton("Send code")
+        self.btn_send_code.setObjectName("ghost")
+        self.btn_send_code.clicked.connect(self._send_otp)
+        lay.addWidget(self.btn_send_code)
+        lay.addWidget(self.otp_code)
+        btn = QPushButton("Verify & Sign In")
+        btn.setObjectName("primary")
+        btn.clicked.connect(self._verify_otp_login)
+        self.otp_code.returnPressed.connect(self._verify_otp_login)
+        lay.addWidget(btn)
+        self.btn_otp = btn
+        back = QPushButton("← Back to password sign-in")
+        back.setObjectName("link")
+        back.clicked.connect(self._show_signin)
+        lay.addWidget(back, alignment=Qt.AlignCenter)
+        return w
+
+    def _build_create_view(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        self.cr_name = QLineEdit()
+        self.cr_name.setObjectName("login_field")
+        self.cr_name.setPlaceholderText("Display name")
+        self.cr_email = QLineEdit()
+        self.cr_email.setObjectName("login_field")
+        self.cr_email.setPlaceholderText(
+            "Email" + ("" if self.cloud_on else " (optional)"))
+        self.cr_pass = QLineEdit()
+        self.cr_pass.setObjectName("login_field")
+        self.cr_pass.setPlaceholderText("Password")
+        self.cr_pass.setEchoMode(QLineEdit.Password)
+        self.cr_pass2 = QLineEdit()
+        self.cr_pass2.setObjectName("login_field")
+        self.cr_pass2.setPlaceholderText("Confirm password")
+        self.cr_pass2.setEchoMode(QLineEdit.Password)
+        for f in (self.cr_name, self.cr_email, self.cr_pass, self.cr_pass2):
+            lay.addWidget(f)
+        self.cr_pass.textChanged.connect(self._refresh_strength)
+        self.cr_pass2.textChanged.connect(self._refresh_strength)
+        self.cr_pass2.returnPressed.connect(self._create)
+
+        # Live password-strength checklist
+        self._rule_labels: dict[str, QLabel] = {}
+        rules_box = QVBoxLayout()
+        rules_box.setSpacing(2)
+        for key, label, _ in PASSWORD_RULES:
+            lbl = QLabel(f"○  {label}")
+            lbl.setStyleSheet(f"font-size: 10px; color: {PAL['muted']};")
+            self._rule_labels[key] = lbl
+            rules_box.addWidget(lbl)
+        self._match_lbl = QLabel("○  Passwords match")
+        self._match_lbl.setStyleSheet(f"font-size: 10px; color: {PAL['muted']};")
+        rules_box.addWidget(self._match_lbl)
+        lay.addLayout(rules_box)
+
+        btn = QPushButton("Create Account")
+        btn.setObjectName("primary")
+        btn.clicked.connect(self._create)
+        btn.setEnabled(False)
+        lay.addWidget(btn)
+        self.btn_create = btn
+        switch = QPushButton("Already have an account?  Sign in")
+        switch.setObjectName("link")
+        switch.clicked.connect(self._show_signin)
+        lay.addWidget(switch, alignment=Qt.AlignCenter)
+        return w
+
+    def _show_signin(self) -> None:
+        self.subtitle.setText("Welcome back")
+        self.msg.clear()
+        self.stack.setCurrentIndex(0)
+        self.adjustSize()
+
+    def _show_create(self) -> None:
+        self.subtitle.setText("Create your account")
+        self.msg.clear()
+        self.stack.setCurrentIndex(1)
+        self._refresh_strength()
+        self.adjustSize()
+
+    def _show_otp(self) -> None:
+        self.subtitle.setText("Sign in with email code")
+        self.msg.clear()
+        self.stack.setCurrentIndex(2)
+        self.adjustSize()
+
+    def _send_otp(self) -> None:
+        if not self.account or self._busy:
+            return
+        email = self.otp_email.text().strip()
+        self._set_busy(True, "Sending code…")
+        ok, msg = self.account.cloud.send_email_otp(email)
+        self._set_busy(False)
+        self.msg.setStyleSheet(
+            f"font-size: 11px; color: {PAL['success'] if ok else PAL['danger']};")
+        self.msg.setText(msg)
+
+    def _verify_otp_login(self) -> None:
+        if not self.account or self._busy:
+            return
+        email = self.otp_email.text().strip()
+        code = self.otp_code.text().strip()
+        self._set_busy(True, "Verifying…")
+        try:
+            ok, msg, uid = self.account.login_otp_cloud(email, code)
+        except Exception as exc:
+            return self._fail(str(exc))
+        if ok:
+            name = email.split("@")[0]
+            return self._finish(uid, name)
+        self._fail(msg or "Verification failed.")
+
+    # ── password strength ───────────────────────────────────────────────────────
+
+    def _password_ok(self, pw: str) -> bool:
+        return all(fn(pw) for _, _, fn in PASSWORD_RULES)
+
+    def _refresh_strength(self) -> None:
+        pw = self.cr_pass.text()
+        for key, label, fn in PASSWORD_RULES:
+            met = fn(pw)
+            lbl = self._rule_labels[key]
+            lbl.setText(f"{'●' if met else '○'}  {label}")
+            lbl.setStyleSheet(
+                f"font-size: 10px; color: "
+                f"{PAL['success'] if met else PAL['muted']};")
+        match = bool(pw) and pw == self.cr_pass2.text()
+        self._match_lbl.setText(f"{'●' if match else '○'}  Passwords match")
+        self._match_lbl.setStyleSheet(
+            f"font-size: 10px; color: {PAL['success'] if match else PAL['muted']};")
+        self.btn_create.setEnabled(self._password_ok(pw) and match)
+
+    # ── shared styling / state ──────────────────────────────────────────────────
+
+    def _qss(self) -> str:
+        return LoginDialog._qss_static()
+
+    @staticmethod
+    def _qss_static() -> str:
+        return (
+            f"QDialog {{ background: {PAL['surface']}; }}"
+            f"QLabel {{ color: {PAL['text']}; }}"
+            f"QLineEdit#login_field {{ background: {PAL['surface_2']}; "
+            f"border: 1px solid {PAL['border']}; border-radius: 8px; "
+            f"padding: 10px; color: {PAL['text']}; font-size: 13px; }}"
+            f"QLineEdit#login_field:focus {{ border: 1px solid {PAL['cyan']}; }}"
+            f"QPushButton#primary {{ background: {PAL['cyan']}; color: {PAL['bg']}; "
+            f"border-radius: 8px; padding: 10px; font-weight: 600; }}"
+            f"QPushButton#primary:hover {{ background: {PAL['text']}; }}"
+            f"QPushButton#primary:disabled {{ background: {PAL['border']}; "
+            f"color: {PAL['muted']}; }}"
+            f"QPushButton#ghost {{ background: {PAL['surface_2']}; color: {PAL['text']}; "
+            f"border: 1px solid {PAL['border']}; border-radius: 8px; padding: 10px; }}"
+            f"QPushButton#ghost:hover {{ border: 1px solid {PAL['cyan']}; color: {PAL['cyan']}; }}"
+            f"QPushButton#ghost:disabled {{ color: {PAL['muted']}; }}"
+            f"QPushButton#link {{ background: transparent; color: {PAL['muted']}; "
+            f"border: none; font-size: 11px; }}"
+            f"QPushButton#link:hover {{ color: {PAL['cyan']}; }}"
+        )
+
+    def _set_busy(self, busy: bool, label: str = "") -> None:
+        self._busy = busy
+        for b in (self.btn_signin, self.btn_create, self.btn_guest):
+            b.setEnabled(not busy)
+        if not busy:
+            self._refresh_strength()   # restore create-button gating
+        if label:
+            self.msg.setStyleSheet(f"font-size: 11px; color: {PAL['muted']};")
+            self.msg.setText(label)
+        QApplication.processEvents()
+
+    def _fail(self, text: str) -> None:
+        self.msg.setStyleSheet(f"font-size: 11px; color: {PAL['danger']};")
+        self.msg.setText(text)
+        self._set_busy(False)
+
+    def _finish(self, uid: int, name: str) -> None:
+        self.user_id = int(uid)
+        self.user_name = name or "default"
+        self.accept()
+
+    # ── actions ─────────────────────────────────────────────────────────────────
+
+    def _sign_in(self) -> None:
+        if self._busy or not self.account:
+            return
+        ident = self.si_id.text().strip()
+        pw = self.si_pass.text()
+        self._set_busy(True, "Signing in…")
+        try:
+            if self.account.cloud_available:
+                if not ident or not pw:
+                    return self._fail("Enter your email and password.")
+                ok, msg, uid = self.account.login_cloud(ident, pw)
+            else:
+                if not ident:
+                    return self._fail("Enter your name.")
+                ok, msg, uid = self.account.login_local(ident, pw or None)
+        except Exception as exc:
+            return self._fail(f"Sign-in error: {exc}")
+        if ok:
+            if msg == "2FA_REQUIRED":
+                needs, method = self.account.needs_2fa(uid)
+                twofa = TwoFactorDialog(
+                    self.account, uid, method,
+                    getattr(self.account, "_pending_2fa_email", ident), self)
+                if twofa.exec() == QDialog.Accepted and twofa.verified:
+                    disp = ident.split("@")[0] if "@" in ident else ident
+                    return self._finish(uid, disp)
+                return self._fail("Two-step verification required.")
+            self._finish(uid, ident.split("@")[0] if "@" in ident else ident)
+        else:
+            self._fail(msg or "Sign-in failed.")
+
+    def _create(self) -> None:
+        if self._busy or not self.account:
+            return
+        name = self.cr_name.text().strip()
+        email = self.cr_email.text().strip()
+        pw = self.cr_pass.text()
+        if not name:
+            return self._fail("Choose a display name.")
+        if not self._password_ok(pw):
+            return self._fail("Password doesn't meet all the requirements.")
+        if pw != self.cr_pass2.text():
+            return self._fail("Passwords don't match.")
+        self._set_busy(True, "Creating account…")
+        try:
+            if self.account.cloud_available:
+                if not email:
+                    return self._fail("Enter an email to create a cloud account.")
+                ok, msg, uid = self.account.register_cloud(name, email, pw)
+            else:
+                ok, msg, uid = self.account.register_local(name, email or None, pw)
+        except Exception as exc:
+            return self._fail(f"Sign-up error: {exc}")
+        if ok:
+            self._finish(uid, name)
+        else:
+            self._fail(msg or "Could not create the account.")
+
+    def _guest(self) -> None:
+        if self._busy or not self.account:
+            return self.reject()
+        try:
+            ok, _msg, uid = self.account.login_local("default")
+            if ok:
+                return self._finish(uid, "default")
+        except Exception:
+            pass
+        self.reject()
+
+
 class AtlasWindow(QMainWindow):
 
     def __init__(self):
@@ -1804,6 +2585,7 @@ class AtlasWindow(QMainWindow):
 
         self._is_floating   = False
         self.bridge         = SignalBridge()
+        self.account        = None   # set by main() after the login gate
 
         # ── Signal connections ────────────────────────────────────────────────
         self.bridge.append_text.connect(self._append_response)
@@ -1821,6 +2603,11 @@ class AtlasWindow(QMainWindow):
         self.bridge.listen_state.connect(self._on_listen_state)
         self.bridge.request_permission.connect(self._on_permission_request)
         self.bridge.accent_changed.connect(self._on_accent_changed)
+
+        # Hands clicks and task automation always need a permission dialog — not
+        # tied to the optional file-system write toggle.
+        if atlas_fs:
+            atlas_fs.register_permission_callback(self._fs_permission_callback)
 
         # ── Status-bar persistence (Bug #23) ──────────────────────────────────
         # Messages are held for at least _STATUS_MIN_MS before being replaced.
@@ -1997,7 +2784,7 @@ class AtlasWindow(QMainWindow):
         hdr_lay.addWidget(self.logo)
         hdr_lay.addWidget(self.alive_dot)
 
-        self.mode_pill = QLabel("ACTIVE")
+        self.mode_pill = QLabel("ATLAS")
         self.mode_pill.setStyleSheet(
             f"color: {PAL['cyan']}; background: rgba(0,212,255,0.10);"
             f"border: 1px solid {PAL['cyan_dim']}; border-radius: 8px;"
@@ -2007,20 +2794,19 @@ class AtlasWindow(QMainWindow):
         hdr_lay.addWidget(self.mode_pill)
         hdr_lay.addStretch()
 
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Active", "Ambient", "Guided", "Interview"])
-        self.mode_combo.setFixedWidth(98)
-        self.mode_combo.setStyleSheet(
-            f"QComboBox {{ background: {PAL['surface_2']}; color: {PAL['text']};"
-            f"border: 1px solid {PAL['border']}; border-radius: 6px;"
-            f"padding: 3px 6px; font-size: 11px; }}"
-            f"QComboBox::drop-down {{ border: none; }}"
-            f"QComboBox QAbstractItemView {{ background: {PAL['surface_2']};"
-            f"border: 1px solid {PAL['border']}; selection-background-color: {PAL['border']}; }}"
-        )
-        self.mode_combo.setToolTip("Conversation mode")
-        self.mode_combo.currentTextChanged.connect(self._on_mode_combo_changed)
-        hdr_lay.addWidget(self.mode_combo)
+        self.btn_focus = QPushButton("Focus")
+        self.btn_focus.setCheckable(True)
+        self.btn_focus.setFixedWidth(58)
+        self.btn_focus.setToolTip(
+            "Focus mode — terse interview-style replies; Atlas always sees your screen")
+        self.btn_focus.setStyleSheet(
+            f"QPushButton {{ background: {PAL['surface_2']}; color: {PAL['muted']}; "
+            f"border: 1px solid {PAL['border']}; border-radius: 6px; padding: 3px 6px; "
+            f"font-size: 10px; }}"
+            f"QPushButton:checked {{ background: rgba(155,89,182,0.2); color: #9B59B6; "
+            f"border: 1px solid #6C3483; }}")
+        self.btn_focus.toggled.connect(self._on_focus_toggled)
+        hdr_lay.addWidget(self.btn_focus)
 
         # ── Opacity control (icon + slider) ───────────────────────────────────
         op_icon = QLabel("◑")
@@ -2046,6 +2832,24 @@ class AtlasWindow(QMainWindow):
         self.btn_close    = self._make_hdr_btn("✕", "Close Atlas", self.close, PAL["danger"])
         for b in [self.btn_float, self.btn_stealth, self.btn_refresh, self.btn_settings, self.btn_close]:
             hdr_lay.addWidget(b)
+
+        # ── Profile cluster: name + avatar with a dropdown menu ───────────────
+        hdr_lay.addWidget(self._hdr_separator())
+        self.user_name_lbl = QLabel("Guest")
+        self.user_name_lbl.setStyleSheet(
+            f"color: {PAL['text']}; font-size: 11px; font-weight: 600; "
+            f"background: transparent;")
+        hdr_lay.addWidget(self.user_name_lbl)
+        self.btn_profile = QPushButton("G")
+        self.btn_profile.setObjectName("profile_btn")
+        self.btn_profile.setFixedSize(28, 28)
+        self.btn_profile.setToolTip("Your profile")
+        self.btn_profile.setStyleSheet(
+            f"QPushButton#profile_btn {{ background: {PAL['cyan']}; color: {PAL['bg']}; "
+            f"border-radius: 14px; font-weight: 700; font-size: 12px; }}"
+            f"QPushButton#profile_btn:hover {{ background: {PAL['text']}; }}")
+        self.btn_profile.clicked.connect(self._show_profile_menu)
+        hdr_lay.addWidget(self.btn_profile)
 
         # ── Control Ribbon opacity engine (dim at rest, full on hover) ─────────
         self._RIBBON_REST = 0.20
@@ -2126,13 +2930,14 @@ class AtlasWindow(QMainWindow):
         self.btn_skip_audio.hide()   # shown only while voice_engine.is_speaking
         util_lay.addWidget(self.btn_skip_audio)
 
-        btn_copy = QPushButton("⎘ Copy")
-        btn_copy.setStyleSheet(f"color: {PAL['muted']}; font-size: 11px; padding: 2px 6px;")
-        btn_copy.clicked.connect(self._copy_text)
+        btn_download = QPushButton("⬇ Download")
+        btn_download.setStyleSheet(f"color: {PAL['muted']}; font-size: 11px; padding: 2px 6px;")
+        btn_download.setToolTip("Download this conversation as a PDF")
+        btn_download.clicked.connect(self._download_pdf)
         btn_clear = QPushButton("🗑 Clear")
         btn_clear.setStyleSheet(f"color: {PAL['muted']}; font-size: 11px; padding: 2px 6px;")
         btn_clear.clicked.connect(self._clear_text)
-        util_lay.addWidget(btn_copy)
+        util_lay.addWidget(btn_download)
         util_lay.addWidget(btn_clear)
         resp_lay.addLayout(util_lay)
 
@@ -2157,6 +2962,11 @@ class AtlasWindow(QMainWindow):
         self.text_area.setReadOnly(True)
         self.text_area.setOpenExternalLinks(False)
         self.text_area.setOpenLinks(False)
+        # Allow the user to select and copy any text (and code) from the chat.
+        self.text_area.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+            | Qt.LinksAccessibleByMouse)
+        self.text_area.setContextMenuPolicy(Qt.DefaultContextMenu)
         self.text_area.anchorClicked.connect(self._on_anchor_clicked)
         self._CODE_CSS = (
             f"<style>"
@@ -2260,6 +3070,11 @@ class AtlasWindow(QMainWindow):
         self.btn_send.clicked.connect(self._do_ask)
         input_lay.addWidget(self.btn_send)
 
+        self.chat_hints = QLabel(
+            "Try: \"Guide me through …\" · \"Do it for me: …\" · \"Can you see my screen?\"")
+        self.chat_hints.setStyleSheet(
+            f"color: {PAL['muted']}; font-size: 10px; padding: 2px 8px;")
+        ws_lay.addWidget(self.chat_hints)
         ws_lay.addWidget(self.input_row)
 
         self.token_footer = QLabel(" Tokens: 0 prompt · 0 completion | Session: 00:00 · 0 turns")
@@ -2501,6 +3316,15 @@ class AtlasWindow(QMainWindow):
     def _on_permission_request(self, action: str, path: str,
                                approve_fn, deny_fn) -> None:
         """Show the PermissionDialog on the main thread."""
+        p = str(path)
+        if not self.fs_access_active and not (
+            p.startswith("atlas-hands://") or p.startswith("atlas-task://")
+        ):
+            deny_fn()
+            self.bridge.set_status.emit(
+                "File system access is off — enable it in settings for file operations."
+            )
+            return
         dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
         dlg.exec()
 
@@ -2588,6 +3412,11 @@ class AtlasWindow(QMainWindow):
             "  🗣  Atlas SPEAKS its replies aloud (voice: af_sarah). Tune it in\n"
             "       ⚙ Control Center → Audio → Voice / Test Voice / Speech speed.\n"
             "  💬  Or just type a message and press Enter.\n"
+            "\n"
+            "  📍  GUIDE:  \"Guide me through setting up …\" — highlights each step on screen.\n"
+            "  🤖  DO:     \"Do it for me — open Spotify and play …\" — Atlas performs the task.\n"
+            "  🎯  FOCUS:  toggle the Focus button for terse interview-style help.\n"
+            "  👁  WATCH:  + menu → Screen Watcher so Atlas can see your screen.\n"
         )
 
         self._append_response("".join(lines))
@@ -2631,70 +3460,80 @@ class AtlasWindow(QMainWindow):
         if event_type == "mode_changed":
             new_mode = payload.get("to", "")
             QTimer.singleShot(0, lambda: self._sync_mode_ui(new_mode))
+        elif event_type in ("task_status", "learn_status", "command_done"):
+            text = str(payload.get("text", ""))
+            if text:
+                self.bridge.set_status.emit(text)
+            if event_type == "learn_status":
+                QTimer.singleShot(0, self._sync_learn_btn)
+        elif event_type == "focus_changed":
+            QTimer.singleShot(0, lambda: self._sync_focus_ui(
+                payload.get("enabled", False)))
+        elif event_type == "toggle_ambient":
+            if payload.get("enabled"):
+                QTimer.singleShot(0, self._start_watch)
+            else:
+                QTimer.singleShot(0, self._stop_watch)
+        elif event_type == "guide_marker":
+            if payload.get("found") and self.overlay:
+                x, y = int(payload["x"]), int(payload["y"])
+                w, h = int(payload.get("w", 0)), int(payload.get("h", 0))
+                self.overlay.mark_target(
+                    x, y, w, h, label=str(payload.get("label", "")),
+                )
+        elif event_type == "spatial_error":
+            err = str(payload.get("error", "Location failed"))
+            self.bridge.set_status.emit(err)
 
-    def _sync_mode_ui(self, mode_name: str):
-        if mode_name.upper() == "INTERVIEW":
-            pill_style = (
+    def _sync_focus_ui(self, enabled: bool) -> None:
+        if hasattr(self, "btn_focus"):
+            self.btn_focus.blockSignals(True)
+            self.btn_focus.setChecked(enabled)
+            self.btn_focus.blockSignals(False)
+        if enabled:
+            self.mode_pill.setText("FOCUS")
+            self.mode_pill.setStyleSheet(
                 f"color: #9B59B6; background: rgba(155,89,182,0.12);"
                 f"border: 1px solid #6C3483; border-radius: 8px;"
                 f"font-size: 9px; font-weight: bold; letter-spacing: 1px; padding: 2px 7px;"
             )
         else:
-            pill_style = (
+            self.mode_pill.setText("ATLAS")
+            self.mode_pill.setStyleSheet(
                 f"color: {PAL['cyan']}; background: rgba(0,212,255,0.10);"
                 f"border: 1px solid {PAL['cyan_dim']}; border-radius: 8px;"
                 f"font-size: 9px; font-weight: bold; letter-spacing: 1px; padding: 2px 7px;"
             )
-        self.mode_pill.setText(mode_name.upper())
-        self.mode_pill.setStyleSheet(pill_style)
 
-        combo_map = {"ACTIVE": "Active", "AMBIENT": "Ambient", "GUIDED": "Guided", "INTERVIEW": "Interview"}
-        label = combo_map.get(mode_name.upper(), mode_name.capitalize())
-        self.mode_combo.blockSignals(True)
-        self.mode_combo.setCurrentText(label)
-        self.mode_combo.blockSignals(False)
-
-    def _on_mode_combo_changed(self, text: str):
+    def _on_focus_toggled(self, checked: bool) -> None:
         if not self.state:
             return
-        mapping = {
-            "Active":    ModeState.ACTIVE,
-            "Ambient":   ModeState.AMBIENT,
-            "Guided":    ModeState.GUIDED,
-            "Interview": ModeState.INTERVIEW,
-        }
-        mode = mapping.get(text)
-        if not mode:
-            return
-
-        # Bug #15: stop any in-flight generation and TTS before switching mode.
-        # Previously, old response kept streaming under the wrong system prompt.
         self._stop_gen.set()
         if voice_engine:
             voice_engine.flush()
             voice_engine.skip()
-
-        entering_interview = (text == "Interview")
-        self.state.set_mode(mode)
-        self._sync_mode_ui(text)
-        self.bridge.set_status.emit(f"Mode → {text}")
-        self._set_ambient_visual(text == "Ambient")
-
-        if entering_interview:
+        self.state.set_focus_mode(checked)
+        self._sync_focus_ui(checked)
+        self.bridge.set_status.emit(f"Focus mode {'on' if checked else 'off'}")
+        if checked:
             self.style_combo_set("Direct")
-            if self.audio:
-                if not self.audio.mic_active:
-                    self.audio.start_mic()
-                    self._action_mic.setChecked(True)
-                if not self.audio.speaker_active:
-                    self.audio.start_speaker()
-                    self._action_spk.setChecked(True)
-            # Bug #28: notify user that interview mode auto-starts audio capture
-            self._append_response(
-                "🎤 Interview Mode active — microphone and speaker capture started.\n"
-                "  Ask for help at any time; Atlas will deliver sharp talking points.\n"
-                "  Use '📄 Upload Context' to pin a resume or job description.\n"
-            )
+            if self.audio and not self.audio.mic_active:
+                self.audio.start_mic()
+                self._action_mic.setChecked(True)
+
+    def _sync_mode_ui(self, mode_name: str):
+        """Legacy hook — maps old mode names to focus toggle."""
+        if str(mode_name).upper() in ("INTERVIEW", "FOCUS"):
+            self._sync_focus_ui(True)
+        else:
+            self._sync_focus_ui(False)
+
+    def _on_mode_combo_changed(self, text: str):
+        """Deprecated — kept so hot-reload paths don't break."""
+        if text == "Interview":
+            self._on_focus_toggled(True)
+        elif text == "Active":
+            self._on_focus_toggled(False)
 
     def style_combo_set(self, style: str):
         """Helper to update session response style without a visible combo widget on dock."""
@@ -2795,6 +3634,11 @@ class AtlasWindow(QMainWindow):
         if text.startswith("/"):
             self._handle_slash_command(text)
             return
+        # "Do anything" intent router — natural-language control of Atlas itself
+        # (switch mode, tweak voice/speed, remember a standing note, stop, run a
+        # routine). Handled commands never hit the LLM.
+        if self.state and self._try_route_command(text):
+            return
         if self.state:
             self._append_user_bubble(text)
             self._stop_gen.clear()
@@ -2809,6 +3653,26 @@ class AtlasWindow(QMainWindow):
                 kwargs={"source": "user", "webcam_b64": webcam_b64},
                 daemon=True,
             ).start()
+
+    def _try_route_command(self, text: str) -> bool:
+        """Intercept natural-language control commands before the LLM.
+
+        Classification is a fast regex pass on the UI thread; execution (which
+        may speak or switch mode) runs off-thread so the UI never blocks.
+        Returns True when the utterance was a control command.
+        """
+        try:
+            intent = self.state.route_command(text)
+        except Exception:
+            return False
+        if not intent or intent.get("intent") == "chat":
+            return False
+        self.bridge.append_text.emit(f"[COMMAND]: {text}")
+        threading.Thread(
+            target=self.state.execute_command, args=(intent,),
+            daemon=True, name="atlas-command",
+        ).start()
+        return True
 
     def _start_thinking(self):
         self.thinking_bar.setRange(0, 0)
@@ -2845,16 +3709,26 @@ class AtlasWindow(QMainWindow):
         self._is_streaming = False
         self.bridge.thinking_done.emit()
         self.bridge.set_status.emit("Done ✓")
+        # Commit the finished answer into the permanent transcript and reset the
+        # live streaming buffer, so the next turn starts clean and every message
+        # stays interleaved (user → Atlas → user → Atlas …).
         if full_text:
-            self._chat_messages.append(
-                {"role": "assistant", "html": self._md_to_html(full_text), "ts": time.time()}
-            )
+            body = self._md_to_html(full_text)
             footer = (
-                f"<div style='color:{PAL['muted']};font-size:10px;margin-top:6px;'>"
-                f"Atlas responded in {elapsed:.1f}s</div>"
+                f"<div style='color:{PAL['muted']};font-size:10px;"
+                f"margin:2px 0 4px 22px;'>Atlas · {elapsed:.1f}s</div>"
             )
-            self._md_plain_prefix += footer
-            self._render_full_html()
+            bubble = self._atlas_bubble_html(body, typing=False)
+            self._md_plain_prefix += bubble + footer
+            self._chat_messages.append(
+                {"role": "assistant", "html": bubble, "text": full_text,
+                 "ts": time.time()}
+            )
+        self._md_ai_streaming = False
+        self._md_ai_buffer = ""
+        self._streaming_html = ""
+        self._render_full_html()
+        if full_text:
             if self._is_floating:
                 self.bridge.notify_pill.emit(full_text.replace("\n", " ")[:60] + "…")
             ping = Path("assets/sounds/ping.wav")
@@ -2960,7 +3834,8 @@ class AtlasWindow(QMainWindow):
             f"border-radius:18px 18px 4px 18px;padding:10px 14px;'>{esc}</div></div>"
         )
         self._md_plain_prefix += bubble
-        self._chat_messages.append({"role": "user", "html": bubble, "ts": time.time()})
+        self._chat_messages.append(
+            {"role": "user", "html": bubble, "text": text, "ts": time.time()})
         self._render_full_html()
 
     def _show_plus_menu(self) -> None:
@@ -2975,9 +3850,127 @@ class AtlasWindow(QMainWindow):
         if voice_engine:
             menu.addAction(self._action_ve)
         menu.addSeparator()
+        learning = bool(self.state and self.state.is_learning)
+        menu.addAction(
+            "⏹ Stop & Save Routine…" if learning else "🎓 Learn a Routine…",
+            self._toggle_learning)
+        menu.addAction("▶ Run a Routine…", self._run_routine_prompt)
+        menu.addSeparator()
         menu.addAction("📄 Upload Context…", self._do_upload_context)
         menu.addAction("⚙ Browse Skills…", self._open_settings_skills_tab)
         menu.exec(self.btn_plus.mapToGlobal(self.btn_plus.rect().bottomLeft()))
+
+    def apply_account_identity(self, name: str) -> None:
+        """Reflect the signed-in user's name + avatar in the header."""
+        clean = (name or "Guest").strip() or "Guest"
+        self._account_name = clean
+        if hasattr(self, "user_name_lbl"):
+            self.user_name_lbl.setText(clean if len(clean) <= 18 else clean[:17] + "…")
+        if hasattr(self, "btn_profile"):
+            initials = "".join(p[0] for p in clean.split()[:2]).upper() or "G"
+            self.btn_profile.setText(initials)
+            self.btn_profile.setToolTip(f"{clean} — profile & account")
+
+    def _show_profile_menu(self) -> None:
+        menu = QMenu(self)
+        name = getattr(self, "_account_name", "Guest")
+        acct = getattr(self, "account", None)
+        cloud_on = bool(acct and acct.cloud_available
+                        and getattr(acct.cloud, "cloud_id", None))
+        header = menu.addAction(f"👤  {name}")
+        header.setEnabled(False)
+        sub = menu.addAction("☁ Cloud synced" if cloud_on else "Local profile")
+        sub.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("⚙ Preferences…", self._open_settings_account_tab)
+        menu.addAction("🔒 Security…", self._open_settings_security_tab)
+        menu.addAction("🧠 What Atlas knows…", self._open_settings_memory_tab)
+        menu.addAction("🔗 Connect Account…", self._connect_account)
+        menu.addAction("💳 Billing  (soon)", lambda: self.bridge.set_status.emit(
+            "Billing is coming soon."))
+        menu.addSeparator()
+        menu.addAction("⎋ Sign out / Switch user", self._sign_out)
+        menu.exec(self.btn_profile.mapToGlobal(self.btn_profile.rect().bottomLeft()))
+
+    def _open_settings_account_tab(self) -> None:
+        if self.settings_dialog:
+            self.settings_dialog.show_tab(6)   # Account tab
+
+    def _open_settings_security_tab(self) -> None:
+        if self.settings_dialog:
+            self.settings_dialog.show_tab(7)
+
+    def _open_settings_memory_tab(self) -> None:
+        if self.settings_dialog:
+            self.settings_dialog.show_tab(4)   # Memory tab
+
+    def _connect_account(self) -> None:
+        acct = getattr(self, "account", None)
+        if not acct:
+            return
+        if not acct.cloud_available:
+            self.bridge.set_status.emit(
+                "Cloud sync isn't configured on this machine.")
+            return
+        if self.settings_dialog:
+            self.settings_dialog.show_tab(6)
+            self.settings_dialog._account_sync()
+
+    def _sign_out(self) -> None:
+        acct = getattr(self, "account", None)
+        if not acct:
+            return
+        acct.sign_out()
+        dlg = LoginDialog(acct, self)
+        if dlg.exec() == QDialog.Accepted and dlg.user_id and self.state:
+            os.environ["ATLAS_USER"] = dlg.user_name
+            self.state.set_user(dlg.user_id, dlg.user_name)
+            self.apply_account_identity(dlg.user_name)
+            self.bridge.set_status.emit(f"Signed in as {dlg.user_name}")
+
+    def _toggle_learning(self) -> None:
+        """Start watching a demonstration, or stop and save it as a routine."""
+        if not self.state:
+            return
+        if self.state.is_learning:
+            from PySide6.QtWidgets import QInputDialog
+            name, ok = QInputDialog.getText(
+                self, "Save Routine",
+                "Name this routine (e.g. 'morning setup'):")
+            if not ok:
+                return
+            self.state.stop_learning(name.strip())
+        else:
+            self.bridge.set_status.emit(
+                "🎓 Tip: minimise Atlas, perform the steps, then re-open and Stop.")
+            self.state.start_learning()
+        self._sync_learn_btn()
+
+    def _run_routine_prompt(self) -> None:
+        if not self.state:
+            return
+        try:
+            routines = self.state.memory.list_routines(self.state.user_id)
+        except Exception:
+            routines = []
+        if not routines:
+            self.bridge.set_status.emit(
+                "No routines yet — use “Learn a Routine” first.")
+            return
+        from PySide6.QtWidgets import QInputDialog
+        names = [r.get("name", "") for r in routines]
+        name, ok = QInputDialog.getItem(
+            self, "Run Routine", "Choose a routine to replay:", names, 0, False)
+        if ok and name:
+            self.state.run_routine(name)
+
+    def _sync_learn_btn(self) -> None:
+        """Reflect learning state on the orb/status (button label is dynamic)."""
+        if self.state and self.state.is_learning:
+            self._set_orb_state("listening")
+        else:
+            if not (voice_engine and getattr(voice_engine, "is_speaking", False)):
+                self._set_orb_state("idle")
 
     def _open_settings(self) -> None:
         if self.settings_dialog:
@@ -3255,6 +4248,8 @@ class AtlasWindow(QMainWindow):
         Previously only stopped text generation; voice kept talking (Bug #7/#8/#9).
         """
         self._stop_gen.set()
+        if self.state:
+            self.state.stop_task()   # halt any running computer-use task
         if voice_engine:
             voice_engine.flush()   # clear the queue
             voice_engine.skip()    # interrupt the current utterance
@@ -3317,6 +4312,90 @@ class AtlasWindow(QMainWindow):
     def _copy_text(self):
         pyperclip.copy(self.text_area.toPlainText())
         self.bridge.set_status.emit("Copied ✓")
+
+    def _download_pdf(self):
+        """Export the current conversation to a styled PDF via reportlab."""
+        if not self._chat_messages:
+            self.bridge.set_status.emit("Nothing to download yet.")
+            return
+        default = f"atlas-chat-{time.strftime('%Y%m%d-%H%M')}.pdf"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Download conversation", default, "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            self._export_chat_pdf(path)
+            self.bridge.set_status.emit(f"Saved PDF → {Path(path).name}")
+        except Exception as exc:
+            self.bridge.set_status.emit(f"PDF export failed: {exc}")
+
+    def _export_chat_pdf(self, path: str) -> None:
+        import html as _html
+        import re as _re
+        from reportlab.lib.pagesizes import LETTER
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib.enums import TA_RIGHT
+        from reportlab.lib import colors
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Preformatted)
+
+        styles = getSampleStyleSheet()
+        user_style = ParagraphStyle(
+            "User", parent=styles["Normal"], alignment=TA_RIGHT,
+            textColor=colors.HexColor("#0B5563"), spaceBefore=10, spaceAfter=2,
+            fontSize=10.5, leading=15)
+        atlas_style = ParagraphStyle(
+            "Atlas", parent=styles["Normal"],
+            textColor=colors.HexColor("#1A1A1F"), spaceBefore=10, spaceAfter=2,
+            fontSize=10.5, leading=15)
+        label_style = ParagraphStyle(
+            "Label", parent=styles["Normal"], fontSize=8,
+            textColor=colors.HexColor("#888888"), spaceAfter=1)
+        code_style = ParagraphStyle(
+            "Code", parent=styles["Code"], fontSize=8.5, leading=11,
+            backColor=colors.HexColor("#F2F3F5"), borderPadding=6,
+            textColor=colors.HexColor("#0A3A4A"))
+
+        def _to_plain(text: str) -> str:
+            return text or ""
+
+        story = [
+            Paragraph("Atlas — Conversation", styles["Title"]),
+            Paragraph(time.strftime("%A, %d %b %Y · %H:%M"), label_style),
+            Spacer(1, 0.18 * inch),
+        ]
+        fence = _re.compile(r"```[\w+-]*\n?([\s\S]*?)```")
+        for msg in self._chat_messages:
+            role = msg.get("role")
+            raw = msg.get("text")
+            if raw is None:
+                # Older user bubbles stored only HTML — strip tags for the PDF.
+                raw = _re.sub(r"<[^>]+>", "", msg.get("html", ""))
+                raw = _html.unescape(raw)
+            who = "You" if role == "user" else "Atlas"
+            story.append(Paragraph(who, label_style))
+            # Split out fenced code blocks into monospace boxes.
+            pos = 0
+            for m in fence.finditer(raw):
+                before = raw[pos:m.start()].strip()
+                if before:
+                    story.append(Paragraph(
+                        _html.escape(before).replace("\n", "<br/>"),
+                        user_style if role == "user" else atlas_style))
+                story.append(Preformatted(m.group(1).rstrip(), code_style))
+                pos = m.end()
+            tail = raw[pos:].strip()
+            if tail:
+                story.append(Paragraph(
+                    _html.escape(tail).replace("\n", "<br/>"),
+                    user_style if role == "user" else atlas_style))
+
+        doc = SimpleDocTemplate(
+            path, pagesize=LETTER, title="Atlas Conversation",
+            leftMargin=0.8 * inch, rightMargin=0.8 * inch,
+            topMargin=0.8 * inch, bottomMargin=0.8 * inch)
+        doc.build(story)
 
     def _clear_text(self):
         # Bug #14: stop any in-flight generation thread and silence TTS first.
@@ -3382,6 +4461,10 @@ class AtlasWindow(QMainWindow):
         # mic is active and Atlas received audio — previously silent.
         self.bridge.set_status.emit(f"🎤 Heard ({source}) — processing…")
         self.bridge.append_text.emit(f"[{source.upper()}]: {text}")
+        # Voice control commands ("stop", "guided mode", "run X routine"…) are
+        # intercepted here before reaching the LLM, so spoken control works too.
+        if self.state and self._try_route_command(text):
+            return
         if self.state:
             # Drive the processing UI (gold accent + thinking bar) for the
             # voice path, mirroring the typed-query pipeline.
@@ -3476,7 +4559,9 @@ class AtlasWindow(QMainWindow):
         self._action_watch.blockSignals(True)
         self._action_watch.setChecked(True)
         self._action_watch.blockSignals(False)
-        self.bridge.set_status.emit("Watcher Active")
+        if self.state:
+            self.state.set_screen_vision(True)   # Atlas can now SEE the screen
+        self.bridge.set_status.emit("Watcher Active — Atlas can see your screen")
         worker = WatchWorker(
             interval=getattr(self, "_watch_interval", 5),
             sensitivity=getattr(self, "_watch_sensitivity", "Medium"),
@@ -3495,6 +4580,8 @@ class AtlasWindow(QMainWindow):
         self._action_watch.blockSignals(True)
         self._action_watch.setChecked(False)
         self._action_watch.blockSignals(False)
+        if self.state:
+            self.state.set_screen_vision(False)
         worker = getattr(self, "_watch_worker", None)
         if worker:
             worker.stop()
@@ -3618,9 +4705,8 @@ class AtlasWindow(QMainWindow):
             self.workspace.setStyleSheet("")
 
     def _stop_ambient_on_input(self) -> None:
-        if self.mode_combo.currentText() == "Ambient":
-            self._ambient_timer.stop()
-            self.workspace.setStyleSheet("")
+        if self.watch_active:
+            pass  # screen watch stays on; only the ambient border pulse pauses on type
 
     def _tick_ambient_border(self) -> None:
         if not self._ambient_pulse_on:
@@ -3820,6 +4906,23 @@ if __name__ == "__main__":
     )
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
+
+    # ── Account gate (local-first; cloud sync when Supabase is configured) ────
+    account = AccountManager() if (HAS_ACCOUNTS and _CORE) else None
+    chosen_uid, chosen_name = None, None
+    if account:
+        login = LoginDialog(account)
+        login.exec()
+        chosen_uid, chosen_name = login.user_id, login.user_name
+        if chosen_name:
+            os.environ["ATLAS_USER"] = chosen_name
+
     win = AtlasWindow()
+    win.account = account
+    if account and chosen_uid and win.state:
+        win.state.set_user(chosen_uid, chosen_name)
+    win.apply_account_identity(chosen_name or "Guest")
+    if win.state and win.state.focus_mode:
+        win._sync_focus_ui(True)
     win.show()
     sys.exit(app.exec())

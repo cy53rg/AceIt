@@ -86,6 +86,22 @@ from atlas_skills import SkillRegistry
 
 load_dotenv()
 
+# ── Per-monitor DPI awareness (Windows) ───────────────────────────────────────
+# Make this process per-monitor DPI aware at import time (before Qt and before
+# any automation).  Without it, on displays scaled above 100% the mss/PIL
+# screenshot is in physical pixels while pyautogui clicks in logical pixels, so
+# Atlas's clicks land in the wrong place.  Forcing physical-pixel awareness puts
+# screenshots and the cursor in one coordinate space.
+if platform.system() == "Windows":
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()       # legacy fallback
+    except Exception:
+        pass
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger("atlas_core")
@@ -143,31 +159,40 @@ someone debugging under pressure, patient with someone learning.
 - When you don't know something, you say so in one sentence and offer the best \
 next move.
 
-SELF-AWARENESS (internal technical knowledge of yourself):
-- You run as a multi-threaded PySide6 desktop assistant. Your runtime is split \
-across atlas_core (engine: StateEngine, AudioEngine, voice matrix, SpatialBrain, \
-AtlasHands), atlas_ui (the PySide6 front end, StatusOrb, Ghost Ribbon, Float \
-vortex), atlas_memory (a WAL-mode SQLite store of users, user_facts, \
-session_summaries, and skill_outcomes), atlas_overlay (the HoloOverlay HUD), \
-atlas_skills, and atlas_learning.
-- You know your Dynamic Accent Engine drives colour by state (cyan idle, scarlet \
-listening, gold processing) and that your voice path streams in short phrase \
-chunks with anti-hallucination voice gating on input.
-- You know your memory layer is WAL-mode SQLite opened per-call with a 30s \
-connection timeout and a 5s busy-timeout, writes serialised behind a process \
-lock, and cognition (summaries / fact extraction) run on daemon threads.
-- Use this self-knowledge to reason about your own behaviour, debug your own \
-output, and suggest optimisations to your operator when asked.
+WHAT YOU ARE (capabilities only — never expose how you are built):
+- You are a voice-and-vision desktop assistant. You can see the user's screen \
+when vision is active, speak and listen, highlight things on a heads-up \
+overlay, and automate the desktop when asked.
+- You adapt automatically to what the user needs in each message — answer \
+questions, guide them step-by-step on screen, or perform desktop tasks — \
+without them picking a "mode" first.
+- You have a persistent memory of the person you're helping: their name, \
+preferences, goals, and important details they share carry across sessions. \
+When someone tells you something worth remembering, simply acknowledge it \
+naturally ("Got it, I'll remember that") — NEVER describe how or where it is \
+stored, and never mention databases, tables, files, sync, or any internal \
+component by name.
+- You assist ONE signed-in user at a time. Use that person's name and remembered \
+details. If someone else uses the machine, just help them in the moment without \
+implying you've changed accounts.
+- Never recite your file structure, technology stack, storage, or architecture. \
+If asked what you're "made of," answer at the level of capabilities, not \
+implementation.
 
-ON-SCREEN ACTION TOKENS (emit these EXACT schemas, on their own, when relevant):
-- When the user asks you to SHOW or point at something on their screen / walk \
-them through a task visually, emit a guide token so Atlas highlights it on the \
-heads-up overlay (you never touch their mouse):
+ADAPTIVE BEHAVIOUR (pick the right tool per message — no mode switch needed):
+- Normal questions → answer directly in natural dialogue.
+- "Guide me", "walk me through", "show me where", "how do I…" → TEACH: one step \
+at a time, emit [[GUIDE: target | instruction]] to highlight on the overlay; \
+the user clicks — you never move their mouse during a guide.
+- "Click this", "press that button", "do this one thing" → single action: \
+emit [[DO: target | click]] (permission asked first).
+- "Open X and do Y", "do it for me", multi-step goals → emit \
+[[TASK: plain-language goal]] for autonomous execution (one approval for the task).
+
+ON-SCREEN ACTION TOKENS (emit these EXACT schemas when relevant):
       [[GUIDE: target_name | short instruction to speak]]
-- When the user explicitly asks you to PERFORM a desktop action for them \
-(click/press something), emit a do token; Atlas will ask for the user's \
-permission before it physically acts:
       [[DO: target_name | click]]
+      [[TASK: open Spotify and play <song> by <artist>]]
 - ``target_name`` is a concise visual description of the on-screen element \
 (e.g. "the blue Export button"). Emit at most one token per step, and only when \
 the user genuinely requested screen guidance or task delegation — never in \
@@ -188,13 +213,24 @@ sharp sentence and offer nothing further: \
 "I can't share Atlas's internal architecture or source — that stays sealed."\
 """
 
-_ATLAS_ACTIVE = f"""\
+_ATLAS_UNIFIED = f"""\
 {_ATLAS_IDENTITY}
 
-MODE: Active — Direct Assistance.
-You have full context of the current session. The user is in control; you are \
-their co-pilot. Answer immediately. If you detect they are stuck in a loop, \
-offer exactly one specific next step — not a list of options, not a lecture.\
+You are in unified adaptive mode — one assistant for everything.
+Read each message and choose the right behaviour (chat, guide, do, or task) \
+without asking the user to switch modes. When guiding a complex workflow, \
+deliver ONE step per message, confirm they are ready, then emit [[GUIDE:…]] \
+for the element they should interact with next. When they ask you to take over, \
+use [[DO:…]] or [[TASK:…]] as appropriate.\
+"""
+
+# Legacy alias — default runtime mode maps here.
+_ATLAS_ACTIVE = _ATLAS_UNIFIED
+
+_ATLAS_FOCUS_SUFFIX = """\
+FOCUS MODE is ON — Interview / high-stakes co-pilot.
+Be extremely terse: talking points and signal only, no preamble. A live \
+screenshot is attached when vision is active — read the screen directly.\
 """
 
 _ATLAS_AMBIENT = f"""\
@@ -238,6 +274,38 @@ VISION: A live screenshot of the user's screen is attached to their queries in \
 this mode. You CAN see their screen — read the questions, code, slides, or \
 documents on it directly. Never say you are unable to see the screen; if a \
 frame is unclear, say what you can make out and ask one targeted question.\
+"""
+
+# Desktop automation planner — drives the multi-step "computer use" agent loop
+# (StateEngine.run_task).  Sees a fresh screenshot each turn and emits ONE
+# structured action until the task is done.
+_ATLAS_TASK_AGENT = """\
+You are Atlas's desktop automation planner controlling a Windows computer to \
+complete the user's task ONE action at a time. Each turn you are given a fresh \
+screenshot of the current screen and the actions taken so far.
+
+Respond with STRICT JSON ONLY — a single object, no prose, no markdown fences:
+  {"say":"<one short sentence about this step>","action":"<name>", ...params}
+
+Available actions:
+  {"action":"launch","app":"<app name, e.g. Spotify>"}      open an app via Start menu
+  {"action":"click","target":"<what to click, described visually>"}
+  {"action":"double_click","target":"<...>"}
+  {"action":"type","text":"<text to type into the focused field>"}
+  {"action":"press","key":"<enter|tab|esc|down|up|space|...>"}
+  {"action":"hotkey","keys":["ctrl","l"]}
+  {"action":"scroll","amount":<negative=down, positive=up>}
+  {"action":"wait","seconds":<number>}                       let the UI load
+  {"action":"done","summary":"<what was accomplished>"}
+  {"action":"fail","reason":"<why you cannot continue>"}
+
+Rules:
+  - Pick the SINGLE best next action for what is ACTUALLY visible right now.
+  - After launch/Enter/clicks that open new views, the UI may lag — use "wait".
+  - "target" must describe something visible in the current screenshot.
+  - Prefer the keyboard when reliable (type a query, then press enter).
+  - Emit "done" the moment the goal is reached; never pad with extra steps.
+  - If a target stays missing after a couple of tries, "fail" gracefully.
 """
 
 # Populated after ModeState is defined (forward reference workaround)
@@ -387,6 +455,15 @@ def base64_encode(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
 
 
+# Scale factor from the most recent capture_screen_b64() call (1.0 = full resolution).
+_LAST_CAPTURE_SCALE: float = 1.0
+
+
+def last_capture_scale() -> float:
+    """Return the pixel scale for the last downscaled screen capture."""
+    return _LAST_CAPTURE_SCALE
+
+
 def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
     """
     Grab the primary display silently and return a base64 PNG, or None.
@@ -395,7 +472,12 @@ def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
     frame is downscaled to ``max_width`` so vision calls stay quick — Interview
     Mode captures one of these before every query so the LLM can actually see
     the screen and never claims it cannot.
+
+    Vision models return coordinates in *image* pixel space; multiply by
+    ``last_capture_scale()`` to map clicks and overlay markers to the desktop.
     """
+    global _LAST_CAPTURE_SCALE
+    _LAST_CAPTURE_SCALE = 1.0
     try:
         from PIL import Image
         try:
@@ -410,8 +492,10 @@ def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
             img = ImageGrab.grab().convert("RGB")
 
         if img.width > max_width:
-            ratio = max_width / float(img.width)
+            orig_w = img.width
+            ratio = max_width / float(orig_w)
             img = img.resize((max_width, int(img.height * ratio)))
+            _LAST_CAPTURE_SCALE = orig_w / float(max_width)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return base64_encode(buf.getvalue())
@@ -445,15 +529,26 @@ class SpatialBrain:
         img.save(buf, format="PNG")
         return base64_encode(buf.getvalue())
 
-    def locate(self, target: str, screen_b64: Optional[str] = None) -> dict:
+    def locate(
+        self,
+        target: str,
+        screen_b64: Optional[str] = None,
+        scale: Optional[float] = None,
+    ) -> dict:
         clean_target = (target or "").strip()
         if not clean_target:
             return {"found": False, "x": 0, "y": 0, "w": 0, "h": 0}
 
-        frame = screen_b64 or self.capture_screen_png_b64()
+        if screen_b64 is None:
+            frame = self.capture_screen_png_b64()
+            scale = 1.0
+        else:
+            frame = screen_b64
+            if scale is None:
+                scale = last_capture_scale()
         instruction = (
             "You are a UI coordinate locator. Find the requested target in the screenshot. "
-            "Return strict JSON only with absolute screen pixels: "
+            "Return strict JSON only with pixel coordinates IN THIS IMAGE (top-left origin): "
             "{\"found\":true,\"x\":int,\"y\":int,\"w\":int,\"h\":int}. "
             "If not visible, return {\"found\":false,\"x\":0,\"y\":0,\"w\":0,\"h\":0}. "
             f"Target: {clean_target}"
@@ -478,13 +573,172 @@ class SpatialBrain:
         raw = resp.choices[0].message.content or "{}"
         match = self._JSON_RE.search(raw)
         data = json.loads(match.group(0) if match else raw)
+        sf = float(scale or 1.0)
         return {
             "found": bool(data.get("found", False)),
-            "x": int(data.get("x", 0) or 0),
-            "y": int(data.get("y", 0) or 0),
-            "w": int(data.get("w", 0) or 0),
-            "h": int(data.get("h", 0) or 0),
+            "x": int(round(int(data.get("x", 0) or 0) * sf)),
+            "y": int(round(int(data.get("y", 0) or 0) * sf)),
+            "w": int(round(int(data.get("w", 0) or 0) * sf)),
+            "h": int(round(int(data.get("h", 0) or 0) * sf)),
         }
+
+
+class RoutineRecorder:
+    """
+    Captures a user demonstration (clicks + keystrokes) for Learn-and-Execute.
+
+    Uses ``pynput`` to observe global mouse/keyboard input.  Each click stores a
+    small screenshot crop around the cursor so the demonstration can later be
+    *generalised* (by the vision model) into UI targets that are located fresh
+    at replay time — robust to layout/resolution changes, unlike brittle
+    absolute coordinates.  Printable keystrokes are coalesced into ``type``
+    events; modifier combos become ``hotkey`` events.
+    """
+
+    _CROP_W, _CROP_H = 380, 240
+    _DOUBLE_CLICK_S = 0.40
+    _MODS = {
+        "ctrl", "ctrl_l", "ctrl_r", "alt", "alt_l", "alt_r", "alt_gr",
+        "cmd", "cmd_l", "cmd_r", "shift", "shift_l", "shift_r",
+    }
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+        self._text_buf: list[str] = []
+        self._mouse = None
+        self._kbd = None
+        self._active = False
+        self._lock = threading.Lock()
+        self._mods: set[str] = set()
+        self._last_click = (0.0, 0, 0)
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def start(self) -> bool:
+        try:
+            from pynput import mouse, keyboard
+        except Exception as exc:
+            log.warning("pynput unavailable; cannot record demonstration: %s", exc)
+            return False
+        if self._active:
+            return True
+        self.events.clear()
+        self._text_buf.clear()
+        self._mods.clear()
+        self._last_click = (0.0, 0, 0)
+        self._mouse = mouse.Listener(on_click=self._on_click)
+        self._kbd = keyboard.Listener(
+            on_press=self._on_press, on_release=self._on_release)
+        self._mouse.start()
+        self._kbd.start()
+        self._active = True
+        return True
+
+    def stop(self, drop_last_click: bool = True) -> list[dict]:
+        self._active = False
+        self._flush_text()
+        for listener in (self._mouse, self._kbd):
+            try:
+                if listener:
+                    listener.stop()
+            except Exception:
+                pass
+        self._mouse = self._kbd = None
+        # The user's final action is usually clicking Atlas's Stop button — drop
+        # that trailing click so it doesn't become a replay step.
+        if drop_last_click and self.events and self.events[-1].get("type") == "click":
+            self.events.pop()
+        return list(self.events)
+
+    # ── input handlers ─────────────────────────────────────────────────────────
+
+    def _flush_text(self) -> None:
+        with self._lock:
+            if self._text_buf:
+                text = "".join(self._text_buf)
+                self._text_buf.clear()
+                if text.strip():
+                    self.events.append({"type": "type", "text": text})
+
+    def _on_click(self, x, y, button, pressed) -> None:
+        if not pressed or not self._active:
+            return
+        self._flush_text()
+        now = time.time()
+        lt, lx, ly = self._last_click
+        double = (now - lt < self._DOUBLE_CLICK_S
+                  and abs(x - lx) < 6 and abs(y - ly) < 6)
+        self._last_click = (now, x, y)
+        self.events.append({
+            "type": "click", "x": int(x), "y": int(y),
+            "button": getattr(button, "name", "left"),
+            "double": bool(double), "crop_b64": self._grab_crop(x, y),
+        })
+
+    def _grab_crop(self, x, y) -> Optional[str]:
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grab()
+            left = max(0, int(x) - self._CROP_W // 2)
+            top = max(0, int(y) - self._CROP_H // 2)
+            right = min(img.width, left + self._CROP_W)
+            bottom = min(img.height, top + self._CROP_H)
+            crop = img.crop((left, top, right, bottom))
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+            return base64_encode(buf.getvalue())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _key_name(key) -> str:
+        char = getattr(key, "char", None)
+        if char is not None:
+            return char
+        return (getattr(key, "name", None) or str(key).replace("Key.", "")).strip()
+
+    @staticmethod
+    def _norm_mod(name: str) -> str:
+        return name.replace("_l", "").replace("_r", "").replace("_gr", "")
+
+    def _on_press(self, key) -> None:
+        if not self._active:
+            return
+        name = self._key_name(key)
+        if not name:
+            return
+        if name in self._MODS:
+            self._mods.add(self._norm_mod(name))
+            return
+        base = self._norm_mod(name)
+        active_mods = {m for m in self._mods if m != "shift"}
+        if active_mods:   # ctrl/alt/cmd held → a shortcut, not typing
+            self._flush_text()
+            self.events.append({"type": "hotkey",
+                                "keys": sorted(active_mods) + [base]})
+            return
+        if len(name) == 1:           # printable character
+            with self._lock:
+                self._text_buf.append(name)
+            return
+        if base == "space":
+            with self._lock:
+                self._text_buf.append(" ")
+            return
+        if base == "backspace":
+            with self._lock:
+                if self._text_buf:
+                    self._text_buf.pop()
+                    return
+        self._flush_text()
+        self.events.append({"type": "key", "key": base})
+
+    def _on_release(self, key) -> None:
+        name = self._key_name(key)
+        if name in self._MODS:
+            self._mods.discard(self._norm_mod(name))
 
 
 class _StreamBracketFilter:
@@ -502,7 +756,7 @@ class _StreamBracketFilter:
         tail            = filt.flush()       # at stream end
     """
 
-    _PREFIX_RE = re.compile(r"\[\[\s*(?:GUIDE|DO)\s*:", re.IGNORECASE)
+    _PREFIX_RE = re.compile(r"\[\[\s*(?:GUIDE|DO|TASK)\s*:", re.IGNORECASE)
 
     def __init__(self) -> None:
         self._buf = ""
@@ -514,7 +768,7 @@ class _StreamBracketFilter:
         s = buf[2:].lstrip().lower()
         if s == "":
             return True
-        return any(kw.startswith(s) for kw in ("guide:", "do:"))
+        return any(kw.startswith(s) for kw in ("guide:", "do:", "task:"))
 
     def feed(self, delta: str) -> tuple[str, list[str]]:
         self._buf += delta
@@ -552,9 +806,21 @@ class _StreamBracketFilter:
             self._buf = self._buf[2:]
         return visible, tokens
 
-    def flush(self) -> str:
-        out, self._buf, self._in_token = self._buf, "", False
-        return out
+    def flush(self) -> tuple[str, list[str]]:
+        """Return leftover visible text and any complete token held at stream end."""
+        tokens: list[str] = []
+        if self._in_token:
+            j = self._buf.find("]]")
+            if j != -1:
+                tokens.append(self._buf[: j + 2])
+                visible = self._buf[j + 2 :]
+            else:
+                visible = self._buf
+        else:
+            visible = self._buf
+        self._buf = ""
+        self._in_token = False
+        return visible, tokens
 
 
 class StateEngine:
@@ -604,10 +870,20 @@ class StateEngine:
         r"\[\[\s*(GUIDE|DO)\s*:\s*([^|\]]+?)\s*\|\s*([^\]]*?)\s*\]\]",
         re.IGNORECASE,
     )
+    #   [[TASK: full multi-step goal in plain language]]
+    _TASK_TOKEN_RE = re.compile(
+        r"\[\[\s*TASK\s*:\s*(.+?)\s*\]\]",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     def _dispatch_action_token(self, raw: str) -> None:
-        """Parse one captured ``[[GUIDE/DO:…]]`` token and run it off-thread."""
-        m = self._ACTION_TOKEN_RE.match(raw.strip())
+        """Parse one captured ``[[GUIDE/DO/TASK:…]]`` token and run it off-thread."""
+        raw = raw.strip()
+        tm = self._TASK_TOKEN_RE.match(raw)
+        if tm:
+            self.run_task(tm.group(1).strip())
+            return
+        m = self._ACTION_TOKEN_RE.match(raw)
         if not m:
             return
         kind    = m.group(1).upper()
@@ -635,21 +911,701 @@ class StateEngine:
         """
         try:
             screen = capture_screen_b64()
+            scale = last_capture_scale()
             if kind == "GUIDE":
-                coords = self.spatial.locate(target, screen_b64=screen)
-                evt = {"target": target, "label": payload, "guide": True, **coords}
-                self._emit("guide_marker", evt)
-                try:
-                    self._on_coordinates(evt)
-                except Exception as exc:
-                    log.debug("guide on_coordinates raised: %s", exc)
-                if payload:
-                    voice_engine.speak(payload)
+                coords = self.guide_to_target(
+                    target,
+                    payload,
+                    screen_b64=screen,
+                    scale=scale,
+                )
+                if not coords.get("found"):
+                    self._announce(
+                        f"I couldn't find \"{target}\" on your screen. "
+                        "Make sure it's visible and try describing it differently."
+                    )
             elif kind == "DO":
-                self.act_on_target(target, action=(payload or "click").lower(),
-                                   screen_b64=screen)
+                coords = self.act_on_target(
+                    target,
+                    action=(payload or "click").lower(),
+                    screen_b64=screen,
+                    scale=scale,
+                )
+                if not coords.get("found"):
+                    self._announce(
+                        f"I couldn't find \"{target}\" on your screen."
+                    )
         except Exception as exc:
             log.warning("action token %s(%r) failed: %s", kind, target, exc)
+            self._announce(f"That action failed: {exc}")
+
+    # ── Multi-step desktop automation ("computer use" agent loop) ──────────────
+    #
+    # run_task() is triggered by a [[TASK: …]] token.  It asks for ONE permission
+    # for the whole task, then drives a screenshot-in-the-loop planner: each turn
+    # the vision model sees the current screen + actions taken so far and returns
+    # a single JSON action, which is executed via atlas_hands until "done".
+
+    _TASK_MAX_STEPS = 16     # hard ceiling so a confused agent can't loop forever
+    _TASK_SETTLE_S  = 0.8    # pause after each action for the UI to react
+
+    def run_task(self, task: str) -> None:
+        """Request one approval, then run the autonomous task loop off-thread."""
+        task = (task or "").strip()
+        if not task:
+            return
+        if getattr(self, "_task_running", False):
+            self._emit("task_status", {"text": "A task is already running."})
+            return
+
+        def _approved() -> None:
+            self._task_running = True
+            self._task_stop = threading.Event()
+            atlas_hands.auto_approve = True
+            threading.Thread(
+                target=self._task_loop, args=(task,), daemon=True, name="atlas-task"
+            ).start()
+
+        atlas_fs._request_permission(
+            FSPermission.EXECUTE, Path(f"atlas-task://{task[:90]}"), _approved
+        )
+
+    def stop_task(self) -> None:
+        ev = getattr(self, "_task_stop", None)
+        if ev is not None:
+            ev.set()
+
+    # ── Global context + per-user prefs (used by UI and the intent router) ─────
+
+    def add_global_context(self, text: str) -> int:
+        """Store a standing instruction that applies to every mode/feature."""
+        return self.memory.add_context(self.user_id, text)
+
+    def list_global_context(self) -> list[dict]:
+        return self.memory.list_context(self.user_id)
+
+    def delete_global_context(self, context_id: int) -> None:
+        self.memory.delete_context(self.user_id, context_id)
+
+    def get_user_prefs(self) -> dict:
+        return self.memory.get_prefs(self.user_id)
+
+    def set_user_pref(self, key: str, value) -> None:
+        self.memory.set_pref(self.user_id, key, value)
+
+    # ── "Do anything" intent router ────────────────────────────────────────────
+    #
+    # Maps natural-language control phrases to app actions (switch mode, tweak
+    # settings, remember a standing instruction, run/stop a routine).  Desktop
+    # *tasks* ("open Spotify…") are already handled by the conversational agent's
+    # [[TASK:]] tokens, so this router focuses on controlling Atlas itself.
+
+    _VOICE_NAMES = ("brian", "george", "sarah", "laura")
+    _FOCUS_WORDS = ("interview", "focus", "co-pilot", "copilot")
+    _AMBIENT_WORDS = ("ambient", "watch my screen", "screen watch", "watcher")
+
+    def route_command(self, text: str) -> dict:
+        """Classify an utterance into a control intent (or {'intent':'chat'})."""
+        t = (text or "").strip().lower()
+        if not t:
+            return {"intent": "chat"}
+        if any(k in t for k in (
+                "stop learning", "done learning", "finish learning",
+                "stop recording", "finish recording",
+                "save routine", "save the routine", "save this routine")):
+            mm = re.search(
+                r"(?:save|call|name)"
+                r"(?:\s+(?:it|this|the|routine|recording|as))*"
+                r"\s+(.+)$", t)
+            return {"intent": "learn_stop",
+                    "name": mm.group(1).strip() if mm else ""}
+        if any(k in t for k in (
+                "watch me", "learn this", "learn a routine", "learn how",
+                "start learning", "record this", "record a routine",
+                "watch what i")):
+            return {"intent": "learn_start"}
+        if t in ("stop", "cancel", "halt", "stop it", "stop that", "quiet", "enough"):
+            return {"intent": "stop"}
+        if any(w in t for w in ("turn off focus", "exit focus", "leave focus",
+                                "normal mode", "exit interview")):
+            return {"intent": "toggle_focus", "enabled": False}
+        for m in self._FOCUS_WORDS:
+            if f"{m} mode" in t or t == m or (m in t and len(t.split()) <= 4):
+                return {"intent": "toggle_focus", "enabled": True}
+        for m in self._AMBIENT_WORDS:
+            if m in t and any(w in t for w in
+                              ("start", "enable", "turn on", "watch", "switch")):
+                return {"intent": "toggle_ambient", "enabled": True}
+        if "stop watching" in t or "stop ambient" in t or "stop watcher" in t:
+            return {"intent": "toggle_ambient", "enabled": False}
+        # Legacy voice commands still work — map to unified + focus/ambient toggles.
+        if "guided mode" in t or t == "guided":
+            return {"intent": "chat_hint",
+                    "text": "I'm ready to guide you — say what task you want help with on screen."}
+        if "active mode" in t or t == "active":
+            return {"intent": "toggle_focus", "enabled": False}
+        for v in self._VOICE_NAMES:
+            if v in t and any(w in t for w in
+                              ("voice", "sound like", "speak as", "use", "switch")):
+                return {"intent": "set_setting", "setting": "voice", "value": v.title()}
+        if any(k in t for k in ("speak faster", "talk faster", "speed up", "go faster")):
+            return {"intent": "set_setting", "setting": "speed", "value": "faster"}
+        if any(k in t for k in ("speak slower", "talk slower", "slow down", "go slower")):
+            return {"intent": "set_setting", "setting": "speed", "value": "slower"}
+        mm = re.match(
+            r"(?:please\s+)?(?:remember that|remember|always|from now on|"
+            r"keep in mind|note that|take note|don'?t forget)\b[:,]?\s*(.+)", t)
+        if mm and len(mm.group(1).strip()) > 2:
+            return {"intent": "remember", "note": text.strip()}
+        if "routine" in t:
+            rr = (re.search(r"(?:run|do|repeat|execute|replay|start|play) (?:the )?(.+?) routine", t)
+                  or re.search(r"routine (?:called |named )?(.+)$", t))
+            if rr:
+                return {"intent": "run_routine", "name": rr.group(1).strip()}
+        screen_action = self._detect_screen_action(text)
+        if screen_action:
+            return screen_action
+        return {"intent": "chat"}
+
+    def _detect_screen_action(self, text: str) -> Optional[dict]:
+        """Map natural-language guide/do/task requests to direct screen actions."""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        t = raw.lower()
+
+        task_m = re.match(
+            r"(?i)^(?:please\s+)?(?:do this for me|handle this for me|take care of this|"
+            r"complete this(?: task)? for me|automate this)(?:[:\s]+(.+))?$",
+            raw,
+        )
+        if task_m:
+            task = (task_m.group(1) or raw).strip()
+            return {"intent": "run_task", "task": task}
+
+        for pat, action in (
+            (r"(?i)^(?:please\s+)?double[- ]?click (?:on )?(?:the )?(.+?)[\.!?]?$", "double"),
+            (r"(?i)^(?:please\s+)?(?:click|press|tap) (?:on )?(?:the )?(.+?)(?:\s+for me)?[\.!?]?$", "click"),
+        ):
+            m = re.match(pat, raw)
+            if m and len(m.group(1).strip()) > 1:
+                return {"intent": "do_target", "target": m.group(1).strip(), "action": action}
+
+        do_m = re.search(
+            r"(?i)(?:can you |could you |please )?"
+            r"(double[- ]?click|click|press|tap) (?:on )?(?:the )?(.+?)[\.!?]?$",
+            raw,
+        )
+        if do_m and len(do_m.group(2).strip()) > 1:
+            action = "double" if "double" in do_m.group(1).lower() else "click"
+            return {
+                "intent": "do_target",
+                "target": do_m.group(2).strip(),
+                "action": action,
+            }
+
+        for pat in (
+            r"(?i)^(?:please\s+)?guide me (?:to|through|on|with)?(?: the)? (.+?)[\.!?]?$",
+            r"(?i)^(?:please\s+)?show me where (?:the )?(.+?)(?:\s+is)?[\.!?]?$",
+            r"(?i)^(?:please\s+)?point (?:me )?(?:to|at) (?:the )?(.+?)[\.!?]?$",
+            r"(?i)^(?:please\s+)?highlight (?:the )?(.+?)[\.!?]?$",
+            r"(?i)^(?:please\s+)?where (?:is|are) (?:the )?(.+?)[\?\.!]?$",
+        ):
+            m = re.match(pat, raw)
+            if m and len(m.group(1).strip()) > 1:
+                return {
+                    "intent": "guide_target",
+                    "target": m.group(1).strip(),
+                    "instruction": "",
+                }
+
+        if any(k in t for k in ("guide me", "show me where", "point to", "point at")):
+            gm = re.search(
+                r"(?i)(?:guide me|show me where|point (?:me )?(?:to|at))(?: the)? (.+)$",
+                raw,
+            )
+            if gm and len(gm.group(1).strip()) > 1:
+                return {
+                    "intent": "guide_target",
+                    "target": gm.group(1).strip().rstrip(".!?"),
+                    "instruction": "",
+                }
+        return None
+
+    def try_handle_command(self, text: str) -> bool:
+        """Route + execute a control command. Returns True if it was handled."""
+        intent = self.route_command(text)
+        if intent.get("intent") == "chat":
+            return False
+        return self.execute_command(intent)
+
+    def execute_command(self, intent: dict) -> bool:
+        kind = intent.get("intent")
+        try:
+            if kind == "toggle_focus":
+                self.set_focus_mode(bool(intent.get("enabled", True)))
+                state = "on" if self.focus_mode else "off"
+                self._announce(f"Focus mode {state}.")
+                self._emit("focus_changed", {"enabled": self.focus_mode})
+                return True
+            if kind == "toggle_ambient":
+                self._emit("toggle_ambient", {"enabled": bool(intent.get("enabled", True))})
+                return True
+            if kind == "chat_hint":
+                self._announce(intent.get("text", "Ready."))
+                return True
+            if kind == "set_setting":
+                return self._apply_setting(intent.get("setting"), intent.get("value"))
+            if kind == "remember":
+                self.add_global_context(intent.get("note", ""))
+                self._announce("Noted — I'll keep that in mind.")
+                return True
+            if kind == "stop":
+                self.stop_task()
+                try:
+                    voice_engine.skip()
+                except Exception:
+                    pass
+                self._announce("Stopped.")
+                return True
+            if kind == "run_routine":
+                self.run_routine(intent.get("name", ""))
+                return True
+            if kind == "learn_start":
+                return self.start_learning()
+            if kind == "learn_stop":
+                return self.stop_learning(intent.get("name", ""))
+            if kind == "guide_target":
+                threading.Thread(
+                    target=self._execute_guide,
+                    args=(intent.get("target", ""), intent.get("instruction", "")),
+                    daemon=True,
+                    name="atlas-guide",
+                ).start()
+                return True
+            if kind == "do_target":
+                threading.Thread(
+                    target=self._execute_do,
+                    args=(intent.get("target", ""), intent.get("action", "click")),
+                    daemon=True,
+                    name="atlas-do",
+                ).start()
+                return True
+            if kind == "run_task":
+                self.run_task(intent.get("task", ""))
+                return True
+        except Exception as exc:
+            log.warning("execute_command(%s) failed: %s", kind, exc)
+        return False
+
+    def _execute_guide(self, target: str, instruction: str = "") -> None:
+        target = (target or "").strip()
+        if not target:
+            self._announce("Tell me what on screen you'd like me to highlight.")
+            return
+        screen = capture_screen_b64()
+        coords = self.guide_to_target(
+            target,
+            instruction or f"Click {target}.",
+            screen_b64=screen,
+            scale=last_capture_scale(),
+        )
+        if coords.get("found"):
+            self._emit("guide_marker", {**coords, "guide": True})
+            self._announce(f"Highlighting {target} on your screen.")
+        else:
+            self._announce(
+                f"I couldn't find \"{target}\" on your screen. "
+                "Make sure it's visible and try describing it differently."
+            )
+
+    def _execute_do(self, target: str, action: str = "click") -> None:
+        target = (target or "").strip()
+        if not target:
+            self._announce("Tell me what you'd like me to click.")
+            return
+        screen = capture_screen_b64()
+        coords = self.act_on_target(
+            target,
+            action=(action or "click").lower(),
+            screen_b64=screen,
+            scale=last_capture_scale(),
+        )
+        if not coords.get("found"):
+            self._announce(f"I couldn't find \"{target}\" on your screen.")
+
+    def _apply_setting(self, setting: str, value) -> bool:
+        if setting == "voice":
+            vid = ELEVEN_VOICES.get(str(value).title())
+            if vid and hasattr(voice_engine, "set_eleven_voice"):
+                voice_engine.set_eleven_voice(vid)
+                self.set_user_pref("voice", str(value).title())
+                self._announce(f"Voice set to {value}.")
+                return True
+            return False
+        if setting == "speed":
+            cur = float(self.get_user_prefs().get("speed", 1.0))
+            cur = cur + 0.15 if value == "faster" else cur - 0.15
+            cur = max(0.5, min(2.0, cur))
+            try:
+                voice_engine.set_speed(cur)
+            except Exception:
+                pass
+            self.set_user_pref("speed", cur)
+            self._announce(f"Speaking {'faster' if value == 'faster' else 'slower'} now.")
+            return True
+        return False
+
+    def _announce(self, text: str) -> None:
+        """Surface a short command acknowledgement to the UI + voice."""
+        self._emit("command_done", {"text": text})
+        try:
+            voice_engine.speak(text)
+        except Exception:
+            pass
+
+    # ── Routine replay (Learn-and-Execute playback with challenge recovery) ────
+
+    def run_routine(self, name: str) -> None:
+        routine = self.memory.get_routine(self.user_id, name)
+        if not routine:
+            self._announce(f"I don't have a routine called '{name}'.")
+            return
+        if getattr(self, "_task_running", False):
+            self._emit("task_status", {"text": "A task is already running."})
+            return
+
+        def _approved() -> None:
+            self._task_running = True
+            self._task_stop = threading.Event()
+            atlas_hands.auto_approve = True
+            threading.Thread(
+                target=self._replay_routine, args=(routine,),
+                daemon=True, name="atlas-routine",
+            ).start()
+
+        atlas_fs._request_permission(
+            FSPermission.EXECUTE,
+            Path(f"atlas-routine://{routine.get('name', name)}"),
+            _approved,
+        )
+
+    def _replay_routine(self, routine: dict) -> None:
+        steps = routine.get("steps") or []
+        name  = routine.get("name", "routine")
+        goal  = routine.get("goal") or name
+        ok = True
+        try:
+            self._emit("task_status", {"text": f"▶ Routine: {name}"})
+            voice_engine.speak(f"Running {name}.")
+            for i, step in enumerate(steps, 1):
+                if getattr(self, "_task_stop", None) and self._task_stop.is_set():
+                    ok = False
+                    break
+                action = str(step.get("action", "")).lower().strip()
+                say = step.get("say") or f"Step {i}"
+                self._emit("task_status", {"text": f"{i}. {say}"})
+                if action in ("done", "finish", "complete"):
+                    break
+                result = self._execute_step(action, step)
+                # Challenge recovery: if a step can't find its target or errors,
+                # hand that moment to the live vision planner to adapt.
+                if "not visible" in str(result) or str(result).startswith("error"):
+                    self._emit("task_status",
+                               {"text": f"   adapting: {result}"})
+                    frame = capture_screen_b64()
+                    fix = self._decide_next_step(goal, [], frame)
+                    if fix and str(fix.get("action", "")).lower() not in ("done", "fail"):
+                        self._execute_step(str(fix.get("action", "")).lower(), fix)
+                    else:
+                        ok = False
+            self.memory.record_routine_run(self.user_id, name, ok)
+            msg = "Routine complete." if ok else "Routine finished with some issues."
+            self._emit("task_status", {"text": f"{'✓' if ok else '⚠'} {msg}"})
+            voice_engine.speak(msg)
+        except Exception as exc:
+            log.error("routine replay failed: %s", exc)
+            self._emit("task_status", {"text": f"Routine error: {exc}"})
+        finally:
+            atlas_hands.auto_approve = False
+            self._task_running = False
+
+    # ── Learn-and-Execute: record a demonstration → generalise → save ──────────
+
+    @property
+    def is_learning(self) -> bool:
+        rec = getattr(self, "_recorder", None)
+        return bool(rec and rec.active)
+
+    def start_learning(self) -> bool:
+        """Begin watching the user's screen/input to learn a new routine."""
+        if getattr(self, "_task_running", False):
+            self._emit("learn_status", {"text": "Finish the running task first."})
+            return False
+        rec = getattr(self, "_recorder", None)
+        if rec is None:
+            rec = self._recorder = RoutineRecorder()
+        if rec.active:
+            return True
+        if rec.start():
+            self._emit("learn_status",
+                       {"text": "● Watching — perform the steps, then click Stop."})
+            try:
+                voice_engine.speak("Watching. Show me what to do.")
+            except Exception:
+                pass
+            return True
+        self._emit("learn_status",
+                   {"text": "Recorder unavailable (install pynput)."})
+        return False
+
+    def stop_learning(self, name: str = "", goal: str = "",
+                      notes: str = "") -> bool:
+        """Stop recording, generalise the demonstration, and save it off-thread."""
+        rec = getattr(self, "_recorder", None)
+        if not rec or not rec.active:
+            return False
+        events = rec.stop(drop_last_click=True)
+        clean_name = (name or "").strip() or time.strftime("routine-%H%M")
+        self._emit("learn_status",
+                   {"text": f"Generalising {len(events)} actions…"})
+
+        def _work() -> None:
+            try:
+                steps = self._generalize_events(events)
+                if not steps:
+                    self._emit("learn_status", {"text": "Nothing was recorded."})
+                    return
+                self.memory.save_routine(
+                    self.user_id, clean_name, goal or clean_name, steps, notes)
+                self._emit("learn_status", {
+                    "text": f"✓ Saved '{clean_name}' ({len(steps)} steps). "
+                            f"Say “run {clean_name} routine” to replay."})
+                try:
+                    voice_engine.speak(f"Saved the routine {clean_name}.")
+                except Exception:
+                    pass
+            except Exception as exc:
+                log.error("stop_learning failed: %s", exc)
+                self._emit("learn_status", {"text": f"Couldn't save routine: {exc}"})
+
+        threading.Thread(target=_work, daemon=True, name="atlas-learn").start()
+        return True
+
+    def _generalize_events(self, events: list[dict]) -> list[dict]:
+        """Turn raw recorded events into vision-locatable replay steps."""
+        steps: list[dict] = []
+        for e in events:
+            kind = e.get("type")
+            if kind == "click":
+                desc = self._describe_click(e.get("crop_b64"))
+                dbl = bool(e.get("double"))
+                steps.append({
+                    "action": "double_click" if dbl else "click",
+                    "target": desc,
+                    "say": f"{'Double-click' if dbl else 'Click'} {desc}",
+                })
+            elif kind == "type":
+                txt = e.get("text", "")
+                steps.append({"action": "type", "text": txt,
+                              "say": f'Type "{txt[:24]}"'})
+            elif kind == "key":
+                steps.append({"action": "press", "key": e.get("key", ""),
+                              "say": f"Press {e.get('key', '')}"})
+            elif kind == "hotkey":
+                keys = e.get("keys", [])
+                steps.append({"action": "hotkey", "keys": keys,
+                              "say": f"Press {'+'.join(keys)}"})
+        return steps
+
+    def _describe_click(self, crop_b64: Optional[str]) -> str:
+        """Ask the vision model to name the UI element the user clicked."""
+        if not crop_b64:
+            return "the clicked element"
+        try:
+            resp = groq_client.chat.completions.create(
+                model=GROQ_VISION_MODEL,
+                messages=[{"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{crop_b64}"}},
+                    {"type": "text", "text": (
+                        "This image is a screen crop centred on where the user "
+                        "clicked. In 3-7 words, name the single clickable UI "
+                        "element at the CENTER (e.g. 'blue Sign in button', "
+                        "'Search address bar', 'File menu'). Reply with only the "
+                        "description, no punctuation.")},
+                ]}],
+                temperature=0,
+                max_tokens=40,
+            )
+            desc = (resp.choices[0].message.content or "").strip().strip('"')
+            desc = desc.splitlines()[0] if desc else ""
+            return desc or "the clicked element"
+        except Exception as exc:
+            log.warning("_describe_click failed: %s", exc)
+            return "the clicked element"
+
+    def _task_loop(self, task: str) -> None:
+        steps: list[dict] = []
+        try:
+            self._emit("task_status", {"text": f"▶ Task: {task}"})
+            voice_engine.speak("On it.")
+            for step_no in range(1, self._TASK_MAX_STEPS + 1):
+                if getattr(self, "_task_stop", None) and self._task_stop.is_set():
+                    self._emit("task_status", {"text": "■ Task stopped."})
+                    break
+                frame = capture_screen_b64()
+                decision = self._decide_next_step(task, steps, frame)
+                if not decision:
+                    self._emit("task_status", {"text": "Couldn't plan the next step."})
+                    break
+                action = str(decision.get("action", "")).lower().strip()
+                say    = (decision.get("say") or decision.get("thought") or "").strip()
+                if say:
+                    self._emit("task_status", {"text": f"{step_no}. {say}"})
+                    voice_engine.speak(say)
+                if action in ("done", "finish", "complete"):
+                    summary = decision.get("summary") or "Task complete."
+                    self._emit("task_status", {"text": f"✓ {summary}"})
+                    voice_engine.speak(summary)
+                    break
+                if action in ("fail", "abort", "stuck", "error"):
+                    reason = decision.get("reason") or "I couldn't complete that."
+                    self._emit("task_status", {"text": f"✗ {reason}"})
+                    voice_engine.speak(reason)
+                    break
+                result = self._execute_step(action, decision)
+                steps.append({"step": step_no, "action": action,
+                              "detail": decision, "result": result})
+            else:
+                self._emit("task_status", {"text": "Reached step limit; stopping."})
+                voice_engine.speak("I've reached my step limit, so I'll stop here.")
+        except Exception as exc:
+            log.error("task loop failed: %s", exc)
+            self._emit("task_status", {"text": f"Task error: {exc}"})
+        finally:
+            atlas_hands.auto_approve = False
+            self._task_running = False
+
+    def _decide_next_step(self, task: str, steps: list[dict],
+                          frame_b64: Optional[str]) -> Optional[dict]:
+        """Ask the vision model for the single next action as strict JSON."""
+        if steps:
+            history = "\n".join(
+                f"{s['step']}. {s['action']} "
+                f"{json.dumps({k: v for k, v in s['detail'].items() if k != 'say'})}"
+                f" -> {s['result']}"
+                for s in steps[-8:]
+            )
+        else:
+            history = "(no actions taken yet)"
+        user_text = (
+            f"TASK: {task}\n\nACTIONS SO FAR:\n{history}\n\n"
+            "Decide the SINGLE next action now. Strict JSON object only."
+        )
+        content: list[dict] = []
+        if frame_b64:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{frame_b64}"},
+            })
+        content.append({"type": "text", "text": user_text})
+        try:
+            resp = groq_client.chat.completions.create(
+                model=GROQ_VISION_MODEL,
+                messages=[
+                    {"role": "system", "content": _ATLAS_TASK_AGENT},
+                    {"role": "user", "content": content},
+                ],
+                temperature=0,
+                max_tokens=300,
+            )
+            raw = resp.choices[0].message.content or "{}"
+            match = re.search(r"\{[\s\S]*\}", raw)
+            return json.loads(match.group(0) if match else raw)
+        except Exception as exc:
+            log.warning("_decide_next_step failed: %s", exc)
+            return None
+
+    def _execute_step(self, action: str, d: dict) -> str:
+        """Carry out one planner action via atlas_hands; return a short result."""
+        try:
+            if action in ("launch", "open", "open_app", "start"):
+                return self._launch_app(d.get("app") or d.get("target")
+                                        or d.get("text") or "")
+            if action in ("click", "left_click", "tap"):
+                return self._locate_and_click(d.get("target", ""), double=False)
+            if action in ("double_click", "doubleclick", "double"):
+                return self._locate_and_click(d.get("target", ""), double=True)
+            if action in ("type", "type_text", "write", "input"):
+                text = str(d.get("text", ""))
+                atlas_hands.type_text(text)
+                return f"typed {len(text)} chars"
+            if action in ("press", "key", "keypress"):
+                key = str(d.get("key") or d.get("text") or "").strip()
+                atlas_hands.press_key(key)
+                return f"pressed {key}"
+            if action in ("hotkey", "combo", "shortcut"):
+                keys = d.get("keys") or d.get("key") or []
+                if isinstance(keys, str):
+                    keys = [k for k in re.split(r"[+,\s]+", keys) if k]
+                atlas_hands.hotkey(*keys)
+                return f"hotkey {'+'.join(keys)}"
+            if action in ("scroll",):
+                amt = int(d.get("amount", -3))
+                w, h = self._screen_size()
+                atlas_hands.scroll(w // 2, h // 2, amt)
+                return f"scrolled {amt}"
+            if action in ("wait", "sleep", "pause"):
+                secs = max(0.0, min(8.0, float(d.get("seconds", 1.5))))
+                time.sleep(secs)
+                return f"waited {secs}s"
+            return f"unknown action: {action}"
+        except Exception as exc:
+            return f"error: {exc}"
+        finally:
+            time.sleep(self._TASK_SETTLE_S)
+
+    def _locate_and_click(self, target: str, double: bool = False) -> str:
+        target = (target or "").strip()
+        if not target:
+            return "no target given"
+        coords = self.spatial.locate(target)   # fresh full-res capture, absolute px
+        if not coords.get("found"):
+            return f"'{target}' not visible on screen"
+        cx = int(coords["x"] + coords.get("w", 0) / 2)
+        cy = int(coords["y"] + coords.get("h", 0) / 2)
+        try:
+            self._on_coordinates({"target": target, **coords})
+        except Exception:
+            pass
+        atlas_hands.click(cx, cy)
+        if double:
+            atlas_hands.click(cx, cy)
+            return f"double-clicked '{target}' at {cx},{cy}"
+        return f"clicked '{target}' at {cx},{cy}"
+
+    def _launch_app(self, app: str) -> str:
+        """Open an app via the Windows Start-menu search (Win → type → Enter)."""
+        app = (app or "").strip()
+        if not app:
+            return "no app name given"
+        atlas_hands.press_key("win")
+        time.sleep(0.7)
+        atlas_hands.type_text(app)
+        time.sleep(1.0)
+        atlas_hands.press_key("enter")
+        time.sleep(3.0)   # give the app time to launch
+        return f"launched '{app}' via Start menu"
+
+    @staticmethod
+    def _screen_size() -> tuple[int, int]:
+        try:
+            import pyautogui
+            size = pyautogui.size()
+            return int(size[0]), int(size[1])
+        except Exception:
+            return (1920, 1080)
 
     @staticmethod
     def _messages_have_image(messages: list[dict]) -> bool:
@@ -701,8 +1657,9 @@ class StateEngine:
 
         # Operating mode + session
         self.mode    = ModeState.ACTIVE
+        self.focus_mode = False
         self.session = SessionManager()
-        self.session.start(MODE_SYSTEMS[self.mode])
+        self.session.start(self.get_system_prompt())
 
         # Silent ambient ring buffer ──────────────────────────────────────────
         # Screen-watcher pushes here via handle_input(source="watch").
@@ -720,12 +1677,64 @@ class StateEngine:
         self.skill_registry = SkillRegistry()
         self.learning = LearningEngine(self.memory, self.user_id)
         self.active_skill: Optional[str] = None
+        self._security_prefs: dict = {}
+        self.load_user_prefs()
         threading.Thread(
             target=self.learning.run_decay,
             daemon=True,
             name="atlas-decay",
         ).start()
         self.spatial = SpatialBrain(groq_client)
+        self._recorder: Optional[RoutineRecorder] = None
+        self.screen_vision = False   # set True by the UI while the watcher runs
+
+    def get_system_prompt(self) -> str:
+        """Effective system prompt for the current mode + focus toggle."""
+        base = MODE_SYSTEMS.get(self.mode, _ATLAS_UNIFIED)
+        if self.focus_mode:
+            base = base + "\n\n" + _ATLAS_FOCUS_SUFFIX
+        return base
+
+    def set_focus_mode(self, enabled: bool) -> None:
+        with self._lock:
+            self.focus_mode = bool(enabled)
+            if self.session.is_active:
+                self.session.start(self.get_system_prompt())
+            self.set_user_pref("focus_mode", self.focus_mode)
+
+    def load_user_prefs(self) -> None:
+        """Restore per-user toggles saved in prefs."""
+        prefs = self.get_user_prefs()
+        self.focus_mode = bool(prefs.get("focus_mode", False))
+        sec = prefs.get("security") or {}
+        if isinstance(sec, dict):
+            self._security_prefs = dict(sec)
+
+    # ── Account switching ──────────────────────────────────────────────────────
+
+    def set_user(self, user_id: int, user_name: str | None = None) -> None:
+        """
+        Switch the active account at runtime (after login / user switch).
+
+        Flushes the current session for the previous user, rebinds memory to the
+        new ``user_id`` and rebuilds the per-user learning engine so facts,
+        prefs, and standing context all follow the signed-in user.
+        """
+        with self._lock:
+            if self.session.is_active and self.session.history_length:
+                hist = list(self.session._history)
+                self.memory.save_session_summary_async(
+                    self.user_id, self.mode.name, hist)
+            self.user_id = int(user_id)
+            self.learning = LearningEngine(self.memory, self.user_id)
+            self.session.start(self.get_system_prompt())
+            self.load_user_prefs()
+            try:
+                self.memory._invalidate_cache()
+            except Exception:
+                pass
+        log.info("Active account switched to user_id=%s (%s)",
+                 self.user_id, user_name or "?")
 
     # ── Mode management ───────────────────────────────────────────────────────
 
@@ -741,7 +1750,7 @@ class StateEngine:
                 # Summarisation (Groq call + SQLite write) runs off the UI loop.
                 self.memory.save_session_summary_async(self.user_id, prev.name, hist)
             self.mode = mode
-            self.session.start(MODE_SYSTEMS[mode])
+            self.session.start(self.get_system_prompt())
             self._clear_context_buffer()
         self._emit("mode_changed", {"from": prev.name, "to": mode.name})
 
@@ -755,7 +1764,7 @@ class StateEngine:
         context are wiped; the ambient buffer is cleared.
         """
         with self._lock:
-            self.session.start(MODE_SYSTEMS[self.mode])
+            self.session.start(self.get_system_prompt())
             self._clear_context_buffer()
         self._emit("session_reset", {"mode": self.mode.name})
 
@@ -809,6 +1818,61 @@ class StateEngine:
         return f"Ambient buffer — {len(entries)} entries:\n" + "\n".join(lines)
 
     # ── Screen capture injection ──────────────────────────────────────────────
+
+    _SCREEN_PHRASES = (
+        "my screen", "the screen", "on screen", "on my screen", "see this",
+        "see my", "what do you see", "what can you see", "look at this",
+        "look at my", "this page", "this window", "right now on", "what's on",
+        "whats on", "can you see", "are you seeing", "what am i looking",
+    )
+
+    def set_screen_vision(self, enabled: bool) -> None:
+        """Toggle persistent screen vision (UI calls this with the watcher)."""
+        self.screen_vision = bool(enabled)
+
+    # Explicit name statements — captured instantly and permanently, so Atlas
+    # never "forgets" a name between the moment it's told and the next turn.
+    _NAME_EXPLICIT_RE = re.compile(
+        r"\b(?:my name is|my name's|call me|you can call me|the name is|"
+        r"name's)\s+([A-Za-z][A-Za-z .'\-]{1,40})", re.IGNORECASE)
+    _NAME_SOFT_RE = re.compile(
+        r"\b(?:i am|i'm|im)\s+([A-Za-z][A-Za-z'\-]{1,20})\b", re.IGNORECASE)
+    _NAME_STOP = {
+        "fine", "good", "great", "ok", "okay", "not", "sorry", "here", "ready",
+        "trying", "looking", "working", "going", "doing", "glad", "happy",
+        "sure", "done", "back", "just", "still", "a", "an", "the", "so", "very",
+        "really", "kind", "sort", "about", "afraid", "curious", "confused",
+        "tired", "busy", "new", "using", "testing", "wondering", "thinking",
+    }
+
+    def _maybe_capture_identity(self, text: str) -> Optional[str]:
+        """Persist a name the user states explicitly. Returns the name or None."""
+        if not text:
+            return None
+        name = None
+        m = self._NAME_EXPLICIT_RE.search(text)
+        if m:
+            name = " ".join(m.group(1).strip().strip(".").split()[:2])
+        else:
+            m = self._NAME_SOFT_RE.search(text)
+            if m:
+                cand = m.group(1).strip()
+                if cand.lower() not in self._NAME_STOP and cand.isalpha():
+                    name = cand
+        if not name:
+            return None
+        name = name.title()
+        try:
+            self.memory.remember(self.user_id, "profile", "name", name,
+                                 confidence=0.98, source="stated")
+            self.memory.set_display_name(self.user_id, name)
+        except Exception as exc:
+            log.warning("identity capture failed: %s", exc)
+        return name
+
+    def _mentions_screen(self, text: str) -> bool:
+        t = (text or "").lower()
+        return any(p in t for p in self._SCREEN_PHRASES)
 
     def inject_screen_capture(self, screen_b64: str) -> None:
         """
@@ -872,7 +1936,7 @@ class StateEngine:
             return
 
         if not self.session.is_active:
-            self.session.start(MODE_SYSTEMS[self.mode])
+            self.session.start(self.get_system_prompt())
 
         # ── Enrich the user input with ambient screen context ─────────────────
         context_snap   = self._get_context_snapshot()
@@ -886,10 +1950,19 @@ class StateEngine:
                 f"{text}"
             )
 
-        # ── Interview Mode: grab the screen silently so Atlas can SEE it ──────
+        # ── Grab the screen silently so Atlas can SEE it ──────────────────────
         # Captured headlessly here (off the UI thread — handle_input already runs
-        # on a worker) and attached as a vision frame to this query.
-        if self.mode == ModeState.INTERVIEW and self._pending_screen_b64 is None:
+        # on a worker) and attached as a vision frame to this query.  We capture
+        # in Interview and Guided modes, whenever the screen-vision flag is on
+        # (e.g. the screen watcher is active), or when the user references their
+        # screen — so "can you see my screen?" actually works.
+        wants_screen = (
+            self.focus_mode
+            or self.mode in (ModeState.INTERVIEW, ModeState.GUIDED)
+            or getattr(self, "screen_vision", False)
+            or self._mentions_screen(text)
+        )
+        if wants_screen and self._pending_screen_b64 is None:
             frame = capture_screen_b64()
             if frame:
                 self.inject_screen_capture(frame)
@@ -897,7 +1970,17 @@ class StateEngine:
         # ── Route to vision builder if any image frame is available ──────────
         screen_b64 = self._consume_screen_capture()
 
-        memory_prompt = self.memory.build_memory_prompt(self.user_id)
+        # Capture an explicitly-stated name immediately (permanent) so it's part
+        # of THIS turn's memory block and survives across sessions.
+        if source in ("user", "mic", "highlight"):
+            self._maybe_capture_identity(text)
+
+        # Standing instructions ("global context") apply to every mode/feature,
+        # so they ride at the front of the memory block injected into all prompts.
+        context_block = self.memory.build_context_prompt(self.user_id)
+        memory_prompt  = self.memory.build_memory_prompt(self.user_id)
+        if context_block:
+            memory_prompt = (context_block + "\n\n" + memory_prompt).strip()
         drift_correction = self.learning.get_correction() or ""
         skill_context = ""
         skill_name = self._resolve_skill(text)
@@ -1033,7 +2116,7 @@ class StateEngine:
         # text model.  Interview Mode streams voice in short word-window chunks.
         use_vision = self._messages_have_image(messages)
         model      = GROQ_VISION_MODEL if use_vision else GROQ_MODEL
-        word_mode  = (self.mode == ModeState.INTERVIEW)
+        word_mode  = self.focus_mode or (self.mode == ModeState.INTERVIEW)
         # Strips [[GUIDE/DO:…]] tokens from the visible/spoken stream in real time
         # and surfaces them to the action dispatcher (Section 6).
         bracket    = _StreamBracketFilter()
@@ -1117,7 +2200,9 @@ class StateEngine:
                         sentence_buf = parts[-1]
 
             # Release any text the bracket filter was holding at stream end.
-            tail = bracket.flush()
+            tail, tail_tokens = bracket.flush()
+            for tok in tail_tokens:
+                self._dispatch_action_token(tok)
             if tail:
                 try:
                     self._on_chunk(tail)
@@ -1146,17 +2231,15 @@ class StateEngine:
                     self._on_token_usage(usage)
                 except Exception as exc:
                     log.debug("on_token_usage callback raised: %s", exc)
+                # Single cognition pipeline: on_turn_complete extracts durable
+                # facts (with reinforcement) AND drives persona-drift checks on
+                # one daemon thread — no duplicate extraction call.
                 threading.Thread(
                     target=self.learning.on_turn_complete,
                     args=(raw_user_text, full_response),
                     daemon=True,
                     name="atlas-learning",
                 ).start()
-                # Durable fact extraction — Groq call + SQLite write fully off
-                # the UI thread; results marshalled back via memory.signals.
-                self.memory.extract_and_store_facts_async(
-                    self.user_id, raw_user_text, full_response
-                )
                 if self.active_skill:
                     skill = self.active_skill
                     threading.Thread(
@@ -1210,11 +2293,19 @@ class StateEngine:
         screen_b64  : Base64-encoded PNG from the screen capture (optional).
         """
         style_hint     = _STYLE_SUFFIX.get(self.session.response_style, "")
-        system_content = MODE_SYSTEMS[self.mode]
+        system_content = self.get_system_prompt()
         if style_hint:
             system_content += f"\n\n{style_hint}"
 
         messages: list[dict] = [{"role": "system", "content": system_content}]
+        if screen_b64:
+            messages.append({"role": "system", "content": (
+                "A live screenshot of the user's screen is attached to their "
+                "message. You CAN see their screen — read what's on it directly "
+                "and answer about it. Never claim you cannot see the screen.")})
+        if webcam_b64:
+            messages.append({"role": "system", "content": (
+                "A live webcam frame from the user is attached; you can see it.")})
         if drift_correction:
             messages.append({"role": "system", "content": drift_correction})
         if memory_prompt:
@@ -1251,7 +2342,14 @@ class StateEngine:
 
     # ── Debug snapshot ────────────────────────────────────────────────────────
 
-    def locate_ui_element(self, target: str, screen_b64: Optional[str] = None) -> dict:
+    def locate_ui_element(
+        self,
+        target: str,
+        screen_b64: Optional[str] = None,
+        scale: Optional[float] = None,
+        guide: bool = False,
+        label: str = "",
+    ) -> dict:
         """
         Locate a UI element by natural-language target and emit coordinates.
 
@@ -1259,8 +2357,15 @@ class StateEngine:
         HoloOverlay focus ring when found.
         """
         try:
-            coords = self.spatial.locate(target, screen_b64=screen_b64)
-            payload = {"target": target, **coords}
+            if scale is None:
+                scale = last_capture_scale() if screen_b64 else 1.0
+            coords = self.spatial.locate(target, screen_b64=screen_b64, scale=scale)
+            payload = {
+                "target": target,
+                "guide": guide,
+                "label": label,
+                **coords,
+            }
             self._emit("spatial_coordinates", payload)
             try:
                 self._on_coordinates(payload)
@@ -1268,7 +2373,16 @@ class StateEngine:
                 log.debug("on_coordinates callback raised: %s", exc)
             return payload
         except Exception as exc:
-            payload = {"target": target, "found": False, "x": 0, "y": 0, "w": 0, "h": 0}
+            payload = {
+                "target": target,
+                "guide": guide,
+                "label": label,
+                "found": False,
+                "x": 0,
+                "y": 0,
+                "w": 0,
+                "h": 0,
+            }
             self._emit("spatial_error", {"target": target, "error": str(exc)})
             try:
                 self._on_error(f"Spatial locate failed: {exc}")
@@ -1283,6 +2397,7 @@ class StateEngine:
         target: str,
         instruction: str = "",
         screen_b64: Optional[str] = None,
+        scale: Optional[float] = None,
     ) -> dict:
         """
         GUIDING — point at a UI target on the HUD and narrate; never touch input.
@@ -1291,7 +2406,13 @@ class StateEngine:
         focus ring / bounding box), and speaks *instruction* so the user performs
         the action themselves.  The physical mouse is NEVER moved here.
         """
-        coords = self.locate_ui_element(target, screen_b64=screen_b64)
+        coords = self.locate_ui_element(
+            target,
+            screen_b64=screen_b64,
+            scale=scale,
+            guide=True,
+            label=instruction,
+        )
         if coords.get("found") and instruction:
             voice_engine.speak(instruction)
         return coords
@@ -1301,6 +2422,7 @@ class StateEngine:
         target: str,
         action: str = "click",
         screen_b64: Optional[str] = None,
+        scale: Optional[float] = None,
     ) -> dict:
         """
         DOING — autonomous OS automation; physically operates the cursor.
@@ -1309,7 +2431,7 @@ class StateEngine:
         hands call is intercepted by the permission gate (PermissionDialog), so
         no real click/keystroke fires without explicit human verification.
         """
-        coords = self.locate_ui_element(target, screen_b64=screen_b64)
+        coords = self.locate_ui_element(target, screen_b64=screen_b64, scale=scale)
         if not coords.get("found"):
             return coords
         cx = int(coords["x"] + coords.get("w", 0) / 2)
@@ -2398,13 +3520,21 @@ class KokoroVoiceEngine:
 _ELEVEN_MODEL       = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
 _ELEVEN_PCM_RATE    = 24_000   # matches output_format "pcm_24000"
 
+# Default premade voices usable on the ElevenLabs free tier via the API
+# (library voices require a paid plan).  Name → voice_id, surfaced in Settings.
+ELEVEN_VOICES: dict = {
+    "Brian":  "nPczCjzI2devNBz1zQrb",
+    "George": "JBFqnCBsd6RMkjVDRZzb",
+    "Sarah":  "EXAVITQu4vr4xnSDxMaL",
+    "Laura":  "FGY2WhTYpPnrIDTdsKH5",
+}
+# Brian is the launch default; .env ELEVENLABS_VOICE_ID overrides only if set.
+ELEVEN_DEFAULT_VOICE_ID = ELEVEN_VOICES["Brian"]
+
 
 def _eleven_configured() -> bool:
-    """True only when an ElevenLabs key + voice id are present in the env."""
-    key   = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
-    voice = (os.environ.get("ELEVENLABS_VOICE_ID")
-             or os.environ.get("VOICE_ID") or "").strip()
-    return bool(key and voice)
+    """True when an ElevenLabs key is present (voice defaults to Brian)."""
+    return bool((os.environ.get("ELEVENLABS_API_KEY") or "").strip())
 
 
 class ElevenLabsVoiceEngine:
@@ -2438,7 +3568,8 @@ class ElevenLabsVoiceEngine:
         self._client     = None
         self._sd         = None
         self._voice_id   = (os.environ.get("ELEVENLABS_VOICE_ID")
-                            or os.environ.get("VOICE_ID") or "").strip()
+                            or os.environ.get("VOICE_ID") or "").strip() \
+                            or ELEVEN_DEFAULT_VOICE_ID
 
         self._queue: queue.Queue[Optional[str]] = queue.Queue()
         self._skip_event  = threading.Event()
@@ -2527,6 +3658,24 @@ class ElevenLabsVoiceEngine:
 
     def set_speed(self, speed: float) -> None:
         self.speed = max(0.5, min(2.0, speed))
+
+    @property
+    def voice_id(self) -> str:
+        return self._voice_id
+
+    def set_voice_id(self, voice_id: str) -> None:
+        """
+        Switch the streaming voice at runtime (takes effect next utterance).
+
+        A voice change also clears any prior hard-failure latch so that selecting
+        a valid voice recovers the premium track after an earlier bad-voice error.
+        """
+        voice_id = (voice_id or "").strip()
+        if not voice_id or voice_id == self._voice_id:
+            return
+        self._voice_id  = voice_id
+        self._disabled  = False
+        self.last_error = ""
 
     def shutdown(self) -> None:
         self._queue.put(None)
@@ -2649,6 +3798,14 @@ class VoiceRouter:
     # ── config (voice/speed apply to whichever engine supports them) ───────────
     def set_voice(self, voice: str) -> None:
         self.kokoro.set_voice(voice)
+
+    @property
+    def eleven_voice_id(self) -> str:
+        return self.eleven.voice_id
+
+    def set_eleven_voice(self, voice_id: str) -> None:
+        """Switch the ElevenLabs (premium) streaming voice at runtime."""
+        self.eleven.set_voice_id(voice_id)
 
     def available_voices(self) -> list[str]:
         return self.kokoro.available_voices()
@@ -3067,8 +4224,18 @@ class AtlasHands:
 
     def __init__(self, fs: AtlasFileSystem) -> None:
         self._fs = fs
+        # When True, individual actions run WITHOUT a per-action permission
+        # dialog.  Set only after a single task-level approval (see
+        # StateEngine.run_task) and always cleared when the task ends.
+        self.auto_approve = False
 
     def _request_action(self, label: str, proceed: Callable[[], None]) -> None:
+        if self.auto_approve:
+            try:
+                proceed()
+            except Exception as exc:
+                log.error("AtlasHands auto-approved %s failed: %s", label, exc)
+            return
         action_path = Path(f"atlas-hands://{label}")
         self._fs._request_permission(FSPermission.EXECUTE, action_path, proceed)
 
@@ -3123,6 +4290,19 @@ class AtlasHands:
             log.info("AtlasHands: scroll %s at %s,%s", clicks, x, y)
 
         self._request_action(f"scroll/{int(x)}/{int(y)}", _do_scroll)
+
+    def hotkey(self, *keys: str) -> None:
+        clean = [str(k).strip() for k in keys if str(k).strip()]
+        if not clean:
+            return
+
+        def _do_hotkey() -> None:
+            import pyautogui
+
+            pyautogui.hotkey(*clean)
+            log.info("AtlasHands: hotkey %s", "+".join(clean))
+
+        self._request_action("hotkey/" + "+".join(clean), _do_hotkey)
 
 
 # ── Module-level singletons ───────────────────────────────────────────────────

@@ -97,6 +97,42 @@ class UserMemory:
                 )
                 """
             )
+            # Per-user free-form notes/instructions that apply to ALL features
+            # (the "global context" the user can add to). scope is reserved for
+            # future per-feature scoping; "global" applies everywhere.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS global_context (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'global',
+                    pinned INTEGER NOT NULL DEFAULT 1,
+                    created REAL NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            # Learn-and-Execute: reusable procedures generalised from a recorded
+            # demonstration. steps_json is the ordered, UI-agnostic step plan.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS routines (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    goal TEXT NOT NULL DEFAULT '',
+                    steps_json TEXT NOT NULL DEFAULT '[]',
+                    notes TEXT NOT NULL DEFAULT '',
+                    runs INTEGER NOT NULL DEFAULT 0,
+                    successes INTEGER NOT NULL DEFAULT 0,
+                    created REAL NOT NULL,
+                    last_run REAL,
+                    UNIQUE(user_id, name),
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_facts (
@@ -139,6 +175,23 @@ class UserMemory:
                 )
                 """
             )
+            self._migrate(conn)
+
+    # Additive, idempotent column migrations on the users table — keeps existing
+    # databases working while adding account (password), per-user settings, and
+    # cloud-sync metadata for the local-first + sync-seam design.
+    _USER_MIGRATIONS = (
+        ("password_hash", "TEXT"),       # set only when password auth is used
+        ("prefs",         "TEXT"),       # JSON blob: per-user settings (voice, mode…)
+        ("cloud_id",      "TEXT"),       # remote account id once cloud sync is wired
+        ("updated",       "REAL"),       # last-modified clock for sync conflict checks
+    )
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        have = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        for col, decl in self._USER_MIGRATIONS:
+            if col not in have:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
 
     def _invalidate_cache(self) -> None:
         with self._cache_lock:
@@ -176,10 +229,258 @@ class UserMemory:
                 )
                 return int(row["id"])
             cur = conn.execute(
-                "INSERT INTO users (name, email, created, last_seen) VALUES (?, ?, ?, ?)",
-                (clean_name, email, now, now),
+                "INSERT INTO users (name, email, created, last_seen, updated) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (clean_name, email, now, now, now),
             )
             return int(cur.lastrowid)
+
+    # ── Accounts / profiles ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _hash_password(password: str, *, iterations: int = 200_000,
+                       salt: bytes | None = None) -> str:
+        import hashlib
+        import os as _os
+        salt = salt or _os.urandom(16)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return f"pbkdf2_sha256${iterations}${salt.hex()}${dk.hex()}"
+
+    @staticmethod
+    def _verify_password(password: str, stored: str) -> bool:
+        import hashlib
+        import hmac
+        try:
+            algo, iters, salt_hex, hash_hex = stored.split("$", 3)
+            if algo != "pbkdf2_sha256":
+                return False
+            dk = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"),
+                bytes.fromhex(salt_hex), int(iters),
+            )
+            return hmac.compare_digest(dk.hex(), hash_hex)
+        except Exception:
+            return False
+
+    def register(self, name: str, email: str | None = None,
+                 password: str | None = None) -> tuple[bool, str, int]:
+        """
+        Create a new account. Returns (ok, message, user_id).
+
+        Password is optional (local profiles); when given it is PBKDF2-hashed.
+        """
+        clean_name = (name or "").strip()
+        if not clean_name:
+            return (False, "Name is required.", 0)
+        now = time.time()
+        pw_hash = self._hash_password(password) if password else None
+        with self._write_lock, self._connect() as conn:
+            exists = conn.execute(
+                "SELECT id FROM users WHERE lower(name) = lower(?)", (clean_name,)
+            ).fetchone()
+            if exists:
+                return (False, "That name is already taken.", 0)
+            cur = conn.execute(
+                "INSERT INTO users (name, email, password_hash, created, last_seen, updated) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (clean_name, email, pw_hash, now, now, now),
+            )
+            return (True, "Account created.", int(cur.lastrowid))
+
+    def authenticate(self, name: str, password: str | None = None
+                     ) -> tuple[bool, str, int]:
+        """Verify credentials. Returns (ok, message, user_id)."""
+        clean_name = (name or "").strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, password_hash FROM users WHERE lower(name) = lower(?)",
+                (clean_name,),
+            ).fetchone()
+        if not row:
+            return (False, "No such user.", 0)
+        stored = row["password_hash"]
+        if stored:
+            if not password or not self._verify_password(password, stored):
+                return (False, "Incorrect password.", 0)
+        # Touch last_seen on successful login.
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET last_seen = ? WHERE id = ?", (time.time(), row["id"])
+            )
+        return (True, "Signed in.", int(row["id"]))
+
+    def list_users(self) -> list[dict[str, Any]]:
+        """All profiles, most-recently-seen first (for a profile picker)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, email, last_seen, "
+                "       (password_hash IS NOT NULL) AS has_password "
+                "FROM users ORDER BY last_seen DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_profile(self, user_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, name, email, created, last_seen FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def set_display_name(self, user_id: int, name: str) -> None:
+        """Update the user's display name (drives 'Known about <name>')."""
+        clean = (name or "").strip()
+        if not clean:
+            return
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET name = ?, updated = ? WHERE id = ?",
+                (clean, time.time(), user_id),
+            )
+        self._invalidate_cache()
+
+    def update_profile(self, user_id: int, *, email: str | None = None,
+                       password: str | None = None) -> None:
+        sets, args = ["updated = ?"], [time.time()]
+        if email is not None:
+            sets.append("email = ?"); args.append(email)
+        if password:
+            sets.append("password_hash = ?"); args.append(self._hash_password(password))
+        args.append(user_id)
+        with self._write_lock, self._connect() as conn:
+            conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", args)
+
+    # ── Per-user settings (prefs JSON) ────────────────────────────────────────
+
+    def get_prefs(self, user_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT prefs FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        if not row or not row["prefs"]:
+            return {}
+        try:
+            return json.loads(row["prefs"])
+        except Exception:
+            return {}
+
+    def set_pref(self, user_id: int, key: str, value: Any) -> None:
+        prefs = self.get_prefs(user_id)
+        prefs[str(key)] = value
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET prefs = ?, updated = ? WHERE id = ?",
+                (json.dumps(prefs), time.time(), user_id),
+            )
+
+    # ── Global context (per-user notes applied to ALL features) ───────────────
+
+    def add_context(self, user_id: int, content: str, scope: str = "global") -> int:
+        content = (content or "").strip()
+        if not content:
+            return 0
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO global_context (user_id, content, scope, created) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, content, scope, time.time()),
+            )
+        self._invalidate_cache()
+        return int(cur.lastrowid)
+
+    def list_context(self, user_id: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, content, scope, pinned, created FROM global_context "
+                "WHERE user_id = ? ORDER BY created DESC",
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_context(self, user_id: int, context_id: int) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM global_context WHERE user_id = ? AND id = ?",
+                (user_id, context_id),
+            )
+        self._invalidate_cache()
+
+    def build_context_prompt(self, user_id: int) -> str:
+        """Markdown block of the user's standing instructions for all prompts."""
+        rows = self.list_context(user_id)
+        if not rows:
+            return ""
+        lines = ["## Standing instructions from the user (always apply)"]
+        for r in rows:
+            lines.append(f"- {r['content']}")
+        return "\n".join(lines)
+
+    # ── Routines (Learn-and-Execute) ──────────────────────────────────────────
+
+    def save_routine(self, user_id: int, name: str, goal: str,
+                     steps: list[dict[str, Any]], notes: str = "") -> int:
+        name = (name or "").strip() or "untitled routine"
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO routines (user_id, name, goal, steps_json, notes, created)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, name) DO UPDATE SET
+                    goal = excluded.goal,
+                    steps_json = excluded.steps_json,
+                    notes = excluded.notes
+                """,
+                (user_id, name, goal, json.dumps(steps), notes, now),
+            )
+            rid = cur.lastrowid or conn.execute(
+                "SELECT id FROM routines WHERE user_id = ? AND name = ?",
+                (user_id, name),
+            ).fetchone()["id"]
+        return int(rid)
+
+    def list_routines(self, user_id: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, goal, runs, successes, created, last_run "
+                "FROM routines WHERE user_id = ? ORDER BY last_run DESC, created DESC",
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_routine(self, user_id: int, name_or_id: str | int) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            if isinstance(name_or_id, int) or str(name_or_id).isdigit():
+                row = conn.execute(
+                    "SELECT * FROM routines WHERE user_id = ? AND id = ?",
+                    (user_id, int(name_or_id)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM routines WHERE user_id = ? AND lower(name) = lower(?)",
+                    (user_id, str(name_or_id).strip()),
+                ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        try:
+            data["steps"] = json.loads(data.get("steps_json") or "[]")
+        except Exception:
+            data["steps"] = []
+        return data
+
+    def record_routine_run(self, user_id: int, name_or_id: str | int,
+                           success: bool) -> None:
+        with self._write_lock, self._connect() as conn:
+            field = "id" if (isinstance(name_or_id, int) or str(name_or_id).isdigit()) else "name"
+            key = int(name_or_id) if field == "id" else str(name_or_id).strip()
+            comp = "id = ?" if field == "id" else "lower(name) = lower(?)"
+            conn.execute(
+                f"UPDATE routines SET runs = runs + 1, "
+                f"successes = successes + ?, last_run = ? "
+                f"WHERE user_id = ? AND {comp}",
+                (1 if success else 0, time.time(), user_id, key),
+            )
 
     def remember(
         self,
