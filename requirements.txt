@@ -1,4 +1,4 @@
-﻿# AceIt dependencies (Windows)
+# Atlas dependencies (Windows)
 #
 # One-time: install Tesseract for Windows (see INSTALL_WINDOWS.txt), then:
 #   python -m pip install -r requirements.txt
@@ -13,3 +13,23 @@ groq>=0.9.0
 numpy>=1.24.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
+webrtcvad>=2.0.10
+PySide6>=6.6.0
+kokoro-onnx
+opencv-python
+mss
+pyperclip
+markdown-it-py
+pymupdf
+# Optional premium streaming TTS — used only when ELEVENLABS_API_KEY + VOICE_ID
+# are set; Atlas falls back to offline Kokoro automatically when absent.
+elevenlabs
+# Optional cloud accounts + sync — used only when SUPABASE_URL + SUPABASE_ANON_KEY
+# are set; Atlas runs fully local-first (offline) when absent.
+supabase
+# Learn-and-Execute demonstration recorder (global mouse/keyboard capture).
+pynput>=1.7.6
+# Chat export to PDF.
+reportlab>=4.0.0
+# TOTP authenticator app 2FA.
+pyotp>=2.9.0
