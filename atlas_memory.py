@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -18,6 +19,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 log = logging.getLogger("atlas_memory")
+
+_default_fast_model = "llama-3.1-8b-instant"
+ATLAS_FAST_MODEL = (
+    os.environ.get("ATLAS_FAST_MODEL") or _default_fast_model
+).strip() or _default_fast_model
 
 _MEMORY_CACHE_TTL_S = 30.0
 
@@ -624,7 +630,7 @@ class UserMemory:
                 )
                 try:
                     resp = client.chat.completions.create(
-                        model="llama-3.1-8b-instant",
+                        model=ATLAS_FAST_MODEL,
                         messages=[
                             {"role": "system", "content": "Return valid JSON only."},
                             {"role": "user", "content": prompt},
@@ -698,7 +704,7 @@ class UserMemory:
         user_id: int,
         user_message: str,
         ai_response: str,
-        model: str = "llama-3.1-8b-instant",
+        model: str = ATLAS_FAST_MODEL,
         on_done: Optional[Callable[[list[dict[str, Any]]], None]] = None,
     ) -> threading.Thread:
         """
@@ -740,7 +746,7 @@ class UserMemory:
         self,
         user_message: str,
         ai_response: str,
-        model: str = "llama-3.1-8b-instant",
+        model: str = ATLAS_FAST_MODEL,
     ) -> list[dict[str, Any]]:
         """Lazy Groq fact extraction; returns [] if unavailable. Blocking."""
         client = self._get_groq()

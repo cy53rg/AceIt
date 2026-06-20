@@ -44,10 +44,11 @@ from PySide6.QtCore import (
     Qt, QPoint, QSize, QPropertyAnimation, QVariantAnimation, QParallelAnimationGroup,
     QEasingCurve, QRect,
     QRectF, QPointF, QTimer, Signal, QObject, Slot, QThread, Property, QUrl, QStringListModel,
+    QEvent,
 )
 from PySide6.QtGui import (
     QColor, QFont, QIcon, QTextCursor, QPainter, QPen, QBrush, QAction, QDragEnterEvent, QDropEvent,
-    QRadialGradient, QCursor,
+    QRadialGradient, QCursor, QKeyEvent, QMouseEvent, QResizeEvent,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
@@ -57,7 +58,7 @@ from PySide6.QtWidgets import (
     QDialog, QSlider, QComboBox, QTabWidget, QScrollArea,
     QListWidget, QListWidgetItem, QStackedWidget, QCheckBox,
     QProgressBar, QFileDialog, QMenu, QCompleter, QTableWidget,
-    QTableWidgetItem, QHeaderView, QMessageBox,
+    QTableWidgetItem, QHeaderView, QMessageBox, QGridLayout, QToolButton,
 )
 
 # ── Markdown renderer ─────────────────────────────────────────────────────────
@@ -211,7 +212,26 @@ PAL = {
     "danger":    "#FF2D55",
     "danger_dim":"#8B0020",
     "success":   "#2ECC8A",
+    "proactive": "#D4AF37",   # Copilot alerts — same gold family as accent
 }
+
+from atlas_settings_ui import SettingsDialog, settings_dialog_qss
+
+# Re-export for callers that import SettingsDialog from atlas_ui
+__all_settings__ = ('SettingsDialog',)
+
+
+try:
+    from pygments import highlight as _pygments_highlight
+    from pygments.lexers import get_lexer_by_name, TextLexer
+    from pygments.formatters import HtmlFormatter
+    HAS_PYGMENTS = True
+except ImportError:
+    _pygments_highlight = None  # type: ignore
+    get_lexer_by_name = None  # type: ignore
+    TextLexer = None  # type: ignore
+    HtmlFormatter = None  # type: ignore
+    HAS_PYGMENTS = False
 
 QSS_BASE = f"""
 QWidget {{ background: transparent; color: {PAL['text']}; font-family: 'Segoe UI'; font-size: 12px; }}
@@ -364,7 +384,641 @@ class PermissionDialog(QDialog):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CHAT INPUT
+# CHAT VIEW + COMPOSER  (rebuilt message display & input)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_CHAT_MD_CSS = f"""
+<style>
+body {{ color: {PAL['text']}; font-family: 'Segoe UI', sans-serif; font-size: 13px;
+        line-height: 1.55; margin: 0; }}
+p {{ margin: 0 0 8px 0; }}
+ul, ol {{ margin: 4px 0 8px 18px; padding-left: 8px; }}
+li {{ margin: 2px 0; }}
+hr {{ border: none; border-top: 1px solid {PAL['border']}; margin: 10px 0; }}
+strong {{ color: {PAL['gold']}; font-weight: 600; }}
+em {{ font-style: italic; }}
+code {{ background: {PAL['surface_2']}; border: 1px solid {PAL['border']};
+        border-radius: 4px; padding: 1px 5px;
+        font-family: Consolas, 'Courier New', monospace; font-size: 12px;
+        color: {PAL['cyan']}; }}
+pre {{ background: {PAL['bg']}; border: 1px solid {PAL['border']};
+       border-radius: 8px; padding: 10px 12px; margin: 6px 0 2px 0;
+       font-family: Consolas, 'Courier New', monospace; font-size: 12px;
+       line-height: 1.45; white-space: pre-wrap; }}
+pre code {{ background: transparent; border: none; padding: 0; color: {PAL['text']}; }}
+.code-actions {{ text-align: right; margin: 0 0 6px 0; }}
+.code-btn {{ display: inline-block; background: {PAL['surface_2']};
+              color: {PAL['cyan']}; border: 1px solid {PAL['cyan_dim']};
+              border-radius: 5px; padding: 2px 8px; font-size: 10px;
+              text-decoration: none; margin-left: 4px; }}
+.stream-cursor {{ color: {PAL['cyan']}; animation: curblink 1s step-end infinite; }}
+@keyframes curblink {{ 50% {{ opacity: 0; }} }}
+</style>
+"""
+
+_SLASH_COMMANDS = [
+    ("/guide",     "Start guided step-by-step help"),
+    ("/task",      "Run a computer-use task"),
+    ("/interview", "Toggle focus / interview mode"),
+    ("/copilot",   "Toggle passive screen copilot"),
+    ("/memory",    "Show what Atlas remembers"),
+    ("/clear",     "Clear the conversation"),
+    ("/settings",  "Open Control Center"),
+]
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_DOC_EXTS = {".pdf", ".txt", ".md"}
+
+
+class ChatMarkdown:
+    """Markdown → HTML for chat bubbles."""
+
+    @staticmethod
+    def render(md_text: str, *, streaming: bool = False) -> str:
+        import html as _html
+        import re
+
+        text = md_text or ""
+        if HAS_MARKDOWN_IT and _md is not None:
+            body = _md.render(text)
+        else:
+            body = "<p>" + _html.escape(text).replace("\n", "<br>") + "</p>"
+
+        def _highlight_block(m: "re.Match") -> str:
+            lang = (m.group(1) or "").strip()
+            code = m.group(2)
+            esc = _html.escape(code)
+            if HAS_PYGMENTS and _pygments_highlight:
+                try:
+                    lexer = get_lexer_by_name(lang, stripall=True) if lang else TextLexer()
+                except Exception:
+                    lexer = TextLexer()
+                fmt = HtmlFormatter(noclasses=True, style="monokai")
+                highlighted = _pygments_highlight(code, lexer, fmt)
+            else:
+                highlighted = f"<pre><code>{esc}</code></pre>"
+            token = base64.b64encode(code.encode()).decode()
+            lang_token = base64.b64encode(lang.encode()).decode()
+            run_link = ""
+            if lang.lower() in (
+                "bash", "sh", "shell", "zsh", "cmd", "powershell", "python", "py", "python3",
+            ):
+                run_link = f"<a class='code-btn' href='runcode:{lang_token}:{token}'>▶ Run</a>"
+            actions = (
+                f"<div class='code-actions'>"
+                f"<a class='code-btn' href='copycode:{token}'>⎘ Copy</a>{run_link}</div>"
+            )
+            return highlighted + actions
+
+        body = re.sub(
+            r"<pre><code(?: class=\"language-([^\"]*)\")?>([\s\S]*?)</code></pre>",
+            _highlight_block,
+            body,
+        )
+        if streaming:
+            body += "<span class='stream-cursor'>▍</span>"
+        return _CHAT_MD_CSS + body
+
+
+class ChatMessageCard(QFrame):
+    """Single chat bubble with hover actions."""
+
+    regenerate_requested = Signal()
+    read_aloud_requested = Signal(str)
+    pin_requested        = Signal(str)
+
+    def __init__(
+        self,
+        role: str,
+        text: str,
+        *,
+        html_body: str = "",
+        ts: Optional[float] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.role = role
+        self.text = text
+        self.ts = ts or time.time()
+        self.setFrameShape(QFrame.NoFrame)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(16, 4, 16, 4)
+        outer.setSpacing(8)
+
+        self._avatar = QLabel("◆" if role == "assistant" else "👁" if role == "proactive" else "")
+        self._avatar.setFixedWidth(22)
+        self._avatar.setAlignment(Qt.AlignTop)
+        if role == "assistant":
+            self._avatar.setStyleSheet(
+                f"color: {PAL['gold']}; font-weight: bold; font-size: 14px; background: transparent;")
+        elif role == "proactive":
+            self._avatar.setStyleSheet(
+                f"color: {PAL['proactive']}; font-weight: bold; background: transparent;")
+        else:
+            self._avatar.hide()
+
+        self._actions = QHBoxLayout()
+        self._actions.addStretch(1)
+        if role == "assistant":
+            self._add_action("⎘", "Copy message", self._copy_self)
+            self._add_action("↻", "Regenerate", lambda: self.regenerate_requested.emit())
+            self._add_action("🔊", "Read aloud", lambda: self.read_aloud_requested.emit(self.text))
+            self._add_action("📌", "Add to memory", lambda: self.pin_requested.emit(self.text))
+        elif role == "user":
+            self._add_action("⎘", "Copy message", self._copy_self)
+        elif role in ("proactive",):
+            self._add_action("⎘", "Copy", self._copy_self)
+            self._add_action("🔊", "Read aloud", lambda: self.read_aloud_requested.emit(self.text))
+
+        self._body = QTextBrowser()
+        self._body.setOpenExternalLinks(False)
+        self._body.setFrameShape(QFrame.NoFrame)
+        self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._body.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard | Qt.LinksAccessibleByMouse)
+        self._body.document().setDocumentMargin(0)
+        self._body.setStyleSheet("background: transparent; border: none;")
+        self._body.setHtml(html_body or ChatMarkdown.render(text))
+        self._body.document().contentsChanged.connect(self._fit_body_height)
+
+        if role == "user":
+            outer.addStretch(1)
+            card = QFrame()
+            card.setStyleSheet(
+                f"background: {PAL['cyan']}; color: {PAL['bg']}; "
+                f"border-radius: 18px 18px 4px 18px; padding: 12px;")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.addLayout(self._actions)
+            cl.addWidget(self._body)
+            outer.addWidget(card, 0, Qt.AlignRight)
+        elif role == "system":
+            self._avatar.hide()
+            self._body.setStyleSheet(f"color: {PAL['muted']}; font-size: 11px;")
+            outer.addStretch(1)
+            outer.addWidget(self._body, 0, Qt.AlignCenter)
+            outer.addStretch(1)
+        elif role == "proactive":
+            card = QFrame()
+            card.setStyleSheet(
+                f"background: rgba(212,175,55,0.08); border-left: 4px solid {PAL['proactive']}; "
+                f"border-radius: 8px; padding: 12px;")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.addLayout(self._actions)
+            cl.addWidget(self._body)
+            outer.addWidget(self._avatar)
+            outer.addWidget(card, 1)
+        else:
+            card = QFrame()
+            card.setStyleSheet(
+                f"background: {PAL['surface_2']}; border: 1px solid {PAL['border']}; "
+                f"border-radius: 18px 18px 18px 4px; padding: 12px;")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.addLayout(self._actions)
+            cl.addWidget(self._body)
+            outer.addWidget(self._avatar)
+            outer.addWidget(card, 1)
+            outer.addStretch(1)
+
+        self.setToolTip(datetime.fromtimestamp(self.ts).strftime("%H:%M:%S"))
+        self._fit_body_height()
+        opacity = QGraphicsOpacityEffect(self)
+        opacity.setOpacity(0.0)
+        self.setGraphicsEffect(opacity)
+        anim = QPropertyAnimation(opacity, b"opacity", self)
+        anim.setDuration(150)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        QTimer.singleShot(0, anim.start)
+
+    def _add_action(self, glyph: str, tip: str, fn: Callable) -> None:
+        btn = QToolButton()
+        btn.setText(glyph)
+        btn.setToolTip(tip)
+        btn.hide()
+        btn.setStyleSheet(
+            f"QToolButton {{ color: {PAL['muted']}; border: none; padding: 2px 4px; "
+            f"font-size: 11px; background: transparent; }}"
+            f"QToolButton:hover {{ color: {PAL['cyan']}; }}"
+        )
+        btn.clicked.connect(fn)
+        self._actions.addWidget(btn)
+
+    def _fit_body_height(self) -> None:
+        doc = self._body.document()
+        w = max(self._body.viewport().width(), 220)
+        doc.setTextWidth(w)
+        self._body.setFixedHeight(max(int(doc.size().height()) + 8, 24))
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._fit_body_height()
+
+    def enterEvent(self, event: QEvent) -> None:
+        for btn in self.findChildren(QToolButton):
+            btn.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        for btn in self.findChildren(QToolButton):
+            btn.hide()
+        super().leaveEvent(event)
+
+    def set_markdown(self, md_text: str, *, streaming: bool = False) -> None:
+        self.text = md_text
+        self._body.setHtml(ChatMarkdown.render(md_text, streaming=streaming))
+        self._fit_body_height()
+
+    def _copy_self(self) -> None:
+        pyperclip.copy(self.text)
+
+
+class ChatView(QWidget):
+    """Scrollable message list with drag-drop and jump-to-latest."""
+
+    anchor_clicked = Signal(QUrl)
+    image_dropped  = Signal(str)
+    message_added  = Signal(object)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+        self._container = QWidget()
+        self._layout = QVBoxLayout(self._container)
+        self._layout.setContentsMargins(0, 8, 0, 8)
+        self._layout.setSpacing(8)
+        self._layout.addStretch(1)
+        self._scroll.setWidget(self._container)
+        lay.addWidget(self._scroll, 1)
+
+        self._jump_btn = QPushButton("↓ Jump to latest")
+        self._jump_btn.setStyleSheet(
+            f"QPushButton {{ background: {PAL['surface_2']}; color: {PAL['cyan']}; "
+            f"border: 1px solid {PAL['cyan_dim']}; border-radius: 14px; padding: 4px 12px; "
+            f"font-size: 10px; }}"
+            f"QPushButton:hover {{ background: {PAL['border']}; }}"
+        )
+        self._jump_btn.hide()
+        self._jump_btn.clicked.connect(self._scroll_to_bottom)
+        lay.addWidget(self._jump_btn, 0, Qt.AlignRight)
+
+        self._drop_overlay = QLabel("Drop image to attach", self)
+        self._drop_overlay.setAlignment(Qt.AlignCenter)
+        self._drop_overlay.setStyleSheet(
+            f"background: rgba(0,212,255,0.12); border: 2px dashed {PAL['cyan']}; "
+            f"border-radius: 12px; color: {PAL['cyan']}; font-size: 13px;")
+        self._drop_overlay.hide()
+
+        self._pinned_bottom = True
+        self._streaming_card: Optional[ChatMessageCard] = None
+        self._cards: list[ChatMessageCard] = []
+
+    def _on_scroll(self, value: int) -> None:
+        sb = self._scroll.verticalScrollBar()
+        self._pinned_bottom = value >= sb.maximum() - 24
+        self._jump_btn.setVisible(not self._pinned_bottom and bool(self._cards))
+
+    def _scroll_to_bottom(self) -> None:
+        sb = self._scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        self._pinned_bottom = True
+        self._jump_btn.hide()
+
+    def _insert_card(self, card: ChatMessageCard) -> None:
+        self._layout.insertWidget(self._layout.count() - 1, card)
+        self._cards.append(card)
+        card._body.anchorClicked.connect(self.anchor_clicked.emit)
+        self.message_added.emit(card)
+        QTimer.singleShot(50, self._scroll_to_bottom_if_pinned)
+
+    def _scroll_to_bottom_if_pinned(self) -> None:
+        if self._pinned_bottom:
+            self._scroll_to_bottom()
+
+    def add_message(self, role: str, text: str, *, ts: Optional[float] = None) -> dict:
+        card = ChatMessageCard(role, text, ts=ts, parent=self._container)
+        self._insert_card(card)
+        return {"role": role, "text": text, "ts": ts or time.time()}
+
+    def begin_assistant_stream(self) -> None:
+        self._streaming_card = ChatMessageCard("assistant", "", parent=self._container)
+        self._insert_card(self._streaming_card)
+
+    def update_stream(self, md_buffer: str) -> None:
+        if self._streaming_card:
+            self._streaming_card.set_markdown(md_buffer, streaming=True)
+            self._scroll_to_bottom_if_pinned()
+
+    def finish_stream(self, full_text: str, elapsed: float = 0.0) -> None:
+        if self._streaming_card:
+            if full_text:
+                self._streaming_card.set_markdown(full_text, streaming=False)
+            else:
+                self._layout.removeWidget(self._streaming_card)
+                self._streaming_card.deleteLater()
+                if self._streaming_card in self._cards:
+                    self._cards.remove(self._streaming_card)
+            self._streaming_card = None
+        if full_text and elapsed > 0:
+            self.add_message("system", f"Atlas · {elapsed:.1f}s")
+        self._scroll_to_bottom_if_pinned()
+
+    def clear(self) -> None:
+        while self._layout.count() > 1:
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._cards.clear()
+        self._streaming_card = None
+
+    def rebuild_from_messages(self, messages: list[dict]) -> None:
+        self.clear()
+        for m in messages:
+            role = m.get("role", "assistant")
+            text = m.get("text") or ""
+            if not text and m.get("html"):
+                import re
+                text = re.sub(r"<[^>]+>", " ", m.get("html", "")).strip()
+            self.add_message(role, text, ts=m.get("ts"))
+
+    def plain_text(self) -> str:
+        return "\n\n".join(c.text for c in self._cards if c.text and c.role != "system")
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in _IMAGE_EXTS:
+                    event.acceptProposedAction()
+                    self._drop_overlay.setGeometry(self.rect().adjusted(8, 8, -8, -8))
+                    self._drop_overlay.show()
+                    self._drop_overlay.raise_()
+                    return
+
+    def dragLeaveEvent(self, event: QEvent) -> None:
+        self._drop_overlay.hide()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        self._drop_overlay.hide()
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                p = Path(url.toLocalFile())
+                if p.suffix.lower() in _IMAGE_EXTS:
+                    self.image_dropped.emit(str(p))
+                    event.acceptProposedAction()
+                    return
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if self._drop_overlay.isVisible():
+            self._drop_overlay.setGeometry(self.rect().adjusted(8, 8, -8, -8))
+
+
+class ChatComposer(QFrame):
+    """Multi-line composer with toolbar, slash commands, send/stop."""
+
+    submitted            = Signal(str)
+    stop_requested       = Signal()
+    attach_file          = Signal(str)
+    screenshot_requested = Signal()
+
+    def __init__(self, window: "AtlasWindow", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._window = window
+        self.setObjectName("chat_composer")
+        self._streaming = False
+        self._tts_next = True
+        self._ptt_active = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(6)
+
+        self._attach_lbl = QLabel("")
+        self._attach_lbl.setStyleSheet(
+            f"color: {PAL['muted']}; font-size: 10px; background: transparent;")
+        root.addWidget(self._attach_lbl)
+
+        row = QHBoxLayout()
+        self._input = QTextEdit()
+        self._input.setPlaceholderText(
+            "Ask Atlas anything... or just say 'look at my screen'")
+        self._input.setAcceptRichText(False)
+        self._input.setMinimumHeight(36)
+        self._input.setMaximumHeight(132)
+        self._input.setStyleSheet(
+            f"QTextEdit {{ background: {PAL['surface_2']}; color: {PAL['text']}; "
+            f"border: 1px solid {PAL['border']}; border-radius: 10px; padding: 8px 10px; "
+            f"font-size: 13px; }}"
+            f"QTextEdit:focus {{ border: 1px solid {PAL['cyan']}; }}"
+        )
+        self._input.textChanged.connect(self._sync_input_height)
+        self._input.installEventFilter(self)
+        row.addWidget(self._input, 1)
+
+        self._send_btn = QPushButton("➤")
+        self._send_btn.setFixedSize(40, 40)
+        self._send_btn.setEnabled(False)
+        self._send_btn.clicked.connect(self._on_send_clicked)
+        self._style_send_idle()
+        row.addWidget(self._send_btn)
+        root.addLayout(row)
+
+        tb = QHBoxLayout()
+        self._tool_btns: list[QToolButton] = []
+        for icon, tip, fn, ptt in [
+            ("📎", "Attach file", self._pick_attach, False),
+            ("📸", "Screenshot for next message", self._shot, False),
+            ("🎤", "Hold to record (PTT)", None, True),
+            ("🔊", "Read next reply aloud", self._toggle_tts, False),
+            ("😊", "Emoji", self._emoji_menu, False),
+            ("+", "More actions", self._overflow, False),
+        ]:
+            btn = QToolButton()
+            btn.setText(icon)
+            btn.setToolTip(tip)
+            btn.setFixedSize(28, 28)
+            btn.setCheckable(icon == "🔊")
+            btn.setChecked(icon == "🔊")
+            btn.setStyleSheet(
+                f"QToolButton {{ color: {PAL['muted']}; border: none; font-size: 14px; "
+                f"border-radius: 6px; }}"
+                f"QToolButton:hover {{ color: {PAL['cyan']}; background: {PAL['border']}; }}"
+                f"QToolButton:checked {{ color: {PAL['cyan']}; background: rgba(0,212,255,0.12); }}"
+            )
+            if ptt:
+                btn.pressed.connect(self._ptt_down)
+                btn.released.connect(self._ptt_up)
+            elif fn:
+                btn.clicked.connect(fn)
+            tb.addWidget(btn)
+            self._tool_btns.append(btn)
+        tb.addStretch(1)
+        root.addLayout(tb)
+
+        self._slash_popup = QListWidget()
+        self._slash_popup.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        self._slash_popup.setStyleSheet(
+            f"QListWidget {{ background: {PAL['surface']}; color: {PAL['text']}; "
+            f"border: 1px solid {PAL['border']}; border-radius: 8px; }}"
+            f"QListWidget::item:selected {{ background: {PAL['border']}; color: {PAL['cyan']}; }}"
+        )
+        self._slash_popup.itemActivated.connect(self._slash_picked)
+        self._slash_idx = 0
+
+    def _style_send_idle(self) -> None:
+        self._send_btn.setText("➤")
+        self._send_btn.setToolTip("Send (Enter)")
+        self._send_btn.setStyleSheet(
+            f"QPushButton {{ background: {PAL['cyan']}; color: {PAL['bg']}; "
+            f"border-radius: 10px; font-size: 16px; font-weight: bold; }}"
+            f"QPushButton:hover {{ background: {PAL['text']}; }}"
+            f"QPushButton:disabled {{ background: {PAL['border']}; color: {PAL['muted']}; }}"
+        )
+
+    def _style_send_stop(self) -> None:
+        self._send_btn.setText("■")
+        self._send_btn.setToolTip("Stop generation")
+        self._send_btn.setEnabled(True)
+        self._send_btn.setStyleSheet(
+            f"QPushButton {{ background: rgba(255,45,85,0.2); color: {PAL['danger']}; "
+            f"border: 1px solid {PAL['danger']}; border-radius: 10px; font-size: 14px; }}"
+            f"QPushButton:hover {{ background: {PAL['danger']}; color: {PAL['bg']}; }}"
+        )
+
+    def set_streaming(self, active: bool) -> None:
+        self._streaming = active
+        if active:
+            self._style_send_stop()
+        else:
+            self._style_send_idle()
+            self._send_btn.setEnabled(bool(self._input.toPlainText().strip()))
+
+    def set_attach_label(self, text: str) -> None:
+        self._attach_lbl.setText(text)
+
+    def tts_enabled_for_next(self) -> bool:
+        return self._tts_next
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._input and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
+                if self._slash_popup.isVisible():
+                    item = self._slash_popup.currentItem()
+                    if item:
+                        self._slash_picked(item)
+                    return True
+                self._on_send_clicked()
+                return True
+            if self._slash_popup.isVisible():
+                if key == Qt.Key_Down:
+                    self._slash_idx = min(self._slash_idx + 1, self._slash_popup.count() - 1)
+                    self._slash_popup.setCurrentRow(self._slash_idx)
+                    return True
+                if key == Qt.Key_Up:
+                    self._slash_idx = max(self._slash_idx - 1, 0)
+                    self._slash_popup.setCurrentRow(self._slash_idx)
+                    return True
+                if key == Qt.Key_Escape:
+                    self._slash_popup.hide()
+                    return True
+            if key == Qt.Key_Slash and self._input.toPlainText().strip() == "":
+                QTimer.singleShot(0, self._show_slash_popup)
+        return super().eventFilter(obj, event)
+
+    def _sync_input_height(self) -> None:
+        lines = max(1, min(6, self._input.document().blockCount()))
+        lh = self._input.fontMetrics().lineSpacing()
+        self._input.setFixedHeight(min(132, max(36, lines * lh + 16)))
+        if not self._streaming:
+            self._send_btn.setEnabled(bool(self._input.toPlainText().strip()))
+
+    def _show_slash_popup(self) -> None:
+        self._slash_popup.clear()
+        for cmd, desc in _SLASH_COMMANDS:
+            item = QListWidgetItem(f"{cmd}  —  {desc}")
+            item.setData(Qt.UserRole, cmd)
+            self._slash_popup.addItem(item)
+        self._slash_idx = 0
+        self._slash_popup.setCurrentRow(0)
+        self._slash_popup.setFixedWidth(max(340, self._input.width()))
+        pos = self._input.mapToGlobal(QPoint(0, -min(220, self._slash_popup.sizeHint().height()) - 6))
+        self._slash_popup.move(pos)
+        self._slash_popup.show()
+
+    def _slash_picked(self, item: QListWidgetItem) -> None:
+        cmd = str(item.data(Qt.UserRole) or item.text().split()[0])
+        self._slash_popup.hide()
+        self._input.setPlainText(cmd + " ")
+        self._input.setFocus()
+        self._sync_input_height()
+
+    def _on_send_clicked(self) -> None:
+        if self._streaming:
+            self.stop_requested.emit()
+            return
+        text = self._input.toPlainText().strip()
+        if not text:
+            return
+        self.submitted.emit(text)
+        self._input.clear()
+        self._sync_input_height()
+
+    def _pick_attach(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self._window, "Attach to message", "",
+            "Images (*.png *.jpg *.jpeg *.gif *.webp);;Documents (*.pdf *.txt *.md);;All (*)",
+        )
+        if path:
+            self.attach_file.emit(path)
+
+    def _shot(self) -> None:
+        self.screenshot_requested.emit()
+
+    def _toggle_tts(self) -> None:
+        self._tts_next = self._tool_btns[3].isChecked()
+        self._window.bridge.set_status.emit(
+            f"TTS for next reply: {'on' if self._tts_next else 'off'}")
+
+    def _emoji_menu(self) -> None:
+        menu = QMenu(self)
+        for em in "😀 😊 👍 🎉 🔥 💡 ❤️ 🤔 👀 ✅ ❌ 🚀 💬 🎯 ⚡ 🙏".split():
+            menu.addAction(em, lambda checked=False, e=em: self._input.insertPlainText(e))
+        menu.exec(self._tool_btns[4].mapToGlobal(QPoint(0, -100)))
+
+    def _overflow(self) -> None:
+        self._window._show_plus_menu()
+
+    def _ptt_down(self) -> None:
+        audio = getattr(self._window, "audio", None)
+        if audio:
+            audio.start_ptt_recording()
+            self._ptt_active = True
+
+    def _ptt_up(self) -> None:
+        audio = getattr(self._window, "audio", None)
+        if audio and self._ptt_active:
+            audio.stop_ptt_recording()
+        self._ptt_active = False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHAT INPUT (legacy line edit — kept for reference)
 # ═════════════════════════════════════════════════════════════════════════════
 
 class ChatInputEntry(QLineEdit):
@@ -464,742 +1118,12 @@ class ChatInputEntry(QLineEdit):
         self.submitted.emit(text)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SETTINGS DIALOG — 6 tabs, instantiated once
-# ═════════════════════════════════════════════════════════════════════════════
-
-class SettingsDialog(QDialog):
-    """Settings: Model, Audio, Appearance, Skills, Memory, Context, Account, Hotkeys."""
-
-    W, H = 520, 580
-
-    def __init__(self, parent, engine, audio, ui_window) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Atlas Settings")
-        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
-        self.setStyleSheet(_CTRL_QSS)
-        self.setFixedSize(self.W, self.H)
-        self.ui = ui_window
-        self.engine = engine
-        self.audio = audio
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 12, 12, 12)
-        self.tabs = QTabWidget()
-        outer.addWidget(self.tabs, 1)
-
-        self._build_model_tab()
-        self._build_audio_tab()
-        self._build_appearance_tab()
-        self._build_skills_tab()
-        self._build_memory_tab()
-        self._build_context_tab()
-        self._build_account_tab()
-        self._build_security_tab()
-        self._build_hotkeys_tab()
-
-        done = QPushButton("Close")
-        done.setObjectName("done_btn")
-        done.clicked.connect(self.hide)
-        row = QHBoxLayout()
-        row.addStretch()
-        row.addWidget(done)
-        outer.addLayout(row)
-
-    def show_tab(self, index: int) -> None:
-        self.tabs.setCurrentIndex(index)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def _build_model_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setSpacing(12)
-        self.model_combo = QComboBox()
-        if _CORE:
-            for mid in GROQ_MODELS:
-                self.model_combo.addItem(GROQ_MODEL_LABELS.get(mid, mid), mid)
-            for i in range(self.model_combo.count()):
-                if self.model_combo.itemData(i) == GROQ_MODEL:
-                    self.model_combo.setCurrentIndex(i)
-                    break
-        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
-        lay.addWidget(QLabel("Groq model"))
-        lay.addWidget(self.model_combo)
-        self.style_combo = QComboBox()
-        styles = RESPONSE_STYLES if _CORE else ["Terse", "Direct", "Balanced", "Detailed"]
-        self.style_combo.addItems(styles)
-        if self.engine:
-            self.style_combo.setCurrentText(
-                getattr(self.engine.session, "response_style", "Balanced")
-            )
-        self.style_combo.currentTextChanged.connect(self._on_style_changed)
-        lay.addWidget(QLabel("Response style"))
-        lay.addWidget(self.style_combo)
-        self.max_tokens_sld = QSlider(Qt.Horizontal)
-        self.max_tokens_sld.setRange(256, 8192)
-        self.max_tokens_sld.setValue(2048)
-        lay.addWidget(QLabel("Max tokens (session hint)"))
-        lay.addWidget(self.max_tokens_sld)
-        lay.addStretch()
-        self.tabs.addTab(w, "Model")
-
-    def _build_audio_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        for label, action in (
-            ("Microphone", self.ui._action_mic),
-            ("Speaker Capture", self.ui._action_spk),
-            ("Voice Engine (TTS)", self.ui._action_ve),
-        ):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            row.addStretch()
-            btn = QPushButton("On" if action.isChecked() else "Off")
-            btn.setCheckable(True)
-            btn.setChecked(action.isChecked())
-            btn.toggled.connect(lambda checked, a=action: a.setChecked(checked))
-            action.toggled.connect(lambda checked, b=btn: b.setChecked(checked))
-            row.addWidget(btn)
-            lay.addLayout(row)
-        self.voice_combo = QComboBox()
-        # Populate from the actually-loaded voices.bin; fall back to the known
-        # Kokoro v0.19 voice set so the list is never empty / never invalid.
-        voices = []
-        if voice_engine is not None:
-            try:
-                voices = voice_engine.available_voices()
-            except Exception:
-                voices = []
-        if not voices:
-            voices = [
-                "af", "af_bella", "af_nicole", "af_sarah", "af_sky",
-                "am_adam", "am_michael", "bf_emma", "bf_isabella",
-                "bm_george", "bm_lewis",
-            ]
-        self.voice_combo.addItems(voices)
-        current_voice = getattr(voice_engine, "voice", "af_sarah") if voice_engine else "af_sarah"
-        if current_voice in voices:
-            self.voice_combo.setCurrentText(current_voice)
-        self.voice_combo.currentTextChanged.connect(self._on_voice_changed)
-
-        # Premium ElevenLabs voice picker — named free-tier defaults; Brian on
-        # launch.  Changing it switches the live streaming voice immediately.
-        self.eleven_combo = QComboBox()
-        eleven_voices = dict(getattr(_core_mod, "ELEVEN_VOICES", {})) if _CORE else {}
-        if eleven_voices:
-            for name, vid in eleven_voices.items():
-                self.eleven_combo.addItem(name, vid)
-            cur_id = getattr(voice_engine, "eleven_voice_id", "") if voice_engine else ""
-            for i in range(self.eleven_combo.count()):
-                if self.eleven_combo.itemData(i) == cur_id:
-                    self.eleven_combo.setCurrentIndex(i)
-                    break
-            self.eleven_combo.currentIndexChanged.connect(self._on_eleven_voice_changed)
-            lay.addWidget(QLabel("Voice (ElevenLabs)"))
-            lay.addWidget(self.eleven_combo)
-            lay.addWidget(QLabel("Fallback voice (offline Kokoro)"))
-        else:
-            lay.addWidget(QLabel("Voice"))
-        lay.addWidget(self.voice_combo)
-        self.speed_sld = QSlider(Qt.Horizontal)
-        self.speed_sld.setRange(50, 200)
-        self.speed_sld.setValue(100)
-        self.speed_sld.valueChanged.connect(self._on_speed_changed)
-        lay.addWidget(QLabel("Speech speed %"))
-        lay.addWidget(self.speed_sld)
-
-        # Quick "test voice" button so the user can confirm TTS audibly.
-        test_btn = QPushButton("🔊 Test Voice")
-        test_btn.clicked.connect(self._test_voice)
-        lay.addWidget(test_btn)
-        lay.addStretch()
-        self.tabs.addTab(w, "Audio")
-
-    def _on_voice_changed(self, name: str) -> None:
-        if voice_engine is not None and name:
-            voice_engine.set_voice(name)
-            self.ui.bridge.set_status.emit(f"Voice → {name}")
-
-    def _on_eleven_voice_changed(self, index: int) -> None:
-        if voice_engine is None or index < 0:
-            return
-        name = self.eleven_combo.itemText(index)
-        vid  = self.eleven_combo.itemData(index)
-        if not vid:
-            return
-        try:
-            voice_engine.set_eleven_voice(vid)
-            self.ui.bridge.set_status.emit(f"Voice → {name} (ElevenLabs)")
-            voice_engine.speak(f"This is {name}, your new Atlas voice.")
-        except Exception as exc:
-            self.ui.bridge.set_status.emit(f"Voice change failed: {exc}")
-
-    def _on_speed_changed(self, pct: int) -> None:
-        if voice_engine is not None:
-            voice_engine.set_speed(pct / 100.0)
-
-    def _test_voice(self) -> None:
-        if voice_engine is None:
-            self.ui.bridge.set_status.emit("Voice engine unavailable")
-            return
-        voice_engine.unmute()
-        voice_engine.speak("Atlas voice engine online. You can hear me clearly.")
-        self.ui.bridge.set_status.emit("🔊 Testing voice…")
-
-    def _build_appearance_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        op = QSlider(Qt.Horizontal)
-        op.setRange(20, 100)
-        op.setValue(int(self.ui.windowOpacity() * 100))
-        op.valueChanged.connect(lambda v: self.ui.setWindowOpacity(v / 100))
-        lay.addWidget(QLabel("Window opacity"))
-        lay.addWidget(op)
-        accent = QComboBox()
-        accent.addItems(["Cyan (default)", "Gold", "Purple"])
-        lay.addWidget(QLabel("Accent preset"))
-        lay.addWidget(accent)
-        font_sld = QSlider(Qt.Horizontal)
-        font_sld.setRange(11, 18)
-        font_sld.setValue(13)
-        lay.addWidget(QLabel("Chat font size (px)"))
-        lay.addWidget(font_sld)
-        lay.addStretch()
-        self.tabs.addTab(w, "Appearance")
-
-    def _build_skills_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        self.skills_list = QListWidget()
-        lay.addWidget(self.skills_list)
-        btn_row = QHBoxLayout()
-        btn_install = QPushButton("Install…")
-        btn_install.clicked.connect(self._install_skill)
-        btn_uninstall = QPushButton("Uninstall")
-        btn_uninstall.clicked.connect(self._uninstall_skill)
-        btn_row.addWidget(btn_install)
-        btn_row.addWidget(btn_uninstall)
-        lay.addLayout(btn_row)
-        self.tabs.addTab(w, "Skills")
-        self.tabs.currentChanged.connect(lambda i: self._refresh_skills() if i == 3 else None)
-
-    def _build_memory_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        self.memory_table = QTableWidget(0, 4)
-        self.memory_table.setHorizontalHeaderLabels(["Category", "Key", "Value", ""])
-        self.memory_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        lay.addWidget(self.memory_table)
-        stats = QLabel("")
-        self._memory_stats_lbl = stats
-        lay.addWidget(stats)
-        btn_row = QHBoxLayout()
-        btn_refresh = QPushButton("Refresh")
-        btn_refresh.clicked.connect(self._refresh_memory)
-        btn_export = QPushButton("Export JSON")
-        btn_export.clicked.connect(self._export_memory)
-        btn_clear = QPushButton("Clear all facts")
-        btn_clear.clicked.connect(self._clear_memory)
-        for b in (btn_refresh, btn_export, btn_clear):
-            btn_row.addWidget(b)
-        lay.addLayout(btn_row)
-        self.tabs.addTab(w, "Memory")
-        self.tabs.currentChanged.connect(lambda i: self._refresh_memory() if i == 4 else None)
-
-    def _build_context_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.addWidget(QLabel(
-            "<b>Standing context</b> — notes Atlas applies to every reply, "
-            "in all modes. e.g. <i>\"I'm a left-handed designer; prefer concise "
-            "answers.\"</i>"))
-        self.context_list = QListWidget()
-        self.context_list.setWordWrap(True)
-        lay.addWidget(self.context_list, 1)
-        add_row = QHBoxLayout()
-        self.context_in = QLineEdit()
-        self.context_in.setPlaceholderText("Add a standing note…")
-        self.context_in.returnPressed.connect(self._add_context)
-        btn_add = QPushButton("Add")
-        btn_add.clicked.connect(self._add_context)
-        add_row.addWidget(self.context_in, 1)
-        add_row.addWidget(btn_add)
-        lay.addLayout(add_row)
-        btn_del = QPushButton("Delete selected")
-        btn_del.clicked.connect(self._del_context)
-        lay.addWidget(btn_del)
-        self.tabs.addTab(w, "Context")
-        self.tabs.currentChanged.connect(
-            lambda i: self._refresh_context() if i == 5 else None)
-
-    def _refresh_context(self) -> None:
-        self.context_list.clear()
-        if not self.engine:
-            return
-        try:
-            items = self.engine.list_global_context()
-        except Exception:
-            items = []
-        if not items:
-            placeholder = QListWidgetItem("No standing notes yet.")
-            placeholder.setFlags(Qt.NoItemFlags)
-            self.context_list.addItem(placeholder)
-            return
-        for c in items:
-            item = QListWidgetItem(c.get("content", ""))
-            item.setData(Qt.UserRole, c.get("id"))
-            self.context_list.addItem(item)
-
-    def _add_context(self) -> None:
-        if not self.engine:
-            return
-        text = self.context_in.text().strip()
-        if not text:
-            return
-        try:
-            self.engine.add_global_context(text)
-            self.context_in.clear()
-            self._refresh_context()
-            self.ui.bridge.set_status.emit("Standing note added ✓")
-        except Exception as exc:
-            self.ui.bridge.set_status.emit(f"Couldn't add note: {exc}")
-
-    def _del_context(self) -> None:
-        if not self.engine:
-            return
-        item = self.context_list.currentItem()
-        cid = item.data(Qt.UserRole) if item else None
-        if cid is None:
-            return
-        try:
-            self.engine.delete_global_context(int(cid))
-            self._refresh_context()
-            self.ui.bridge.set_status.emit("Standing note removed")
-        except Exception as exc:
-            self.ui.bridge.set_status.emit(f"Couldn't remove note: {exc}")
-
-    def _build_account_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setSpacing(12)
-        self.account_lbl = QLabel("")
-        self.account_lbl.setWordWrap(True)
-        lay.addWidget(self.account_lbl)
-        self.btn_sync = QPushButton("Sync now")
-        self.btn_sync.clicked.connect(self._account_sync)
-        lay.addWidget(self.btn_sync)
-        btn_switch = QPushButton("Switch account…")
-        btn_switch.clicked.connect(self._account_switch)
-        lay.addWidget(btn_switch)
-        lay.addStretch()
-        self.tabs.addTab(w, "Account")
-        self.tabs.currentChanged.connect(
-            lambda i: self._refresh_account() if i == 6 else None)
-
-    def _refresh_account(self) -> None:
-        acct = getattr(self.ui, "account", None)
-        name = os.environ.get("ATLAS_USER", "guest")
-        if acct and acct.cloud_available:
-            who = acct.email or name
-            self.account_lbl.setText(
-                f"<b>{who}</b><br><span style='color:{PAL['success']}'>"
-                f"☁ Cloud sync ON</span>")
-            self.btn_sync.setEnabled(bool(getattr(acct.cloud, "cloud_id", None)))
-        else:
-            self.account_lbl.setText(
-                f"<b>{name}</b><br><span style='color:{PAL['muted']}'>"
-                f"Local profile (offline)</span>")
-            self.btn_sync.setEnabled(False)
-
-    def _account_sync(self) -> None:
-        acct = getattr(self.ui, "account", None)
-        if not (acct and self.engine):
-            return
-        self.ui.bridge.set_status.emit("Syncing…")
-
-        def _work():
-            try:
-                acct.sync_up(self.engine.user_id)
-                acct.sync_down(self.engine.user_id)
-                self.ui.bridge.set_status.emit("Synced ✓")
-            except Exception as exc:
-                self.ui.bridge.set_status.emit(f"Sync failed: {exc}")
-
-        threading.Thread(target=_work, daemon=True, name="atlas-sync").start()
-
-    def _account_switch(self) -> None:
-        acct = getattr(self.ui, "account", None)
-        if not acct:
-            return
-        acct.sign_out()
-        dlg = LoginDialog(acct, self)
-        if dlg.exec() == QDialog.Accepted and dlg.user_id and self.engine:
-            os.environ["ATLAS_USER"] = dlg.user_name
-            self.engine.set_user(dlg.user_id, dlg.user_name)
-            self._refresh_account()
-            self.ui.bridge.set_status.emit(f"Signed in as {dlg.user_name}")
-
-    def _build_security_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setSpacing(10)
-        lay.addWidget(QLabel(
-            "<b>Two-step verification</b> — extra check when signing in."))
-        self.twofa_combo = QComboBox()
-        self.twofa_combo.addItems(["Off", "Email code", "Authenticator app"])
-        lay.addWidget(self.twofa_combo)
-        self.btn_twofa_apply = QPushButton("Apply 2FA setting")
-        self.btn_twofa_apply.clicked.connect(self._apply_twofa)
-        lay.addWidget(self.btn_twofa_apply)
-        self.twofa_status = QLabel("")
-        self.twofa_status.setWordWrap(True)
-        lay.addWidget(self.twofa_status)
-
-        lay.addWidget(QLabel("<b>Change password</b> (local profile)"))
-        self.sec_old_pw = QLineEdit()
-        self.sec_old_pw.setPlaceholderText("Current password")
-        self.sec_old_pw.setEchoMode(QLineEdit.Password)
-        self.sec_new_pw = QLineEdit()
-        self.sec_new_pw.setPlaceholderText("New password")
-        self.sec_new_pw.setEchoMode(QLineEdit.Password)
-        for f in (self.sec_old_pw, self.sec_new_pw):
-            lay.addWidget(f)
-        btn_pw = QPushButton("Update password")
-        btn_pw.clicked.connect(self._change_password)
-        lay.addWidget(btn_pw)
-
-        lay.addWidget(QLabel("<b>App lock</b> — PIN required after idle (optional)"))
-        self.sec_pin = QLineEdit()
-        self.sec_pin.setPlaceholderText("4+ digit PIN")
-        self.sec_pin.setEchoMode(QLineEdit.Password)
-        self.sec_pin.setMaxLength(12)
-        lay.addWidget(self.sec_pin)
-        btn_pin = QPushButton("Set app lock PIN")
-        btn_pin.clicked.connect(self._set_app_lock)
-        lay.addWidget(btn_pin)
-
-        self.chk_pause_sensing = QCheckBox("Pause all sensing (mic, screen watch, camera)")
-        self.chk_pause_sensing.toggled.connect(self._toggle_pause_sensing)
-        lay.addWidget(self.chk_pause_sensing)
-
-        btn_clear = QPushButton("Clear all my remembered facts")
-        btn_clear.clicked.connect(self._security_clear_memory)
-        lay.addWidget(btn_clear)
-        btn_export = QPushButton("Export my data (JSON)")
-        btn_export.clicked.connect(self._security_export_data)
-        lay.addWidget(btn_export)
-
-        lay.addWidget(QLabel("<b>Computer Use — Safety Mode</b>"))
-        self.safety_combo = QComboBox()
-        self.safety_combo.addItems([
-            "Off — act without prompts",
-            "Always — confirm each action",
-            "Trusted — confirm once per session",
-        ])
-        btn_safety = QPushButton("Apply safety mode")
-        btn_safety.clicked.connect(self._apply_safety_mode)
-        lay.addWidget(self.safety_combo)
-        lay.addWidget(btn_safety)
-
-        lay.addStretch()
-        self.tabs.addTab(w, "Security")
-        self.tabs.currentChanged.connect(
-            lambda i: self._refresh_security() if i == 7 else None)
-
-    def _refresh_security(self) -> None:
-        acct = getattr(self.ui, "account", None)
-        if not (acct and self.engine):
-            return
-        sec = acct.get_security(self.engine.user_id)
-        method = sec.get("twofa_method", "none")
-        idx = {"none": 0, "email": 1, "totp": 2}.get(method, 0)
-        self.twofa_combo.setCurrentIndex(idx)
-        self.chk_pause_sensing.blockSignals(True)
-        self.chk_pause_sensing.setChecked(sec.get("pause_sensing", False))
-        self.chk_pause_sensing.blockSignals(False)
-        if sec.get("twofa_enabled"):
-            self.twofa_status.setText(
-                f"2FA active via {'email' if method == 'email' else 'authenticator app'}.")
-        else:
-            self.twofa_status.setText("Two-step verification is off.")
-        mode = "off"
-        if self.engine:
-            mode = str(self.engine.get_user_prefs().get("safety_mode", "off"))
-        self.safety_combo.setCurrentIndex(
-            {"off": 0, "always": 1, "trusted": 2}.get(mode, 0))
-
-    def _apply_safety_mode(self) -> None:
-        if not self.engine:
-            return
-        idx = self.safety_combo.currentIndex()
-        mode = ("off", "always", "trusted")[idx]
-        self.engine.safety_mode = mode
-        self.engine.set_user_pref("safety_mode", mode)
-        self.engine._safety_session_ok = False
-        self.ui.bridge.set_status.emit(f"Safety mode: {mode}")
-
-    def _apply_twofa(self) -> None:
-        acct = getattr(self.ui, "account", None)
-        if not (acct and self.engine):
-            return
-        uid = self.engine.user_id
-        choice = self.twofa_combo.currentText()
-        if choice == "Off":
-            acct.disable_2fa(uid)
-            self.ui.bridge.set_status.emit("Two-step verification disabled.")
-            self._refresh_security()
-            return
-        if choice == "Email code":
-            ok, msg = acct.enable_email_2fa(uid)
-        else:
-            secret, uri = acct.setup_totp_secret(uid)
-            from PySide6.QtWidgets import QInputDialog
-            code, ok_d = QInputDialog.getText(
-                self, "Link authenticator",
-                f"Add this secret to Google Authenticator / Authy:\n\n{secret}\n\n"
-                f"Or scan URI:\n{uri}\n\nEnter the 6-digit code to confirm:")
-            if not ok_d:
-                return
-            ok, msg = acct.confirm_totp_setup(uid, code)
-        self.twofa_status.setText(msg)
-        self.ui.bridge.set_status.emit(msg)
-        self._refresh_security()
-
-    def _change_password(self) -> None:
-        acct = getattr(self.ui, "account", None)
-        if not (acct and self.engine):
-            return
-        ok, msg = acct.change_password_local(
-            self.engine.user_id, self.sec_old_pw.text(), self.sec_new_pw.text())
-        self.ui.bridge.set_status.emit(msg)
-        if ok:
-            self.sec_old_pw.clear()
-            self.sec_new_pw.clear()
-
-    def _set_app_lock(self) -> None:
-        acct = getattr(self.ui, "account", None)
-        if not (acct and self.engine):
-            return
-        ok, msg = acct.set_app_lock_pin(self.engine.user_id, self.sec_pin.text())
-        self.ui.bridge.set_status.emit(msg)
-        if ok:
-            self.sec_pin.clear()
-
-    def _toggle_pause_sensing(self, checked: bool) -> None:
-        acct = getattr(self.ui, "account", None)
-        if not (acct and self.engine):
-            return
-        acct.set_security(self.engine.user_id, pause_sensing=checked)
-        if checked:
-            if self.ui.audio:
-                try:
-                    self.ui.audio.stop_mic()
-                    self.ui.audio.stop_speaker()
-                except Exception:
-                    pass
-            self.ui._stop_watch()
-            self.ui._action_cam.setChecked(False)
-            self.ui.bridge.set_status.emit("All sensing paused.")
-        else:
-            self.ui.bridge.set_status.emit("Sensing resumed — enable mic/watch manually.")
-
-    def _security_clear_memory(self) -> None:
-        if not self.engine:
-            return
-        from PySide6.QtWidgets import QMessageBox
-        if QMessageBox.question(
-                self, "Clear memory",
-                "Delete all remembered facts for this profile?") != QMessageBox.Yes:
-            return
-        facts = self.engine.memory.recall(self.engine.user_id, 0.0)
-        for f in facts:
-            self.engine.memory.forget(
-                self.engine.user_id, f["category"], f["key"])
-        self.ui.bridge.set_status.emit("Memory cleared.")
-
-    def _security_export_data(self) -> None:
-        if not self.engine:
-            return
-        import json
-        uid = self.engine.user_id
-        payload = {
-            "profile": self.engine.memory.get_profile(uid),
-            "facts": self.engine.memory.recall(uid, 0.0),
-            "context": self.engine.memory.list_context(uid),
-            "routines": self.engine.memory.list_routines(uid),
-            "prefs": self.engine.memory.get_prefs(uid),
-        }
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export my data", "atlas-export.json", "JSON (*.json)")
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, default=str)
-        self.ui.bridge.set_status.emit(f"Exported → {Path(path).name}")
-
-    def _build_hotkeys_tab(self) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        for shortcut, desc in (
-            ("Ctrl+Shift+S", "Screen capture"),
-            ("Ctrl+Shift+H", "Toggle clipboard watch"),
-            ("Ctrl+Shift+W", "Toggle screen watcher"),
-            ("Ctrl+R", "Hot reload"),
-            ("Ctrl+,", "Open settings"),
-            ("Ctrl+L", "Clear chat"),
-            ("Ctrl+E", "Export session"),
-            ("Ctrl+Space / Alt+Space (hold)", "Push-to-talk"),
-        ):
-            row = QLabel(f"<b>{shortcut}</b> — {desc}")
-            row.setStyleSheet(f"color: {PAL['text']}; padding: 4px;")
-            lay.addWidget(row)
-        lay.addStretch()
-        self.tabs.addTab(w, "Hotkeys")
-
-    def _on_model_changed(self, index: int) -> None:
-        if not _CORE:
-            return
-        mid = self.model_combo.itemData(index)
-        if mid:
-            _core_mod.GROQ_MODEL = mid
-            self.ui.bridge.set_status.emit(f"Model → {GROQ_MODEL_LABELS.get(mid, mid)}")
-
-    def _on_style_changed(self, style: str) -> None:
-        if self.engine:
-            self.engine.session.response_style = style
-            self.ui.bridge.set_status.emit(f"Style → {style}")
-
-    def _refresh_skills(self) -> None:
-        self.skills_list.clear()
-        if not self.engine:
-            return
-        for sk in self.engine.skill_registry.list_skills():
-            item = QListWidgetItem(f"{sk.get('display', sk.get('name'))} — {sk.get('description', '')}")
-            item.setData(Qt.UserRole, sk.get("name"))
-            self.skills_list.addItem(item)
-
-    def _install_skill(self) -> None:
-        if not self.engine:
-            return
-        path, _ = QFileDialog.getOpenFileName(self, "Install Skill", "", "Python (*.py)")
-        if not path:
-            return
-        ok, msg = self.engine.skill_registry.install_from_file(path)
-        self.ui.bridge.set_status.emit(msg)
-        self._refresh_skills()
-
-    def _uninstall_skill(self) -> None:
-        if not self.engine:
-            return
-        item = self.skills_list.currentItem()
-        if not item:
-            return
-        name = item.data(Qt.UserRole)
-        self.engine.skill_registry.uninstall(name)
-        self._refresh_skills()
-
-    def _refresh_memory(self) -> None:
-        self.memory_table.setRowCount(0)
-        if not self.engine:
-            return
-        facts = self.engine.memory.recall(self.engine.user_id)
-        for fact in facts:
-            row = self.memory_table.rowCount()
-            self.memory_table.insertRow(row)
-            self.memory_table.setItem(row, 0, QTableWidgetItem(str(fact.get("category", ""))))
-            self.memory_table.setItem(row, 1, QTableWidgetItem(str(fact.get("key", ""))))
-            self.memory_table.setItem(row, 2, QTableWidgetItem(str(fact.get("value", ""))))
-            del_btn = QPushButton("Delete")
-            cat, key = fact.get("category", ""), fact.get("key", "")
-            del_btn.clicked.connect(
-                lambda _=False, c=cat, k=key: self._delete_fact(c, k)
-            )
-            self.memory_table.setCellWidget(row, 3, del_btn)
-        report = self.engine.learning.get_learning_report()
-        self._memory_stats_lbl.setText(
-            f"Facts: {report.get('total_facts', len(facts))} | "
-            f"High confidence: {report.get('high_confidence_facts', 0)} | "
-            f"Turns: {report.get('turn_count', 0)}"
-        )
-
-    def _delete_fact(self, category: str, key: str) -> None:
-        if self.engine:
-            self.engine.memory.forget(self.engine.user_id, category, key)
-            self._refresh_memory()
-
-    def _export_memory(self) -> None:
-        if not self.engine:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "Export Memory", "atlas_memory.json", "JSON (*.json)")
-        if not path:
-            return
-        facts = self.engine.memory.recall(self.engine.user_id)
-        Path(path).write_text(json.dumps(facts, indent=2), encoding="utf-8")
-
-    def _clear_memory(self) -> None:
-        if not self.engine:
-            return
-        for fact in self.engine.memory.recall(self.engine.user_id):
-            self.engine.memory.forget(
-                self.engine.user_id, fact.get("category", ""), fact.get("key", "")
-            )
-        self._refresh_memory()
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # UNIFIED CONTROL CENTER PANEL  (legacy — superseded by SettingsDialog)
 # ═════════════════════════════════════════════════════════════════════════════
 
-_CTRL_QSS = f"""
-QDialog, QWidget {{ background: transparent; }}
-QFrame#ctrl_chrome {{
-    background: {PAL['surface']};
-    border: 1px solid {PAL['border']};
-    border-radius: 12px;
-}}
-QLabel#section_hdr {{
-    color: {PAL['cyan']};
-    font-size: 10px;
-    font-weight: bold;
-    letter-spacing: 1px;
-    padding-bottom: 4px;
-    border-bottom: 1px solid {PAL['border']};
-    background: transparent;
-}}
-QComboBox {{
-    background: {PAL['surface_2']}; border: 1px solid {PAL['border']};
-    border-radius: 6px; padding: 4px 10px; color: {PAL['text']};
-    min-width: 120px;
-}}
-QComboBox::drop-down {{ border: none; }}
-QComboBox QAbstractItemView {{
-    background: {PAL['surface_2']}; border: 1px solid {PAL['border']};
-    selection-background-color: {PAL['border']};
-}}
-QPushButton#toggle_on {{
-    background: {PAL['success']}; color: {PAL['bg']};
-    border-radius: 10px; font-size: 11px; font-weight: bold;
-    min-width: 52px; max-width: 52px; min-height: 20px; max-height: 20px;
-}}
-QPushButton#toggle_off {{
-    background: {PAL['border']}; color: {PAL['muted']};
-    border-radius: 10px; font-size: 11px;
-    min-width: 52px; max-width: 52px; min-height: 20px; max-height: 20px;
-}}
-QSlider::groove:horizontal {{ height: 4px; background: {PAL['border']}; border-radius: 2px; }}
-QSlider::handle:horizontal {{
-    background: {PAL['cyan']}; width: 13px; height: 13px;
-    margin: -5px 0; border-radius: 7px;
-}}
-QPushButton#done_btn {{
-    background: {PAL['cyan']}; color: {PAL['bg']};
-    border-radius: 6px; padding: 7px 24px;
-    font-weight: bold; font-size: 13px;
-}}
-QPushButton#done_btn:hover {{ background: {PAL['cyan_dim']}; color: {PAL['text']}; }}
-"""
+_CTRL_QSS = settings_dialog_qss()
 
 
 class ControlCenter(QDialog):
@@ -1675,10 +1599,10 @@ class WatchWorker(QThread):
 
     def _try_vision_ai(self, img_bytes: bytes) -> str:
         try:
-            from atlas_core import groq_client
+            from atlas_core import groq_client, ATLAS_WEBCAM_MODEL
             b64  = base64.b64encode(img_bytes).decode()
             resp = groq_client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                model=ATLAS_WEBCAM_MODEL,
                 messages=[{
                     "role": "user",
                     "content": [
@@ -2753,11 +2677,17 @@ class AtlasWindow(QMainWindow):
             )
             if _CORE else None
         )
+        if self.state and self.audio:
+            self.state.audio_watcher.bind_audio(self.audio)
 
         # ── Feature state ─────────────────────────────────────────────────────
+        self.copilot_active       = False
         self.watch_active       = False
         self.highlight_active   = False
         self.stealth_active     = False
+        self._stealth_before_interview = False
+        self._interview_headphone_shown = False
+        self._capture_exclusion_warned = False
         self.camera_active      = False     # Req 4: webcam toggle
         self.fs_access_active   = False     # Req 7: FS permission gate
         self.last_clipboard     = ""
@@ -2919,6 +2849,20 @@ class AtlasWindow(QMainWindow):
         hdr_lay.addWidget(self.mode_pill)
         hdr_lay.addStretch()
 
+        self.btn_copilot = QPushButton("👁 Copilot")
+        self.btn_copilot.setCheckable(True)
+        self.btn_copilot.setFixedWidth(78)
+        self.btn_copilot.setToolTip(
+            "Copilot — passive screen awareness; optional always-on voice")
+        self.btn_copilot.setStyleSheet(
+            f"QPushButton {{ background: {PAL['surface_2']}; color: {PAL['muted']}; "
+            f"border: 1px solid {PAL['border']}; border-radius: 6px; padding: 3px 6px; "
+            f"font-size: 10px; }}"
+            f"QPushButton:checked {{ background: rgba(245,158,11,0.22); color: #F59E0B; "
+            f"border: 1px solid #D97706; }}")
+        self.btn_copilot.toggled.connect(self._on_copilot_toggled)
+        hdr_lay.addWidget(self.btn_copilot)
+
         self.btn_focus = QPushButton("Focus")
         self.btn_focus.setCheckable(True)
         self.btn_focus.setFixedWidth(58)
@@ -3023,6 +2967,15 @@ class AtlasWindow(QMainWindow):
         # Control ribbon docks here — below the orb, directly atop the dialogue box.
         self.main_lay.addWidget(self.header)
 
+        self.copilot_status_lbl = QLabel("")
+        self.copilot_status_lbl.setAlignment(Qt.AlignCenter)
+        self.copilot_status_lbl.setStyleSheet(
+            f"color: #F59E0B; font-size: 10px; font-weight: 600; padding: 2px 8px; "
+            f"background: rgba(245,158,11,0.08); border-radius: 4px;"
+        )
+        self.copilot_status_lbl.hide()
+        self.main_lay.addWidget(self.copilot_status_lbl)
+
         # ══ WORKSPACE ═════════════════════════════════════════════════════════
         self.workspace = QFrame()
         self.workspace.setObjectName("workspace")
@@ -3082,50 +3035,17 @@ class AtlasWindow(QMainWindow):
         self.thinking_bar.hide()
         resp_lay.addWidget(self.thinking_bar)
 
-        # Text area
-        self.text_area = QTextBrowser()
-        self.text_area.setReadOnly(True)
-        self.text_area.setOpenExternalLinks(False)
-        self.text_area.setOpenLinks(False)
-        # Allow the user to select and copy any text (and code) from the chat.
-        self.text_area.setTextInteractionFlags(
-            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
-            | Qt.LinksAccessibleByMouse)
-        self.text_area.setContextMenuPolicy(Qt.DefaultContextMenu)
-        self.text_area.anchorClicked.connect(self._on_anchor_clicked)
-        self._CODE_CSS = (
-            f"<style>"
-            f"body {{ color: {PAL['text']}; background: {PAL['surface']}; "
-            f"       font-family: 'Segoe UI', sans-serif; font-size: 13px; line-height: 1.5; }}"
-            f"pre  {{ background: {PAL['bg']}; border: 1px solid {PAL['border']}; "
-            f"        border-radius: 8px; padding: 12px 14px; margin: 8px 0 2px 0; "
-            f"        font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; "
-            f"        font-size: 12.5px; color: {PAL['cyan']}; white-space: pre-wrap; "
-            f"        line-height: 1.45; }}"
-            f"code {{ background: {PAL['surface_2']}; border: 1px solid {PAL['border']}; "
-            f"        border-radius: 4px; padding: 1px 5px; "
-            f"        font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; "
-            f"        font-size: 12px; color: {PAL['cyan']}; }}"
-            f"pre code {{ background: transparent; border: none; padding: 0; }}"
-            f"a    {{ color: {PAL['cyan']}; text-decoration: none; }}"
-            f"ul, ol {{ margin-left: 18px; }}"
-            f"strong {{ color: {PAL['gold']}; }}"
-            # Clean inline "Copy" badge anchored to each fenced code block.
-            f".copy-row {{ text-align: right; margin: 0 0 8px 0; }}"
-            f".copy-badge {{ display: inline-block; background: {PAL['surface_2']}; "
-            f"        color: {PAL['cyan']}; border: 1px solid {PAL['cyan_dim']}; "
-            f"        border-radius: 5px; padding: 2px 9px; font-size: 10px; "
-            f"        font-family: 'Cascadia Code', 'Consolas', monospace; "
-            f"        letter-spacing: 0.5px; }}"
-            f".typing-dot {{ animation: blink 1.2s infinite; opacity: 0.3; margin: 0 2px; }}"
-            f"@keyframes blink {{ 0%,80%,100%{{opacity:0}} 40%{{opacity:1}} }}"
-            f"</style>"
-        )
-        self._md_plain_prefix:  str  = ""
-        self._md_ai_buffer:     str  = ""
-        self._md_ai_streaming:  bool = False
+        self.chat_view = ChatView()
+        self.chat_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.chat_view.setMinimumHeight(200)
+        self.chat_view.anchor_clicked.connect(self._on_chat_anchor)
+        self.chat_view.image_dropped.connect(self._on_chat_image_dropped)
+        self.chat_view.message_added.connect(self._wire_message_card)
+        resp_lay.addWidget(self.chat_view, 1)
 
-        resp_lay.addWidget(self.text_area)
+        # Legacy alias — some helpers still reference text_area
+        self.text_area = self.chat_view._scroll
+
         ws_lay.addLayout(resp_lay)
 
         # Status bar
@@ -3133,74 +3053,29 @@ class AtlasWindow(QMainWindow):
         self.status_lbl.setStyleSheet(f"color: {PAL['muted']}; font-size: 10px; padding: 4px 14px;")
         ws_lay.addWidget(self.status_lbl)
 
-        # Input dock: [+] [🎧] [ChatInput] [stop] [send]
-        self.input_row = QFrame()
-        self.input_row.setObjectName("action_dock")
-        input_lay = QHBoxLayout(self.input_row)
-        input_lay.setContentsMargins(8, 6, 8, 6)
-        input_lay.setSpacing(6)
-
-        self.btn_plus = QPushButton("+")
-        self.btn_plus.setFixedSize(34, 34)
-        self.btn_plus.setToolTip("Actions menu")
-        self.btn_plus.setStyleSheet(
-            f"QPushButton {{ background: {PAL['surface']}; color: {PAL['cyan']}; "
-            f"  border: 1px solid {PAL['border']}; border-radius: 8px; font-size: 18px; font-weight: bold; }}"
-            f"QPushButton:hover {{ background: {PAL['border']}; }}"
+        self.chat_composer = ChatComposer(self)
+        self.chat_composer.setObjectName("action_dock")
+        self.chat_composer.setStyleSheet(
+            f"QFrame#action_dock {{ background: {PAL['surface_2']}; "
+            f"border-radius: 12px; border: 1px solid {PAL['border']}; }}"
         )
-        self.btn_plus.clicked.connect(self._show_plus_menu)
-        input_lay.addWidget(self.btn_plus)
+        self.chat_composer.submitted.connect(self._submit_query)
+        self.chat_composer.stop_requested.connect(self._do_stop_gen)
+        self.chat_composer.attach_file.connect(self._on_composer_attach)
+        self.chat_composer.screenshot_requested.connect(self._on_composer_screenshot)
+        ws_lay.addWidget(self.chat_composer)
 
-        # ── Talk button — mouse-accessible equivalent of the talk hotkey ──────
-        self.btn_talk = QPushButton("🎧")
-        self.btn_talk.setFixedSize(34, 34)
-        self.btn_talk.setToolTip("Talk to Atlas (or tap Ctrl + Space)")
-        self.btn_talk.setStyleSheet(
-            f"QPushButton {{ background: {PAL['surface']}; color: {PAL['danger']}; "
-            f"  border: 1px solid {PAL['border']}; border-radius: 8px; font-size: 15px; }}"
-            f"QPushButton:hover {{ background: rgba(255,45,85,0.18); border: 1px solid {PAL['danger']}; }}"
-        )
-        self.btn_talk.clicked.connect(self._on_orb_clicked)
-        input_lay.addWidget(self.btn_talk)
-
-        def _skill_names() -> list[str]:
-            if self.state:
-                return [s.get("name", "") for s in self.state.skill_registry.list_skills()]
-            return []
-
-        self.ask_entry = ChatInputEntry(self, skill_names_fn=_skill_names)
-        self.ask_entry.returnPressed.connect(self._do_ask)
-        self.ask_entry.submitted.connect(self._submit_query)
-        input_lay.addWidget(self.ask_entry, 1)
-
-        self.btn_stop = QPushButton("⏹")
-        self.btn_stop.setToolTip("Stop generation")
-        self.btn_stop.setFixedSize(34, 34)
-        self.btn_stop.setStyleSheet(
-            f"QPushButton {{ background: rgba(255,45,85,0.15); color: {PAL['danger']};"
-            f"  border: 1px solid {PAL['danger']}; border-radius: 8px; font-size: 13px; }}"
-            f"QPushButton:hover {{ background: {PAL['danger']}; color: {PAL['bg']}; }}"
-        )
-        self.btn_stop.clicked.connect(self._do_stop_gen)
-        self.btn_stop.hide()
-        input_lay.addWidget(self.btn_stop)
-
-        self.btn_send = QPushButton("➤")
-        self.btn_send.setFixedHeight(34)
-        self.btn_send.setStyleSheet(
-            f"QPushButton {{ background: {PAL['cyan']}; color: {PAL['bg']}; "
-            f"  border-radius: 8px; padding: 6px 14px; font-weight: bold; font-size: 14px; }}"
-            f"QPushButton:hover {{ background: {PAL['text']}; }}"
-        )
-        self.btn_send.clicked.connect(self._do_ask)
-        input_lay.addWidget(self.btn_send)
-
-        self.chat_hints = QLabel(
-            "Try: \"Guide me through …\" · \"Do it for me: …\" · \"Can you see my screen?\"")
-        self.chat_hints.setStyleSheet(
-            f"color: {PAL['muted']}; font-size: 10px; padding: 2px 8px;")
-        ws_lay.addWidget(self.chat_hints)
-        ws_lay.addWidget(self.input_row)
+        # Legacy aliases for hot-reload / menu paths
+        self.input_row = self.chat_composer
+        self.ask_entry = self.chat_composer._input
+        self.btn_send = self.chat_composer._send_btn
+        self.btn_stop = self.chat_composer._send_btn
+        self.btn_plus = self.chat_composer._tool_btns[-1]
+        self._pending_attachments: list[dict] = []
+        self._last_user_query = ""
+        self._md_ai_buffer = ""
+        self._md_ai_streaming = False
+        self._md_plain_prefix = ""
 
         self.token_footer = QLabel(" Tokens: 0 prompt · 0 completion | Session: 00:00 · 0 turns")
         self.token_footer.setStyleSheet(
@@ -3351,14 +3226,50 @@ class AtlasWindow(QMainWindow):
 
     # ═════════════════════════════════════════════════════════════════════════
     # STEALTH MATRIX  (Requirement 5)
-    # WDA_EXCLUDEFROMCAPTURE applied to main window, FloatBubble, PillNotification
+    # WDA_EXCLUDEFROMCAPTURE on main window, FloatBubble, PillNotification,
+    # HoloOverlay, and AgentCursorOverlay (Windows 10 build 19041+)
     # ═════════════════════════════════════════════════════════════════════════
+
+    def _stealth_widgets(self) -> list:
+        widgets = [self, self._bubble, self._pill_win]
+        if self.overlay:
+            widgets.append(self.overlay)
+        if self.agent_cursor:
+            widgets.append(self.agent_cursor)
+        return widgets
+
+    def _warn_capture_exclusion_unsupported(self) -> None:
+        if self._capture_exclusion_warned:
+            return
+        self._capture_exclusion_warned = True
+        msg = (
+            "Screen exclusion requires Windows 10 v2004 or later. Your version "
+            "doesn't support it — Atlas windows may be visible in screen shares."
+        )
+        if HAS_LOGGING:
+            get_logger("atlas.ui").warning(msg)
+        self.bridge.set_status.emit(msg)
+        if hasattr(self, "_append_response"):
+            self._append_response(msg)
 
     def _apply_stealth_to_hwnd(self, hwnd_int: int, enable: bool) -> bool:
         """Apply or remove WDA_EXCLUDEFROMCAPTURE on any HWND. Returns True on success."""
+        if HAS_OVERLAY:
+            from atlas_overlay import apply_capture_exclusion, capture_exclusion_supported
+            if enable and not capture_exclusion_supported():
+                self._warn_capture_exclusion_unsupported()
+                return False
+            return apply_capture_exclusion(hwnd_int, enable)
         import ctypes
         import ctypes.wintypes
-        WDA_NONE               = 0x00000000
+        if enable:
+            try:
+                if sys.platform == "win32" and sys.getwindowsversion().build < 19041:
+                    self._warn_capture_exclusion_unsupported()
+                    return False
+            except Exception:
+                pass
+        WDA_NONE = 0x00000000
         WDA_EXCLUDEFROMCAPTURE = 0x00000011
         flag = WDA_EXCLUDEFROMCAPTURE if enable else WDA_NONE
         try:
@@ -3370,60 +3281,92 @@ class AtlasWindow(QMainWindow):
         except (AttributeError, OSError):
             return False
 
-    def _toggle_stealth(self):
-        """
-        Complete Stealth Matrix — cloak or reveal all three HWNDs:
-        1. QMainWindow (self)
-        2. FloatBubble
-        3. PillNotification
-        """
-        target = not self.stealth_active
-
-        results = []
-        for widget, name in [
-            (self,         "main"),
-            (self._bubble, "bubble"),
-            (self._pill_win, "pill"),
-        ]:
+    def _set_stealth_active(self, active: bool, *, update_ui: bool = True) -> None:
+        """Apply capture exclusion to every Atlas HWND."""
+        results: list[bool] = []
+        for widget in self._stealth_widgets():
             try:
-                hwnd = int(widget.winId())
-                ok   = self._apply_stealth_to_hwnd(hwnd, target)
-                results.append((name, ok))
+                results.append(self._apply_stealth_to_hwnd(int(widget.winId()), active))
             except Exception:
-                results.append((name, False))
+                results.append(False)
+        if self.overlay and hasattr(self.overlay, "set_capture_excluded"):
+            self.overlay.set_capture_excluded(active)
+        if self.agent_cursor and hasattr(self.agent_cursor, "set_capture_excluded"):
+            self.agent_cursor.set_capture_excluded(active)
 
-        main_ok = any(ok for _, ok in results)
-
-        if target and main_ok:
-            self.stealth_active = True
-            self._set_accent_state("stealth")
-            self.btn_stealth.setStyleSheet(
-                f"QPushButton {{ background: rgba(255,45,85,0.15);"
-                f"  color: {PAL['danger']}; border: none; border-radius: 5px;"
-                f"  font-size: 13px; }}"
-                f"QPushButton:hover {{ background: rgba(255,45,85,0.30);"
-                f"  color: {PAL['danger']}; }}"
-            )
-            self.btn_stealth.setToolTip("Stealth ACTIVE — click to disable")
-            self.bridge.set_status.emit("🥷 Stealth ON — hidden from all screen capture APIs")
-        elif not target:
-            self.stealth_active = False
-            self._set_accent_state("idle")
-            self.btn_stealth.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; border-radius: 5px;"
-                f"  color: {PAL['muted']}; font-size: 13px; }}"
-                f"QPushButton:hover {{ background: {PAL['surface_2']};"
-                f"  color: {PAL['text']}; }}"
-            )
-            self.btn_stealth.setToolTip("Stealth Mode — hide from screen capture (Windows only)")
-            self.bridge.set_status.emit("🥷 Stealth OFF — visible in screen share")
+        if active:
+            if any(results):
+                self.stealth_active = True
+                if update_ui:
+                    self._set_accent_state("stealth")
+                    self.btn_stealth.setStyleSheet(
+                        f"QPushButton {{ background: rgba(255,45,85,0.15);"
+                        f"  color: {PAL['danger']}; border: none; border-radius: 5px;"
+                        f"  font-size: 13px; }}"
+                        f"QPushButton:hover {{ background: rgba(255,45,85,0.30);"
+                        f"  color: {PAL['danger']}; }}"
+                    )
+                    self.btn_stealth.setToolTip("Stealth ACTIVE — click to disable")
+                    self.bridge.set_status.emit(
+                        "🥷 Stealth ON — hidden from all screen capture APIs")
+            elif HAS_OVERLAY:
+                from atlas_overlay import capture_exclusion_supported
+                if capture_exclusion_supported():
+                    import ctypes
+                    err = ctypes.GetLastError() if hasattr(ctypes, "GetLastError") else "n/a"
+                    self.bridge.set_status.emit(
+                        f"Stealth: SetWindowDisplayAffinity failed (err {err}) — "
+                        "requires Windows 10 build 19041+"
+                    )
         else:
-            import ctypes
-            err = ctypes.GetLastError() if hasattr(ctypes, "GetLastError") else "n/a"
-            self.bridge.set_status.emit(
-                f"Stealth: SetWindowDisplayAffinity failed (err {err}) — "
-                "requires Windows 10 build 19041+"
-            )
+            self.stealth_active = False
+            if update_ui:
+                self._set_accent_state("idle")
+                self.btn_stealth.setStyleSheet(
+                    f"QPushButton {{ background: transparent; border: none; border-radius: 5px;"
+                    f"  color: {PAL['muted']}; font-size: 13px; }}"
+                    f"QPushButton:hover {{ background: {PAL['surface_2']};"
+                    f"  color: {PAL['text']}; }}"
+                )
+                self.btn_stealth.setToolTip(
+                    "Stealth Mode — hide from screen capture (Windows only)")
+                self.bridge.set_status.emit("🥷 Stealth OFF — visible in screen share")
+
+    def _toggle_stealth(self):
+        """Toggle capture exclusion on all Atlas windows."""
+        self._set_stealth_active(not self.stealth_active, update_ui=True)
+
+    def _show_interview_headphone_reminder(self) -> None:
+        """One-time per run reminder when Interview / Focus mode starts."""
+        if self._interview_headphone_shown:
+            return
+        self._interview_headphone_shown = True
+        msg = (
+            "🎧 Reminder: if TTS is on, Atlas will speak out loud. Use headphones "
+            "so your mic doesn't pick it up during the call."
+        )
+        if hasattr(self, "chat_view"):
+            self._append_response(msg)
+        self.bridge.set_status.emit(msg)
+        QTimer.singleShot(3000, lambda: self.bridge.set_status.emit("  Ready"))
+
+    def _on_focus_mode_changed(self, enabled: bool) -> None:
+        """Interview / Focus mode side effects — UI sync, stealth, mic, reminders."""
+        self._sync_focus_ui(enabled)
+        if enabled:
+            self._stealth_before_interview = self.stealth_active
+            if not self.stealth_active:
+                self._set_stealth_active(True, update_ui=True)
+            self._show_interview_headphone_reminder()
+            self.style_combo_set("Direct")
+            if self.audio and not self.audio.mic_active:
+                self.audio.start_mic()
+                self._action_mic.setChecked(True)
+            self.bridge.set_status.emit("Focus mode on")
+        else:
+            if not self._stealth_before_interview and self.stealth_active:
+                self._set_stealth_active(False, update_ui=True)
+            self.bridge.set_status.emit("Focus mode off")
 
     # ═════════════════════════════════════════════════════════════════════════
     # PERMISSION INTERCEPTOR  (Requirement 7)
@@ -3687,7 +3630,7 @@ class AtlasWindow(QMainWindow):
             if event_type == "learn_status":
                 QTimer.singleShot(0, self._sync_learn_btn)
         elif event_type == "focus_changed":
-            QTimer.singleShot(0, lambda: self._sync_focus_ui(
+            QTimer.singleShot(0, lambda: self._on_focus_mode_changed(
                 payload.get("enabled", False)))
         elif event_type == "toggle_ambient":
             if payload.get("enabled"):
@@ -3704,6 +3647,49 @@ class AtlasWindow(QMainWindow):
         elif event_type == "spatial_error":
             err = str(payload.get("error", "Location failed"))
             self.bridge.set_status.emit(err)
+        elif event_type == "proactive_alert":
+            msg = str(payload.get("message") or payload.get("summary") or "")
+            if msg:
+                QTimer.singleShot(0, lambda m=msg: self._append_proactive_alert(m))
+        elif event_type == "copilot_changed":
+            QTimer.singleShot(0, lambda: self._sync_copilot_ui(
+                payload.get("active", False)))
+
+    def _on_copilot_toggled(self, checked: bool) -> None:
+        self.copilot_active = checked
+        if self.state:
+            self.state.set_copilot_mode(checked)
+        self._sync_copilot_ui(checked)
+        self.bridge.set_status.emit(
+            f"Copilot {'on — Atlas is watching' if checked else 'off'}")
+
+    def _sync_copilot_ui(self, active: bool) -> None:
+        if hasattr(self, "btn_copilot"):
+            self.btn_copilot.blockSignals(True)
+            self.btn_copilot.setChecked(active)
+            self.btn_copilot.blockSignals(False)
+        self.copilot_active = bool(active)
+        if not hasattr(self, "copilot_status_lbl"):
+            return
+        if active:
+            voice_on = bool(
+                self.state
+                and getattr(self.state, "audio_watcher", None)
+                and self.state.audio_watcher.voice_listening
+            )
+            if voice_on:
+                self.copilot_status_lbl.setText(
+                    "Atlas is watching your screen + listening")
+            else:
+                self.copilot_status_lbl.setText("Atlas is watching your screen")
+            self.copilot_status_lbl.show()
+        else:
+            self.copilot_status_lbl.hide()
+
+    def _append_proactive_alert(self, message: str) -> None:
+        msg = self.chat_view.add_message("proactive", message)
+        self._chat_messages.append(msg)
+        self.bridge.set_status.emit("👁 Copilot noticed something on your screen")
 
     def _sync_focus_ui(self, enabled: bool) -> None:
         if hasattr(self, "btn_focus"):
@@ -3733,13 +3719,7 @@ class AtlasWindow(QMainWindow):
             voice_engine.flush()
             voice_engine.skip()
         self.state.set_focus_mode(checked)
-        self._sync_focus_ui(checked)
-        self.bridge.set_status.emit(f"Focus mode {'on' if checked else 'off'}")
-        if checked:
-            self.style_combo_set("Direct")
-            if self.audio and not self.audio.mic_active:
-                self.audio.start_mic()
-                self._action_mic.setChecked(True)
+        self._on_focus_mode_changed(checked)
 
     def _sync_mode_ui(self, mode_name: str):
         """Legacy hook — maps old mode names to focus toggle."""
@@ -3777,12 +3757,7 @@ class AtlasWindow(QMainWindow):
             self.watch_active = False
             self.highlight_active = False
             if self.stealth_active:
-                for widget in [self, self._bubble, self._pill_win]:
-                    try:
-                        self._apply_stealth_to_hwnd(int(widget.winId()), False)
-                    except Exception:
-                        pass
-                self.stealth_active = False
+                self._set_stealth_active(False, update_ui=False)
             worker = getattr(self, "_watch_worker", None)
             if worker:
                 worker.stop()
@@ -3842,37 +3817,54 @@ class AtlasWindow(QMainWindow):
     # ═════════════════════════════════════════════════════════════════════════
 
     def _do_ask(self) -> None:
-        text = self.ask_entry.text().strip()
+        text = self.chat_composer._input.toPlainText().strip()
         if text:
-            self.ask_entry.clear()
+            self.chat_composer._input.clear()
+            self.chat_composer._sync_input_height()
             self._submit_query(text)
 
     def _submit_query(self, text: str) -> None:
         if not text:
             return
+        self._last_user_query = text
         self._stop_ambient_on_input()
         if text.startswith("/"):
-            self._handle_slash_command(text)
-            return
-        # "Do anything" intent router — natural-language control of Atlas itself
-        # (switch mode, tweak voice/speed, remember a standing note, stop, run a
-        # routine). Handled commands never hit the LLM.
+            if self._handle_slash_command(text):
+                return
         if self.state and self._try_route_command(text):
             return
         if self.state:
-            self._append_user_bubble(text)
+            msg = self.chat_view.add_message("user", text)
+            self._chat_messages.append(msg)
             self._stop_gen.clear()
             self._stream_start_ts = time.time()
             self._is_streaming = True
             self.bridge.start_thinking.emit()
             self.bridge.set_status.emit("Thinking…")
             webcam_b64 = self._capture_webcam_frame()
+            screen_b64 = None
+            doc_ctx = ""
+            for att in self._pending_attachments:
+                if att.get("type") == "image":
+                    screen_b64 = att.get("b64") or screen_b64
+                elif att.get("type") == "screen":
+                    screen_b64 = att.get("b64") or screen_b64
+                elif att.get("type") == "doc":
+                    doc_ctx += att.get("text", "") + "\n\n"
+            if doc_ctx:
+                text = f"[Attached document]\n{doc_ctx.strip()}\n\n{text}"
+            if screen_b64 and self.state:
+                self.state.inject_screen_capture(screen_b64)
+            if not self.chat_composer.tts_enabled_for_next() and voice_engine:
+                voice_engine.flush()
             threading.Thread(
                 target=self.state.handle_input,
                 args=(text,),
-                kwargs={"source": "user", "webcam_b64": webcam_b64},
+                kwargs={"source": "user", "webcam_b64": webcam_b64 or screen_b64},
                 daemon=True,
             ).start()
+            self._pending_attachments.clear()
+            self.chat_composer.set_attach_label("")
 
     def _try_route_command(self, text: str) -> bool:
         """Intercept natural-language control commands before the LLM.
@@ -3887,7 +3879,7 @@ class AtlasWindow(QMainWindow):
             return False
         if not intent or intent.get("intent") == "chat":
             return False
-        self.bridge.append_text.emit(f"[COMMAND]: {text}")
+        self._append_response(f"[COMMAND]: {text}")
         threading.Thread(
             target=self.state.execute_command, args=(intent,),
             daemon=True, name="atlas-command",
@@ -3897,7 +3889,7 @@ class AtlasWindow(QMainWindow):
     def _start_thinking(self):
         self.thinking_bar.setRange(0, 0)
         self.thinking_bar.show()
-        self.btn_stop.show()
+        self.chat_composer.set_streaming(True)
         self._set_accent_state("processing")
         self._set_orb_state("thinking")
         if self._is_floating:
@@ -3907,7 +3899,7 @@ class AtlasWindow(QMainWindow):
         self.thinking_bar.setRange(0, 1)
         self.thinking_bar.setValue(1)
         self.thinking_bar.hide()
-        self.btn_stop.hide()
+        self.chat_composer.set_streaming(False)
         self._set_accent_state("stealth" if self.stealth_active else "idle")
         # If TTS is about to speak, the skip-audio poll will flip the orb to
         # "speaking"; otherwise settle to idle.
@@ -3929,25 +3921,17 @@ class AtlasWindow(QMainWindow):
         self._is_streaming = False
         self.bridge.thinking_done.emit()
         self.bridge.set_status.emit("Done ✓")
-        # Commit the finished answer into the permanent transcript and reset the
-        # live streaming buffer, so the next turn starts clean and every message
-        # stays interleaved (user → Atlas → user → Atlas …).
         if full_text:
-            body = self._md_to_html(full_text)
-            footer = (
-                f"<div style='color:{PAL['muted']};font-size:10px;"
-                f"margin:2px 0 4px 22px;'>Atlas · {elapsed:.1f}s</div>"
-            )
-            bubble = self._atlas_bubble_html(body, typing=False)
-            self._md_plain_prefix += bubble + footer
+            self.chat_view.finish_stream(full_text, elapsed)
             self._chat_messages.append(
-                {"role": "assistant", "html": bubble, "text": full_text,
-                 "ts": time.time()}
+                {"role": "assistant", "text": full_text, "ts": time.time()}
             )
         self._md_ai_streaming = False
         self._md_ai_buffer = ""
         self._streaming_html = ""
-        self._render_full_html()
+        if not self.chat_composer.tts_enabled_for_next() and voice_engine:
+            voice_engine.flush()
+            voice_engine.skip()
         if full_text:
             if self._is_floating:
                 self.bridge.notify_pill.emit(full_text.replace("\n", " ")[:60] + "…")
@@ -3969,7 +3953,7 @@ class AtlasWindow(QMainWindow):
         self._md_ai_buffer = ""
         self._md_ai_streaming = True
         self._streaming_html = ""
-        self._render_full_html()
+        self.chat_view.begin_assistant_stream()
 
     @Slot(str)
     def _on_stream_token(self, token: str) -> None:
@@ -3983,80 +3967,160 @@ class AtlasWindow(QMainWindow):
 
     def _flush_render(self) -> None:
         self._render_pending = False
-        self._render_full_html()
+        self.chat_view.update_stream(self._md_ai_buffer)
 
-    def _md_to_html(self, md_text: str) -> str:
-        import html as _html
-        import re
+    def _wire_message_card(self, card: object) -> None:
+        if not isinstance(card, ChatMessageCard):
+            return
+        card.regenerate_requested.connect(self._regenerate_last)
+        card.read_aloud_requested.connect(self._read_message_aloud)
+        card.pin_requested.connect(self._pin_message)
 
-        if HAS_MARKDOWN_IT and _md is not None:
-            html = _md.render(md_text)
+    def _regenerate_last(self) -> None:
+        if self._last_user_query:
+            self._submit_query(self._last_user_query)
+
+    def _read_message_aloud(self, text: str) -> None:
+        if voice_engine and text.strip():
+            voice_engine.speak(text.strip())
+
+    def _pin_message(self, text: str) -> None:
+        if not self.state or not text.strip():
+            return
+        snippet = text.strip()[:2000]
+        self.state.session.add_pinned_context(snippet, source="user")
+        self.bridge.set_status.emit("Pinned to session context ✓")
+
+    def _on_chat_anchor(self, url: QUrl) -> None:
+        href = url.toString()
+        if href.startswith("copycode:"):
+            try:
+                code = base64.b64decode(href[9:]).decode("utf-8")
+                pyperclip.copy(code)
+                self.bridge.set_status.emit("Code copied ✓")
+            except Exception:
+                pass
+        elif href.startswith("runcode:"):
+            try:
+                rest = href[len("runcode:"):]
+                lang_b64, code_b64 = rest.split(":", 1)
+                lang = base64.b64decode(lang_b64).decode("utf-8")
+                code = base64.b64decode(code_b64).decode("utf-8")
+                self._run_code_snippet(code, lang)
+            except Exception as exc:
+                self.bridge.set_status.emit(f"Run failed: {exc}")
+
+    def _run_code_snippet(self, code: str, lang: str) -> None:
+        def _approve() -> None:
+            threading.Thread(
+                target=self._execute_code_snippet, args=(code, lang),
+                daemon=True, name="atlas-run-snippet",
+            ).start()
+
+        def _deny() -> None:
+            self.bridge.set_status.emit("Run cancelled")
+
+        self.bridge.request_permission.emit(
+            "EXECUTE", f"{lang or 'code'} snippet", _approve, _deny)
+
+    def _execute_code_snippet(self, code: str, lang: str) -> None:
+        import subprocess
+        lang_l = (lang or "").lower()
+        try:
+            if lang_l in ("python", "py", "python3"):
+                proc = subprocess.run(
+                    [sys.executable, "-c", code],
+                    capture_output=True, text=True, timeout=30,
+                )
+            elif lang_l in ("bash", "sh", "shell", "zsh"):
+                proc = subprocess.run(
+                    ["bash", "-c", code],
+                    capture_output=True, text=True, timeout=30,
+                )
+            elif lang_l in ("cmd", "powershell"):
+                proc = subprocess.run(
+                    ["powershell", "-Command", code],
+                    capture_output=True, text=True, timeout=30,
+                )
+            else:
+                self.bridge.set_status.emit(f"Unsupported language for Run: {lang}")
+                return
+            out = (proc.stdout or proc.stderr or "").strip() or "(no output)"
+            self.bridge.append_text.emit(out[:4000])
+        except Exception as exc:
+            self.bridge.set_status.emit(f"Execution error: {exc}")
+
+    def _on_chat_image_dropped(self, path: str) -> None:
+        self._attach_path(path)
+
+    def _on_composer_attach(self, path: str) -> None:
+        self._attach_path(path)
+
+    def _on_composer_screenshot(self) -> None:
+        try:
+            from atlas_core import capture_screen_b64
+            b64 = capture_screen_b64()
+        except Exception:
+            b64 = None
+        if not b64:
+            self.bridge.set_status.emit("Screenshot capture failed")
+            return
+        self._pending_attachments.append({
+            "type": "screen", "b64": b64, "label": "Screenshot",
+        })
+        chips = " · ".join(a["label"] for a in self._pending_attachments)
+        self.chat_composer.set_attach_label(f"Attached: {chips}")
+        self.bridge.set_status.emit("Screenshot attached — send your message")
+
+    def _attach_path(self, path: str) -> None:
+        p = Path(path)
+        if not p.is_file():
+            return
+        ext = p.suffix.lower()
+        if ext in _IMAGE_EXTS:
+            data = p.read_bytes()
+            b64 = base64.b64encode(data).decode("ascii")
+            self._pending_attachments.append({
+                "type": "image", "b64": b64, "label": p.name, "path": str(p),
+            })
+        elif ext in _DOC_EXTS:
+            worker = ContextIngestWorker(str(p), parent=None)
+            worker.ingest_done.connect(self._on_attach_doc_ready)
+            worker.ingest_failed.connect(self.bridge.set_status.emit)
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+            self.bridge.set_status.emit(f"Reading {p.name}…")
+            return
         else:
-            html = "<pre>" + _html.escape(md_text) + "</pre>"
+            self.bridge.set_status.emit("Unsupported attachment type")
+            return
+        chips = " · ".join(a["label"] for a in self._pending_attachments)
+        self.chat_composer.set_attach_label(f"Attached: {chips}")
 
-        def _add_copy_badge(m: "re.Match") -> str:
-            code_text = m.group(2)
-            token = base64.b64encode(code_text.encode()).decode()
-            badge = (
-                f"<div class='copy-row'>"
-                f"<a class='copy-badge' href='copycode:{token}'>⎘ Copy</a>"
-                f"</div>"
-            )
-            return m.group(1) + code_text + m.group(3) + badge
+    def _on_attach_doc_ready(self, text: str) -> None:
+        label = "Document"
+        self._pending_attachments.append({"type": "doc", "text": text, "label": label})
+        chips = " · ".join(a["label"] for a in self._pending_attachments)
+        self.chat_composer.set_attach_label(f"Attached: {chips}")
+        self.bridge.set_status.emit("Document attached ✓")
 
-        return re.sub(
-            r"(<pre><code[^>]*>)([\s\S]*?)(</code></pre>)",
-            _add_copy_badge,
-            html,
-        )
-
-    def _render_full_html(self) -> None:
-        ai_html = ""
-        if self._md_ai_streaming and self._md_ai_buffer:
-            live = self._md_to_html(self._md_ai_buffer)
-            ai_html = self._atlas_bubble_html(live, typing=False)
-        elif self._md_ai_streaming:
-            ai_html = self._atlas_bubble_html("", typing=True)
-
-        full_html = self._CODE_CSS + self._md_plain_prefix + ai_html
-        sb = self.text_area.verticalScrollBar()
-        was_at_bottom = sb.value() >= sb.maximum() - 10
-        self.text_area.setHtml(full_html)
-        if was_at_bottom or self._is_streaming:
-            sb.setValue(sb.maximum())
+    @Slot(str)
+    def _append_response(self, text: str) -> None:
+        t = text or ""
+        role = "assistant"
+        if t.startswith("[") or t.startswith("**Startup") or "Autosave" in t or "Slash commands" in t:
+            role = "system"
+        msg = self.chat_view.add_message(role, t)
+        self._chat_messages.append(msg)
+        self._md_ai_streaming = False
+        self._md_ai_buffer = ""
 
     def _render_html(self) -> None:
-        self._render_full_html()
-
-    def _atlas_bubble_html(self, body: str, typing: bool = False) -> str:
-        if typing:
-            dots = (
-                "<span class='typing-dot'>●</span>"
-                "<span class='typing-dot'>●</span>"
-                "<span class='typing-dot'>●</span>"
-            )
-            inner = dots
-        else:
-            inner = body
-        return (
-            f"<div class='atlas-bubble' style='text-align:left;max-width:85%;margin:8px 0;'>"
-            f"<span style='color:{PAL['gold']};font-weight:bold;margin-right:6px;'>◆</span>"
-            f"<div class='bubble-inner' style='display:inline-block;background:{PAL['surface_2']};"
-            f"border-radius:18px 18px 18px 4px;padding:10px 14px;'>{inner}</div></div>"
-        )
+        pass
 
     def _append_user_bubble(self, text: str) -> None:
-        import html as _html
-        esc = _html.escape(text).replace("\n", "<br>")
-        bubble = (
-            f"<div style='text-align:right;max-width:75%;margin:8px 0 8px auto;'>"
-            f"<div style='display:inline-block;background:{PAL['cyan']};color:#fff;"
-            f"border-radius:18px 18px 4px 18px;padding:10px 14px;'>{esc}</div></div>"
-        )
-        self._md_plain_prefix += bubble
-        self._chat_messages.append(
-            {"role": "user", "html": bubble, "text": text, "ts": time.time()})
-        self._render_full_html()
+        msg = self.chat_view.add_message("user", text)
+        self._chat_messages.append(msg)
 
     def _show_plus_menu(self) -> None:
         menu = QMenu(self)
@@ -4078,7 +4142,8 @@ class AtlasWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("📄 Upload Context…", self._do_upload_context)
         menu.addAction("⚙ Browse Skills…", self._open_settings_skills_tab)
-        menu.exec(self.btn_plus.mapToGlobal(self.btn_plus.rect().bottomLeft()))
+        anchor = self.chat_composer._tool_btns[-1]
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
 
     def apply_account_identity(self, name: str) -> None:
         """Reflect the signed-in user's name + avatar in the header."""
@@ -4358,8 +4423,9 @@ class AtlasWindow(QMainWindow):
                 if self._is_floating:
                     self._bubble.set_active(False)
 
-    def _handle_slash_command(self, text: str) -> None:
-        cmd = text.lower().strip()
+    def _handle_slash_command(self, text: str) -> bool:
+        cmd = text.lower().strip().split()[0]
+        args = text.strip()[len(cmd):].strip()
         if cmd == "/debug" and self.state:
             self._append_response(self.state.get_debug_state())
         elif cmd == "/clear":
@@ -4370,18 +4436,31 @@ class AtlasWindow(QMainWindow):
             self._do_reload()
         elif cmd == "/restore":
             self._restore_autosave()
-        elif cmd == "/help":
-            self._append_response(
-                "Commands: /debug /clear /export /reload /restore /help /skills /memory"
-            )
-        elif cmd == "/skills" and self.state:
-            names = [s.get("display", s.get("name")) for s in self.state.skill_registry.list_skills()]
-            self._append_response("Skills: " + (", ".join(names) if names else "(none)"))
+        elif cmd == "/guide":
+            self._submit_query(args or "Guide me through what I'm looking at")
+            return True
+        elif cmd == "/task":
+            self._submit_query(args or "Do it for me: complete this task on screen")
+            return True
+        elif cmd == "/interview":
+            self._on_focus_toggled(not getattr(self, "btn_focus", None) or not self.btn_focus.isChecked())
+        elif cmd == "/copilot":
+            if hasattr(self, "btn_copilot"):
+                self.btn_copilot.toggle()
         elif cmd == "/memory" and self.state:
             report = self.state.learning.get_learning_report()
             self._append_response(json.dumps(report, indent=2))
+        elif cmd == "/settings":
+            self._open_control_center()
+        elif cmd == "/help":
+            lines = [f"{c} — {d}" for c, d in _SLASH_COMMANDS]
+            self._append_response("Slash commands:\n" + "\n".join(lines))
+        elif cmd == "/skills" and self.state:
+            names = [s.get("display", s.get("name")) for s in self.state.skill_registry.list_skills()]
+            self._append_response("Skills: " + (", ".join(names) if names else "(none)"))
         else:
             self._append_response(f"Unknown command: {text}")
+        return True
 
     def _autosave(self) -> None:
         try:
@@ -4410,8 +4489,7 @@ class AtlasWindow(QMainWindow):
         try:
             data = json.loads(AUTOSAVE_PATH.read_text(encoding="utf-8"))
             self._chat_messages = data.get("messages", [])
-            self._md_plain_prefix = "".join(m.get("html", "") for m in self._chat_messages)
-            self._render_full_html()
+            self.chat_view.rebuild_from_messages(self._chat_messages)
             self.bridge.set_status.emit("Autosave restored ✓")
         except Exception as exc:
             self._append_response(f"Restore failed: {exc}")
@@ -4422,10 +4500,13 @@ class AtlasWindow(QMainWindow):
             return
         lines = [f"# Atlas Session — {datetime.now().isoformat()}\n"]
         for msg in self._chat_messages:
-            role = "You" if msg.get("role") == "user" else "Atlas"
-            import re
-            plain = re.sub(r"<[^>]+>", "", msg.get("html", ""))
-            lines.append(f"**{role}:** {plain.strip()}\n")
+            role = msg.get("role", "assistant")
+            who = {"user": "You", "assistant": "Atlas", "proactive": "Copilot"}.get(role, role)
+            plain = msg.get("text") or ""
+            if not plain and msg.get("html"):
+                import re
+                plain = re.sub(r"<[^>]+>", " ", msg.get("html", "")).strip()
+            lines.append(f"**{who}:** {plain.strip()}\n")
         Path(path).write_text("\n".join(lines), encoding="utf-8")
         self.bridge.set_status.emit(f"Exported → {path}")
 
@@ -4463,29 +4544,21 @@ class AtlasWindow(QMainWindow):
     def _do_stop_gen(self):
         """
         Single 'shut up' action: stops text streaming AND flushes the TTS queue.
-        Previously only stopped text generation; voice kept talking (Bug #7/#8/#9).
         """
         self._stop_gen.set()
         if self.state:
-            self.state.stop_task()   # halt any running computer-use task
+            self.state.cancel_current()
+            self.state.stop_task()
         if voice_engine:
-            voice_engine.flush()   # clear the queue
-            voice_engine.skip()    # interrupt the current utterance
+            voice_engine.flush()
+            voice_engine.skip()
+        self.chat_composer.set_streaming(False)
         self.bridge.thinking_done.emit()
         self.bridge.set_status.emit("Stopped ⏹")
 
     # ═════════════════════════════════════════════════════════════════════════
     # TEXT AREA HELPERS
     # ═════════════════════════════════════════════════════════════════════════
-
-    @Slot(str)
-    def _append_response(self, text):
-        import html as _html
-        escaped = _html.escape(text).replace("\n", "<br>")
-        self._md_plain_prefix += escaped + "<br>"
-        self._md_ai_streaming = False
-        self._md_ai_buffer    = ""
-        self._render_html()
 
     @Slot(str)
     def _set_status(self, msg: str) -> None:
@@ -4518,17 +4591,10 @@ class AtlasWindow(QMainWindow):
             self._pending_status   = ""
 
     def _on_anchor_clicked(self, url: QUrl) -> None:
-        href = url.toString()
-        if href.startswith("copycode:"):
-            try:
-                code = base64.b64decode(href[9:]).decode("utf-8")
-                pyperclip.copy(code)
-                self.bridge.set_status.emit("Code copied ✓")
-            except Exception:
-                pass
+        self._on_chat_anchor(url)
 
     def _copy_text(self):
-        pyperclip.copy(self.text_area.toPlainText())
+        pyperclip.copy(self.chat_view.plain_text())
         self.bridge.set_status.emit("Copied ✓")
 
     def _download_pdf(self):
@@ -4616,19 +4682,21 @@ class AtlasWindow(QMainWindow):
         doc.build(story)
 
     def _clear_text(self):
-        # Bug #14: stop any in-flight generation thread and silence TTS first.
-        # Previously, clearing while Atlas was mid-response produced ghost output
-        # as the background thread kept writing to the now-cleared buffer.
         self._stop_gen.set()
+        if self.state:
+            self.state.cancel_current()
         if voice_engine:
             voice_engine.flush()
             voice_engine.skip()
-        self.text_area.clear()
-        self._md_plain_prefix  = ""
-        self._md_ai_buffer     = ""
-        self._md_ai_streaming  = False
+        self.chat_view.clear()
+        self.chat_composer.set_streaming(False)
+        self._md_plain_prefix = ""
+        self._md_ai_buffer = ""
+        self._md_ai_streaming = False
         self._chat_messages = []
         self._streaming_html = ""
+        self._pending_attachments.clear()
+        self.chat_composer.set_attach_label("")
         self._token_prompt = 0
         self._token_completion = 0
         if self.state:
@@ -4675,6 +4743,15 @@ class AtlasWindow(QMainWindow):
             self.bridge.set_status.emit(status)
 
     def _on_transcript(self, text, source):
+        routed = "forward"
+        if self.state and getattr(self.state, "audio_watcher", None):
+            routed = self.state.audio_watcher.route_transcript(text, source)
+        if routed == "buffer":
+            return
+        if routed == "drop":
+            self.bridge.set_status.emit(
+                f"🎤 Heard ({source}) — ignored (you typed recently)")
+            return
         # Bug #4: emit a visible "Listening" status so the user knows the
         # mic is active and Atlas received audio — previously silent.
         self.bridge.set_status.emit(f"🎤 Heard ({source}) — processing…")
@@ -4683,7 +4760,7 @@ class AtlasWindow(QMainWindow):
         # intercepted here before reaching the LLM, so spoken control works too.
         if self.state and self._try_route_command(text):
             return
-        if self.state:
+        if self.state and routed != "consumed":
             # Drive the processing UI (gold accent + thinking bar) for the
             # voice path, mirroring the typed-query pipeline.
             self._stop_gen.clear()
@@ -4695,6 +4772,11 @@ class AtlasWindow(QMainWindow):
                 args=(text, source),
                 daemon=True,
             ).start()
+        elif self.state and routed == "consumed":
+            self._stop_gen.clear()
+            self._stream_start_ts = time.time()
+            self._is_streaming = True
+            self.bridge.start_thinking.emit()
 
     # ═════════════════════════════════════════════════════════════════════════
     # SCREEN CAPTURE + OCR
@@ -5167,7 +5249,7 @@ if __name__ == "__main__":
         win.state.set_user(chosen_uid, chosen_name)
     win.apply_account_identity(chosen_name or "Guest")
     if win.state and win.state.focus_mode:
-        win._sync_focus_ui(True)
+        win._on_focus_mode_changed(True)
     if win.telemetry and win.state:
         email = getattr(account, "email", "") if account else ""
         st = win.telemetry.check_license(email)

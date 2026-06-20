@@ -9,6 +9,8 @@ permission gate — the two never mix.
 """
 from __future__ import annotations
 
+import logging
+import sys
 from typing import Callable
 
 from PySide6.QtCore import (
@@ -25,8 +27,71 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
+_log = logging.getLogger("atlas.overlay")
 
-class HoloOverlay(QWidget):
+# Windows 10 2004 (build 19041+) — required for WDA_EXCLUDEFROMCAPTURE
+_MIN_CAPTURE_EXCLUSION_BUILD = 19041
+
+
+def capture_exclusion_supported() -> bool:
+    """True when SetWindowDisplayAffinity exclusion is available on this OS."""
+    if sys.platform != "win32":
+        return False
+    try:
+        return sys.getwindowsversion().build >= _MIN_CAPTURE_EXCLUSION_BUILD
+    except Exception:
+        return False
+
+
+def apply_capture_exclusion(hwnd_int: int, enable: bool = True) -> bool:
+    """
+    Apply or remove WDA_EXCLUDEFROMCAPTURE on *hwnd_int*.
+
+    Returns True when the API call succeeds (or when disabling on any platform).
+    Returns False when exclusion is unsupported or the call fails — never raises.
+    """
+    if enable and not capture_exclusion_supported():
+        return False
+    import ctypes
+    import ctypes.wintypes
+
+    WDA_NONE = 0x00000000
+    WDA_EXCLUDEFROMCAPTURE = 0x00000011
+    flag = WDA_EXCLUDEFROMCAPTURE if enable else WDA_NONE
+    try:
+        ok = ctypes.windll.user32.SetWindowDisplayAffinity(
+            ctypes.wintypes.HWND(hwnd_int),
+            ctypes.wintypes.DWORD(flag),
+        )
+        return bool(ok)
+    except (AttributeError, OSError) as exc:
+        _log.debug("apply_capture_exclusion failed: %s", exc)
+        return False
+
+
+class _CaptureExclusionMixin:
+    """Re-apply WDA_EXCLUDEFROMCAPTURE when the overlay HWND is shown."""
+
+    _capture_excluded: bool
+
+    def set_capture_excluded(self, excluded: bool) -> None:
+        self._capture_excluded = bool(excluded)
+        if self.isVisible():
+            self._apply_capture_exclusion_now(excluded)
+
+    def _apply_capture_exclusion_now(self, enable: bool) -> None:
+        try:
+            apply_capture_exclusion(int(self.winId()), enable)
+        except Exception as exc:
+            _log.debug("overlay capture exclusion failed: %s", exc)
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        super().showEvent(event)
+        if getattr(self, "_capture_excluded", False):
+            self._apply_capture_exclusion_now(True)
+
+
+class HoloOverlay(_CaptureExclusionMixin, QWidget):
     """Full-screen transparent overlay with animated focus ring."""
 
     def __init__(self) -> None:
@@ -60,6 +125,10 @@ class HoloOverlay(QWidget):
         self._marker_timer = QTimer(self)
         self._marker_timer.setSingleShot(True)
         self._marker_timer.timeout.connect(self.clear_markers)
+        self._capture_excluded = False
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        _CaptureExclusionMixin.showEvent(self, event)
 
     def get_ring_pos(self) -> QPointF:
         return self._ring_pos
@@ -253,7 +322,7 @@ class HoloOverlay(QWidget):
             painter.drawEllipse(self._path[-1], 5, 5)
 
 
-class AgentCursorOverlay(QWidget):
+class AgentCursorOverlay(_CaptureExclusionMixin, QWidget):
     """
     Persistent animated agent cursor — moves smoothly between targets, never
     teleports or disappears between steps.  Click-through, always on top.
@@ -280,6 +349,7 @@ class AgentCursorOverlay(QWidget):
         self._move_grp: QParallelAnimationGroup | None = None
         self._pulse_anim: QSequentialAnimationGroup | None = None
         self._on_move_done: Callable | None = None
+        self._capture_excluded = False
 
         screen = QApplication.primaryScreen()
         if screen:
@@ -287,6 +357,9 @@ class AgentCursorOverlay(QWidget):
             self._cursor_x = g.width() / 2.0
             self._cursor_y = g.height() / 2.0
         self._sync_geometry()
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        _CaptureExclusionMixin.showEvent(self, event)
 
     def get_cursor_x(self) -> float:
         return self._cursor_x

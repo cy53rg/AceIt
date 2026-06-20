@@ -51,6 +51,7 @@ Dependencies
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import logging
 import os
@@ -60,30 +61,17 @@ import re
 import subprocess
 import threading
 import time
-import wave
 from enum import Enum, auto
 from pathlib import Path
 from typing import Callable, Optional
 
-import numpy as np
 from dotenv import load_dotenv
 from groq import Groq
-
-# ── Optional Voice Activity Detection backend ─────────────────────────────────
-# webrtcvad gives us a hardened, low-latency speech/no-speech gate that runs
-# entirely on-device.  When it is unavailable we fall back to a dynamic noise
-# floor (see AudioEngine._passes_voice_gate) so the pipeline never crashes.
-try:
-    import webrtcvad  # type: ignore
-    _HAS_WEBRTCVAD = True
-except Exception:  # pragma: no cover - optional dependency
-    webrtcvad = None  # type: ignore
-    _HAS_WEBRTCVAD = False
 
 from atlas_learning import LearningEngine
 from atlas_memory import UserMemory
 from atlas_skills import SkillRegistry
-from atlas_logging import get_logger, setup_logging, task_scope, new_task_id
+from atlas_logging import get_logger, setup_logging, task_scope, new_task_id, log_outcome_json
 from atlas_stepevent import StepOrchestrator
 
 setup_logging()
@@ -105,25 +93,128 @@ if platform.system() == "Windows":
 
 load_dotenv()
 
-# ── Per-monitor DPI awareness (Windows) ───────────────────────────────────────
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+# ── Groq model registry (override via .env) ───────────────────────────────────
+# ATLAS_CHAT_MODEL   — default chat model for queries
+# ATLAS_VISION_MODEL — vision model for screen locate / GUIDE / DO / TASK
+_default_chat = "openai/gpt-oss-120b"
+GROQ_MODEL = (os.environ.get("ATLAS_CHAT_MODEL") or _default_chat).strip() or _default_chat
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+_TASK_MAX_STEPS_DEFAULT = 40
+_TASK_MAX_STEPS = max(1, int(os.environ.get("ATLAS_MAX_STEPS") or _TASK_MAX_STEPS_DEFAULT))
+
+_default_fast_model = "llama-3.1-8b-instant"
+ATLAS_FAST_MODEL = (
+    os.environ.get("ATLAS_FAST_MODEL") or _default_fast_model
+).strip() or _default_fast_model
+
+_default_webcam = "meta-llama/llama-4-scout-17b-16e-instruct"
+ATLAS_WEBCAM_MODEL = (
+    os.environ.get("ATLAS_WEBCAM_MODEL") or _default_webcam
+).strip() or _default_webcam
 
 GROQ_MODELS: list[str] = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
 ]
 
 GROQ_MODEL_LABELS: dict[str, str] = {
+    "openai/gpt-oss-120b":     "GPT OSS 120B",
+    "openai/gpt-oss-20b":      "GPT OSS 20B (Fast)",
     "llama-3.3-70b-versatile": "Llama 3.3 70B",
-    "llama-3.1-8b-instant":    "Llama 3.1 8B",
-    "mixtral-8x7b-32768":      "Mixtral 8×7B",
-    "gemma2-9b-it":            "Gemma 2 9B",
+    "llama-3.1-8b-instant":    "Llama 3.1 8B (Fast)",
 }
+
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+
+from atlas_vision import (
+    GROQ_VISION_MODEL,
+    SpatialBrain,
+    ScreenWatcher,
+    capture_screen_b64,
+    last_capture_scale,
+    base64_encode,
+    base64_decode,
+    _HAS_SCREEN_DEPS,
+    _SCREEN_POLL_INTERVAL,
+    _ERROR_DETECT_PROMPT,
+)
+from atlas_recorder import (
+    RoutineRecorder,
+    StreamBracketFilter,
+    ActionTokenPatterns,
+)
+from atlas_audio import (
+    ATLAS_WHISPER_MODEL,
+    AudioEngine,
+    AudioWatcher,
+    ElevenLabsVoiceEngine,
+    KokoroVoiceEngine,
+    VoiceRouter,
+    voice_engine,
+)
+
+# Backward-compatible alias used by StateEngine streaming filter
+_StreamBracketFilter = StreamBracketFilter
+
+# Minimal 1×1 PNG for vision-model health probes.
+_TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAD0lEQVQImWP4"
+    "DwABBAEAAP//AAAAAH0CQQAAAABJRU5ErkJggg=="
+)
+
+
+def _groq_model_retired(exc: BaseException) -> bool:
+    """True when Groq reports a model id is gone or decommissioned."""
+    msg = str(exc).lower()
+    return any(
+        k in msg
+        for k in (
+            "model_decommissioned",
+            "model_not_found",
+            "decommissioned",
+            "does not exist",
+            "no longer supported",
+        )
+    )
+
+
+def _probe_groq_model(model: str, *, vision: bool = False) -> bool:
+    """
+    Return True if the model id is retired / not found.
+
+    Makes a minimal max_tokens=1 call.  Other errors are ignored (network, rate
+    limit, etc.) so startup is not blocked.
+    """
+    if not model or not os.environ.get("GROQ_API_KEY"):
+        return False
+    try:
+        if vision:
+            messages = [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_TINY_PNG_B64}"},
+                    },
+                    {"type": "text", "text": "ping"},
+                ],
+            }]
+        else:
+            messages = [{"role": "user", "content": "ping"}]
+        groq_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=1,
+            temperature=0,
+        )
+        return False
+    except Exception as exc:
+        if _groq_model_retired(exc):
+            return True
+        log.debug("Model health probe non-fatal for %r: %s", model, exc)
+        return False
 
 RESPONSE_STYLES: list[str] = ["Terse", "Direct", "Balanced", "Detailed"]
 
@@ -448,378 +539,8 @@ MODE_SYSTEMS = {
 # 4.  STATE ENGINE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def base64_encode(data: bytes) -> str:
-    import base64
-
-    return base64.b64encode(data).decode("utf-8")
 
 
-# Scale factor from the most recent capture_screen_b64() call (1.0 = full resolution).
-_LAST_CAPTURE_SCALE: float = 1.0
-
-
-def last_capture_scale() -> float:
-    """Return the pixel scale for the last downscaled screen capture."""
-    return _LAST_CAPTURE_SCALE
-
-
-def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
-    """
-    Grab the primary display silently and return a base64 PNG, or None.
-
-    Prefers ``mss`` (fast, headless) and falls back to Pillow ImageGrab.  The
-    frame is downscaled to ``max_width`` so vision calls stay quick — Interview
-    Mode captures one of these before every query so the LLM can actually see
-    the screen and never claims it cannot.
-
-    Vision models return coordinates in *image* pixel space; multiply by
-    ``last_capture_scale()`` to map clicks and overlay markers to the desktop.
-    """
-    global _LAST_CAPTURE_SCALE
-    _LAST_CAPTURE_SCALE = 1.0
-    try:
-        from PIL import Image
-        try:
-            import mss  # type: ignore
-
-            with mss.mss() as sct:
-                shot = sct.grab(sct.monitors[0])
-                img = Image.frombytes("RGB", shot.size, shot.rgb)
-        except Exception:
-            from PIL import ImageGrab
-
-            img = ImageGrab.grab().convert("RGB")
-
-        if img.width > max_width:
-            orig_w = img.width
-            ratio = max_width / float(orig_w)
-            img = img.resize((max_width, int(img.height * ratio)))
-            _LAST_CAPTURE_SCALE = orig_w / float(max_width)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64_encode(buf.getvalue())
-    except Exception as exc:  # pragma: no cover - capture is best-effort
-        log.debug("capture_screen_b64 failed: %s", exc)
-        return None
-
-
-class SpatialBrain:
-    """
-    Vision-based locator that resolves textual UI targets to absolute pixels.
-
-    locate() returns:
-        {"found": true|false, "x": int, "y": int, "w": int, "h": int}
-    """
-
-    _JSON_RE = re.compile(r"\{[\s\S]*\}")
-
-    def __init__(self, client: Groq, model: str = GROQ_VISION_MODEL) -> None:
-        self.client = client
-        self.model = model
-
-    def capture_screen_png_b64(self) -> str:
-        try:
-            from PIL import ImageGrab
-        except ImportError as exc:
-            raise RuntimeError("Pillow ImageGrab is required for spatial location") from exc
-
-        img = ImageGrab.grab()
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64_encode(buf.getvalue())
-
-    def locate(
-        self,
-        target: str,
-        screen_b64: Optional[str] = None,
-        scale: Optional[float] = None,
-    ) -> dict:
-        clean_target = (target or "").strip()
-        if not clean_target:
-            return {"found": False, "x": 0, "y": 0, "w": 0, "h": 0}
-
-        if screen_b64 is None:
-            frame = self.capture_screen_png_b64()
-            scale = 1.0
-        else:
-            frame = screen_b64
-            if scale is None:
-                scale = last_capture_scale()
-        instruction = (
-            "You are a UI coordinate locator. Find the requested target in the screenshot. "
-            "Return strict JSON only with pixel coordinates IN THIS IMAGE (top-left origin): "
-            "{\"found\":true,\"x\":int,\"y\":int,\"w\":int,\"h\":int}. "
-            "If not visible, return {\"found\":false,\"x\":0,\"y\":0,\"w\":0,\"h\":0}. "
-            f"Target: {clean_target}"
-        )
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{frame}"},
-                        },
-                        {"type": "text", "text": instruction},
-                    ],
-                }
-            ],
-            temperature=0,
-            max_tokens=160,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        match = self._JSON_RE.search(raw)
-        data = json.loads(match.group(0) if match else raw)
-        sf = float(scale or 1.0)
-        return {
-            "found": bool(data.get("found", False)),
-            "x": int(round(int(data.get("x", 0) or 0) * sf)),
-            "y": int(round(int(data.get("y", 0) or 0) * sf)),
-            "w": int(round(int(data.get("w", 0) or 0) * sf)),
-            "h": int(round(int(data.get("h", 0) or 0) * sf)),
-        }
-
-
-class RoutineRecorder:
-    """
-    Captures a user demonstration (clicks + keystrokes) for Learn-and-Execute.
-
-    Uses ``pynput`` to observe global mouse/keyboard input.  Each click stores a
-    small screenshot crop around the cursor so the demonstration can later be
-    *generalised* (by the vision model) into UI targets that are located fresh
-    at replay time — robust to layout/resolution changes, unlike brittle
-    absolute coordinates.  Printable keystrokes are coalesced into ``type``
-    events; modifier combos become ``hotkey`` events.
-    """
-
-    _CROP_W, _CROP_H = 380, 240
-    _DOUBLE_CLICK_S = 0.40
-    _MODS = {
-        "ctrl", "ctrl_l", "ctrl_r", "alt", "alt_l", "alt_r", "alt_gr",
-        "cmd", "cmd_l", "cmd_r", "shift", "shift_l", "shift_r",
-    }
-
-    def __init__(self) -> None:
-        self.events: list[dict] = []
-        self._text_buf: list[str] = []
-        self._mouse = None
-        self._kbd = None
-        self._active = False
-        self._lock = threading.Lock()
-        self._mods: set[str] = set()
-        self._last_click = (0.0, 0, 0)
-
-    @property
-    def active(self) -> bool:
-        return self._active
-
-    def start(self) -> bool:
-        try:
-            from pynput import mouse, keyboard
-        except Exception as exc:
-            log.warning("pynput unavailable; cannot record demonstration: %s", exc)
-            return False
-        if self._active:
-            return True
-        self.events.clear()
-        self._text_buf.clear()
-        self._mods.clear()
-        self._last_click = (0.0, 0, 0)
-        self._mouse = mouse.Listener(on_click=self._on_click)
-        self._kbd = keyboard.Listener(
-            on_press=self._on_press, on_release=self._on_release)
-        self._mouse.start()
-        self._kbd.start()
-        self._active = True
-        return True
-
-    def stop(self, drop_last_click: bool = True) -> list[dict]:
-        self._active = False
-        self._flush_text()
-        for listener in (self._mouse, self._kbd):
-            try:
-                if listener:
-                    listener.stop()
-            except Exception:
-                pass
-        self._mouse = self._kbd = None
-        # The user's final action is usually clicking Atlas's Stop button — drop
-        # that trailing click so it doesn't become a replay step.
-        if drop_last_click and self.events and self.events[-1].get("type") == "click":
-            self.events.pop()
-        return list(self.events)
-
-    # ── input handlers ─────────────────────────────────────────────────────────
-
-    def _flush_text(self) -> None:
-        with self._lock:
-            if self._text_buf:
-                text = "".join(self._text_buf)
-                self._text_buf.clear()
-                if text.strip():
-                    self.events.append({"type": "type", "text": text})
-
-    def _on_click(self, x, y, button, pressed) -> None:
-        if not pressed or not self._active:
-            return
-        self._flush_text()
-        now = time.time()
-        lt, lx, ly = self._last_click
-        double = (now - lt < self._DOUBLE_CLICK_S
-                  and abs(x - lx) < 6 and abs(y - ly) < 6)
-        self._last_click = (now, x, y)
-        self.events.append({
-            "type": "click", "x": int(x), "y": int(y),
-            "button": getattr(button, "name", "left"),
-            "double": bool(double), "crop_b64": self._grab_crop(x, y),
-        })
-
-    def _grab_crop(self, x, y) -> Optional[str]:
-        try:
-            from PIL import ImageGrab
-            img = ImageGrab.grab()
-            left = max(0, int(x) - self._CROP_W // 2)
-            top = max(0, int(y) - self._CROP_H // 2)
-            right = min(img.width, left + self._CROP_W)
-            bottom = min(img.height, top + self._CROP_H)
-            crop = img.crop((left, top, right, bottom))
-            buf = io.BytesIO()
-            crop.save(buf, format="PNG")
-            return base64_encode(buf.getvalue())
-        except Exception:
-            return None
-
-    @staticmethod
-    def _key_name(key) -> str:
-        char = getattr(key, "char", None)
-        if char is not None:
-            return char
-        return (getattr(key, "name", None) or str(key).replace("Key.", "")).strip()
-
-    @staticmethod
-    def _norm_mod(name: str) -> str:
-        return name.replace("_l", "").replace("_r", "").replace("_gr", "")
-
-    def _on_press(self, key) -> None:
-        if not self._active:
-            return
-        name = self._key_name(key)
-        if not name:
-            return
-        if name in self._MODS:
-            self._mods.add(self._norm_mod(name))
-            return
-        base = self._norm_mod(name)
-        active_mods = {m for m in self._mods if m != "shift"}
-        if active_mods:   # ctrl/alt/cmd held → a shortcut, not typing
-            self._flush_text()
-            self.events.append({"type": "hotkey",
-                                "keys": sorted(active_mods) + [base]})
-            return
-        if len(name) == 1:           # printable character
-            with self._lock:
-                self._text_buf.append(name)
-            return
-        if base == "space":
-            with self._lock:
-                self._text_buf.append(" ")
-            return
-        if base == "backspace":
-            with self._lock:
-                if self._text_buf:
-                    self._text_buf.pop()
-                    return
-        self._flush_text()
-        self.events.append({"type": "key", "key": base})
-
-    def _on_release(self, key) -> None:
-        name = self._key_name(key)
-        if name in self._MODS:
-            self._mods.discard(self._norm_mod(name))
-
-
-class _StreamBracketFilter:
-    """
-    Incrementally strips ``[[GUIDE:…]]`` / ``[[DO:…]]`` action tokens out of a
-    streaming LLM response so they never reach the chat view or the TTS engine,
-    while surfacing each completed token exactly once for the action dispatcher.
-
-    Plain double-brackets that are NOT a GUIDE/DO schema (e.g. ``list[[0]]`` in a
-    code answer) are passed through untouched.
-
-    Usage
-    -----
-        visible, tokens = filt.feed(delta)   # per stream chunk
-        tail            = filt.flush()       # at stream end
-    """
-
-    _PREFIX_RE = re.compile(r"\[\[\s*(?:GUIDE|DO|TASK)\s*:", re.IGNORECASE)
-
-    def __init__(self) -> None:
-        self._buf = ""
-        self._in_token = False
-
-    @staticmethod
-    def _maybe_prefix(buf: str) -> bool:
-        """True while ``buf`` (starting with '[[') could still grow into a token."""
-        s = buf[2:].lstrip().lower()
-        if s == "":
-            return True
-        return any(kw.startswith(s) for kw in ("guide:", "do:", "task:"))
-
-    def feed(self, delta: str) -> tuple[str, list[str]]:
-        self._buf += delta
-        visible = ""
-        tokens: list[str] = []
-        while self._buf:
-            if self._in_token:
-                j = self._buf.find("]]")
-                if j == -1:
-                    break  # token still streaming — hold
-                tokens.append(self._buf[: j + 2])
-                self._buf = self._buf[j + 2:]
-                self._in_token = False
-                continue
-            i = self._buf.find("[[")
-            if i == -1:
-                # Hold a lone trailing '[' in case it becomes '[[' next chunk.
-                if self._buf.endswith("["):
-                    visible += self._buf[:-1]
-                    self._buf = self._buf[-1:]
-                else:
-                    visible += self._buf
-                    self._buf = ""
-                break
-            if i > 0:
-                visible += self._buf[:i]
-                self._buf = self._buf[i:]
-            # self._buf now starts with "[["
-            if self._PREFIX_RE.match(self._buf):
-                self._in_token = True
-                continue
-            if self._maybe_prefix(self._buf):
-                break  # not enough chars yet to decide — wait for more
-            visible += self._buf[:2]      # ordinary "[[" — pass through
-            self._buf = self._buf[2:]
-        return visible, tokens
-
-    def flush(self) -> tuple[str, list[str]]:
-        """Return leftover visible text and any complete token held at stream end."""
-        tokens: list[str] = []
-        if self._in_token:
-            j = self._buf.find("]]")
-            if j != -1:
-                tokens.append(self._buf[: j + 2])
-                visible = self._buf[j + 2 :]
-            else:
-                visible = self._buf
-        else:
-            visible = self._buf
-        self._buf = ""
-        self._in_token = False
-        return visible, tokens
 
 
 class StateEngine:
@@ -865,15 +586,8 @@ class StateEngine:
     # engine can drive the HUD ("GUIDE") or autonomous automation ("DO").
     #   [[GUIDE: target_name | instruction text]]
     #   [[DO:    target_name | action_type]]
-    _ACTION_TOKEN_RE = re.compile(
-        r"\[\[\s*(GUIDE|DO)\s*:\s*([^|\]]+?)\s*\|\s*([^\]]*?)\s*\]\]",
-        re.IGNORECASE,
-    )
-    #   [[TASK: full multi-step goal in plain language]]
-    _TASK_TOKEN_RE = re.compile(
-        r"\[\[\s*TASK\s*:\s*(.+?)\s*\]\]",
-        re.IGNORECASE | re.DOTALL,
-    )
+    _ACTION_TOKEN_RE = ActionTokenPatterns._ACTION_TOKEN_RE
+    _TASK_TOKEN_RE = ActionTokenPatterns._TASK_TOKEN_RE
 
     def _dispatch_action_token(self, raw: str) -> None:
         """Parse one captured ``[[GUIDE/DO/TASK:…]]`` token and run it off-thread."""
@@ -945,7 +659,7 @@ class StateEngine:
     # the vision model sees the current screen + actions taken so far and returns
     # a single JSON action, which is executed via atlas_hands until "done".
 
-    _TASK_MAX_STEPS = 16     # hard ceiling so a confused agent can't loop forever
+    _TASK_MAX_STEPS = _TASK_MAX_STEPS  # env ATLAS_MAX_STEPS (module-level)
     _TASK_SETTLE_S  = 0.8    # pause after each action for the UI to react
 
     def run_task(self, task: str) -> None:
@@ -1442,8 +1156,32 @@ class StateEngine:
             log.warning("_describe_click failed: %s", exc)
             return "the clicked element"
 
+    def _log_task_step(
+        self,
+        step_no: int,
+        action: str,
+        result: str,
+        screen_hash: str,
+    ) -> None:
+        try:
+            status = "success"
+            low = (result or "").lower()
+            if "stuck" in low or "denied" in low or low.startswith("error"):
+                status = "error"
+            elif "not visible" in low or "failed" in low or "unknown" in low:
+                status = "error"
+            log_outcome_json({
+                "step": step_no,
+                "action": action,
+                "result": status,
+                "screen_hash": screen_hash,
+            })
+        except Exception:
+            pass
+
     def _task_loop(self, task: str) -> None:
         steps: list[dict] = []
+        screen_hashes: list[str] = []
         try:
             self._emit("task_status", {"text": f"▶ Task: {task}"})
             voice_engine.speak("On it.")
@@ -1452,9 +1190,21 @@ class StateEngine:
                     self._emit("task_status", {"text": "■ Task stopped."})
                     break
                 frame = capture_screen_b64()
+                screen_hash = hashlib.md5((frame or "").encode("ascii")).hexdigest()
+                screen_hashes.append(screen_hash)
+                if len(screen_hashes) >= 3 and len(set(screen_hashes[-3:])) == 1:
+                    stuck_msg = (
+                        "The screen hasn't changed for several steps — "
+                        "stopping because the agent appears stuck."
+                    )
+                    self._emit("task_status", {"text": f"✗ {stuck_msg}"})
+                    voice_engine.speak(stuck_msg)
+                    self._log_task_step(step_no, "stuck", "stuck", screen_hash)
+                    break
                 decision = self._decide_next_step(task, steps, frame)
                 if not decision:
                     self._emit("task_status", {"text": "Couldn't plan the next step."})
+                    self._log_task_step(step_no, "plan", "error", screen_hash)
                     break
                 action = str(decision.get("action", "")).lower().strip()
                 say    = (decision.get("say") or decision.get("thought") or "").strip()
@@ -1465,18 +1215,27 @@ class StateEngine:
                     summary = decision.get("summary") or "Task complete."
                     self._emit("task_status", {"text": f"✓ {summary}"})
                     voice_engine.speak(summary)
+                    self._log_task_step(step_no, action, "success", screen_hash)
                     break
                 if action in ("fail", "abort", "stuck", "error"):
                     reason = decision.get("reason") or "I couldn't complete that."
                     self._emit("task_status", {"text": f"✗ {reason}"})
                     voice_engine.speak(reason)
+                    self._log_task_step(step_no, action, "error", screen_hash)
                     break
                 result = self._execute_step(action, decision)
                 steps.append({"step": step_no, "action": action,
                               "detail": decision, "result": result})
+                self._log_task_step(step_no, action, result, screen_hash)
             else:
                 self._emit("task_status", {"text": "Reached step limit; stopping."})
                 voice_engine.speak("I've reached my step limit, so I'll stop here.")
+                self._log_task_step(
+                    self._TASK_MAX_STEPS,
+                    "step_limit",
+                    "error",
+                    screen_hashes[-1] if screen_hashes else "",
+                )
         except Exception as exc:
             log.error("task loop failed: %s", exc)
             self._emit("task_status", {"text": f"Task error: {exc}"})
@@ -1697,10 +1456,43 @@ class StateEngine:
         self.spatial = SpatialBrain(groq_client)
         self._recorder: Optional[RoutineRecorder] = None
         self.screen_vision = False   # set True by the UI while the watcher runs
+        self._copilot_active = False
+        self.screen_watcher = ScreenWatcher(
+            client=groq_client,
+            model=GROQ_VISION_MODEL,
+            on_proactive=lambda payload: self._emit("proactive_alert", payload),
+        )
+        self.audio_watcher = AudioWatcher(
+            on_voice_input=lambda t: self.handle_input(t, source="mic"),
+        )
         self.execution_blocked = False
         # Safety mode: off = auto actions, always = confirm each action, trusted = confirm once per session
         self.safety_mode = str(self.get_user_prefs().get("safety_mode", "off"))
         self._safety_session_ok = False
+        threading.Thread(
+            target=self._model_health_check,
+            daemon=True,
+            name="atlas-model-health",
+        ).start()
+
+    def _model_health_check(self) -> None:
+        """Once per session: probe chat + vision models off the UI thread."""
+        probes = (
+            ("chat", GROQ_MODEL, False),
+            ("vision", GROQ_VISION_MODEL, True),
+        )
+        for role, model_id, is_vision in probes:
+            if _probe_groq_model(model_id, vision=is_vision):
+                self._emit("model_retired", {
+                    "role": role,
+                    "model": model_id,
+                    "message": (
+                        f"⚠ Your {role} model was retired by Groq — go to Settings → Model "
+                        f"to pick a replacement."
+                    ),
+                    "persistent": True,
+                })
+                log.error("Groq model retired or not found: %s (%s)", model_id, role)
 
     def get_system_prompt(self) -> str:
         """Effective system prompt for the current mode + focus toggle."""
@@ -1836,8 +1628,10 @@ class StateEngine:
     _SCREEN_PHRASES = (
         "my screen", "the screen", "on screen", "on my screen", "see this",
         "see my", "what do you see", "what can you see", "look at this",
-        "look at my", "this page", "this window", "right now on", "what's on",
-        "whats on", "can you see", "are you seeing", "what am i looking",
+        "look at my", "look at my screen", "this page", "this window",
+        "right now on", "what's on", "whats on", "what's happening",
+        "whats happening", "can you see", "are you seeing", "what am i looking",
+        "help with this error",
     )
 
     def set_screen_vision(self, enabled: bool) -> None:
@@ -1939,6 +1733,9 @@ class StateEngine:
             self._push_context(text)
             return
 
+        if source == "user":
+            self.audio_watcher.mark_user_typed()
+
         # FIX-2: Non-blocking semaphore acquisition — drop concurrent overlaps.
         acquired = self._query_semaphore.acquire(blocking=False)
         if not acquired:
@@ -1964,6 +1761,20 @@ class StateEngine:
                 f"{text}"
             )
 
+        audio_ctx = self.audio_watcher.get_audio_context(20.0)
+        if audio_ctx:
+            enriched_input = (
+                f"Audio context from the user's screen: [{audio_ctx}]\n\n"
+                f"{enriched_input}"
+            )
+
+        screen_analyzed = False
+        if source in ("user", "mic", "highlight", "capture") and self._mentions_screen(text):
+            analysis = self.screen_watcher.take_and_analyze(text)
+            if analysis:
+                enriched_input = f"[SCREEN ANALYSIS]\n{analysis}\n\n{enriched_input}"
+                screen_analyzed = True
+
         # ── Grab the screen silently so Atlas can SEE it ──────────────────────
         # Captured headlessly here (off the UI thread — handle_input already runs
         # on a worker) and attached as a vision frame to this query.  We capture
@@ -1971,10 +1782,13 @@ class StateEngine:
         # (e.g. the screen watcher is active), or when the user references their
         # screen — so "can you see my screen?" actually works.
         wants_screen = (
-            self.focus_mode
-            or self.mode in (ModeState.INTERVIEW, ModeState.GUIDED)
-            or getattr(self, "screen_vision", False)
-            or self._mentions_screen(text)
+            not screen_analyzed
+            and (
+                self.focus_mode
+                or self.mode in (ModeState.INTERVIEW, ModeState.GUIDED)
+                or getattr(self, "screen_vision", False)
+                or self._mentions_screen(text)
+            )
         )
         if wants_screen and self._pending_screen_b64 is None:
             frame = capture_screen_b64()
@@ -2519,1368 +2333,19 @@ class StateEngine:
             f"  Voice engine:     {getattr(voice_engine, 'active_engine', 'kokoro')}\n"
         )
 
+    # ── Copilot (passive screen + audio awareness) ────────────────────────────
+
+    def set_copilot_mode(self, active: bool) -> None:
+        """Start/stop passive screen polling and optional always-on voice."""
+        self._copilot_active = bool(active)
+        if active:
+            self.screen_watcher.start_watching()
+        else:
+            self.screen_watcher.stop_watching()
+        self.audio_watcher.set_copilot(active)
+        self._emit("copilot_changed", {"active": self._copilot_active})
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 5.  AUDIO ENGINE  (Groq Whisper STT)
-# ═════════════════════════════════════════════════════════════════════════════
 
-class AudioEngine:
-    """
-    Microphone and speaker-loopback capture using Groq Whisper for
-    speech-to-text transcription.
-
-    Both capture loops run as daemon threads.  Silence is detected via RMS
-    threshold before any API call is made, keeping costs minimal.
-
-    Callbacks
-    ---------
-    on_transcript(text: str, source: str)
-        Fired with the transcribed text and its origin ("mic" or "speaker").
-
-    on_status(message: str)
-        Fired with human-readable status updates (start, stop, errors).
-    """
-
-    _MIC_RATE         = 16_000
-    _MIC_CHUNK_S      = 3
-    _MIC_SILENCE_RMS  = 0.02   # raised from 0.01 — more aggressive silence gate
-    _SPK_RATE         = 16_000
-    _SPK_CHUNK_S      = 3
-    _SPK_SILENCE_RMS  = 0.015  # raised from 0.005 — more aggressive silence gate
-
-    # ── Anti-hallucination voice gate ─────────────────────────────────────────
-    # Two-stage gate applied to every captured chunk BEFORE it can reach the
-    # Groq Whisper network call:
-    #   Stage 1  Raw energy (RMS) floor — instantly drops dead-air / DC offset.
-    #   Stage 2  webrtcvad voice-confidence gate — drops ambient static, fans,
-    #            keyboard noise, and room tone that survive the RMS check.
-    # Static that slips through is what makes Whisper hallucinate foreign-script
-    # phrases (Arabic "أهلا", Urdu, etc.), so we keep this gate strict.
-    _VAD_AGGRESSIVENESS = 2      # 0 (lenient) .. 3 (very aggressive)
-    _VAD_FRAME_MS       = 30     # webrtcvad accepts 10 / 20 / 30 ms frames
-    _VAD_VOICED_RATIO   = 0.55   # fraction of frames that must register speech
-    _VAD_RMS_FLOOR      = 0.012  # hard energy gate that runs ahead of the VAD
-
-    # Push-to-Talk is EXPLICIT user intent (a key is held), so there is no
-    # ambient-hallucination risk — we only reject a near-silent recording and
-    # skip the aggressive VAD ratio that can clip real, quiet speech.
-    _PTT_MIN_RMS        = 0.006
-
-    # ── Conversation listening (tap-to-talk + silence endpointing) ────────────
-    # The user taps the hotkey to start listening; we capture continuously and
-    # auto-finalise once they pause for _ENDPOINT_SILENCE_S after speaking.
-    _LISTEN_RATE         = 16_000
-    _LISTEN_FRAME_MS     = 30      # 480 samples @ 16 kHz — valid webrtcvad frame
-    _ENDPOINT_SILENCE_S  = 3.0     # trailing silence that ends the utterance
-    _LISTEN_MIN_SPEECH_S = 0.30    # ignore sub-300 ms blips (clicks, taps)
-    _LISTEN_MAX_S        = 30.0    # hard safety cap on a single utterance
-    _LISTEN_PREROLL_S    = 0.30    # audio kept just before speech onset
-    _LISTEN_TAIL_KEEP_S  = 0.30    # trailing silence kept before Whisper
-    _LISTEN_ABS_FLOOR    = 0.010   # absolute RMS floor for the fallback detector
-
-    def __init__(
-        self,
-        on_transcript: Callable[[str, str], None],
-        on_status:     Callable[[str], None],
-        on_state:      Optional[Callable[[str], None]] = None,
-    ) -> None:
-        self._on_transcript = on_transcript
-        self._on_status     = on_status
-        # on_state(state) — "listening" | "processing" | "idle".  Lets the UI
-        # drive the accent engine for the conversation loop.
-        self._on_state      = on_state or (lambda _s: None)
-        self.mic_active     = False
-        self.speaker_active = False
-        self._mic_stop      = threading.Event()
-        self._spk_stop      = threading.Event()
-        self.ptt_active     = False
-        self._ptt_lock      = threading.Lock()
-        self._ptt_frames: list[np.ndarray] = []
-        self._ptt_stream    = None
-
-        # Conversation listening session state.
-        self.is_listening   = False
-        self._listen_stop   = threading.Event()
-        self._finalize_now  = threading.Event()
-        self._listen_cancel = threading.Event()
-        self._listen_thread: Optional[threading.Thread] = None
-        self._listen_floor  = 0.005
-
-        # Voice-activity detector — None when webrtcvad is unavailable, in which
-        # case _passes_voice_gate() falls back to a dynamic noise-floor estimate.
-        self._vad = None
-        if _HAS_WEBRTCVAD:
-            try:
-                self._vad = webrtcvad.Vad(self._VAD_AGGRESSIVENESS)
-            except Exception as exc:  # pragma: no cover - defensive
-                log.warning("webrtcvad init failed (%s); using RMS noise floor.", exc)
-                self._vad = None
-
-        # Dynamic noise-floor estimate used by the fallback gate.
-        self._noise_floor = 0.005
-        self._noise_lock  = threading.Lock()
-
-    # ── Voice-activity gate (anti-hallucination) ──────────────────────────────
-
-    def _passes_voice_gate(self, audio: "np.ndarray", rate: int) -> bool:
-        """
-        Return True only when *audio* contains real speech.
-
-        Stage 1 — raw RMS energy floor.  Cheap and catches silence/DC offset.
-        Stage 2 — webrtcvad voiced-frame ratio when the backend is present;
-                  otherwise a dynamic noise-floor comparison.
-
-        Any chunk that fails is dropped before it ever reaches the network, so
-        ambient static can no longer trigger Whisper foreign-language
-        hallucinations.
-        """
-        flat = np.asarray(audio, dtype=np.float32).flatten()
-        if flat.size == 0:
-            return False
-
-        rms = float(np.sqrt(np.mean(flat ** 2)))
-        if rms < self._VAD_RMS_FLOOR:
-            return False
-
-        if self._vad is None:
-            return self._dynamic_floor_pass(rms)
-
-        # webrtcvad requires 16-bit mono PCM at 8/16/32/48 kHz.
-        pcm = (np.clip(flat, -1.0, 1.0) * 32_767.0).astype(np.int16).tobytes()
-        frame_bytes = int(rate * (self._VAD_FRAME_MS / 1000.0)) * 2  # 2 bytes/sample
-        if frame_bytes <= 0:
-            return self._dynamic_floor_pass(rms)
-
-        voiced = 0
-        total  = 0
-        for offset in range(0, len(pcm) - frame_bytes + 1, frame_bytes):
-            frame = pcm[offset:offset + frame_bytes]
-            total += 1
-            try:
-                if self._vad.is_speech(frame, rate):
-                    voiced += 1
-            except Exception:
-                continue
-
-        if total == 0:
-            return self._dynamic_floor_pass(rms)
-        return (voiced / total) >= self._VAD_VOICED_RATIO
-
-    def _dynamic_floor_pass(self, rms: float) -> bool:
-        """
-        Lightweight adaptive noise-floor gate used when webrtcvad is absent.
-
-        The floor tracks quiet samples with an exponential moving average; a
-        chunk must exceed ~3× the learned floor to be treated as speech.
-        """
-        with self._noise_lock:
-            if rms < self._noise_floor * 1.5:
-                # Likely background — fold it into the running noise estimate.
-                self._noise_floor = 0.95 * self._noise_floor + 0.05 * rms
-            threshold = max(self._VAD_RMS_FLOOR, self._noise_floor * 3.0)
-        return rms >= threshold
-
-    # ── Conversation listening (tap-to-talk + silence endpointing) ────────────
-
-    def start_listening(self) -> None:
-        """
-        Begin a continuous listening session.
-
-        Captures audio until the speaker pauses for ``_ENDPOINT_SILENCE_S`` (or
-        ``finalize_now()`` / ``_LISTEN_MAX_S`` fires), then transcribes the whole
-        utterance in one shot — eliminating the chopped 3-second windows that
-        caused poor understanding and hallucinations.
-        """
-        if self.is_listening:
-            return
-        try:
-            import sounddevice  # noqa: F401  (import-time availability check)
-        except ImportError:
-            self._on_status("🎧 sounddevice not installed")
-            return
-
-        self.is_listening = True
-        self._listen_stop.clear()
-        self._finalize_now.clear()
-        self._listen_cancel.clear()
-        self._listen_floor = 0.005
-        self._on_state("listening")
-        self._on_status("🎧 Listening…")
-        self._listen_thread = threading.Thread(
-            target=self._listen_loop, daemon=True, name="atlas-listen"
-        )
-        self._listen_thread.start()
-
-    def finalize_listening(self) -> None:
-        """Stop capturing immediately and transcribe whatever was collected."""
-        if self.is_listening:
-            self._finalize_now.set()
-
-    def cancel_listening(self) -> None:
-        """Abort the listening session without transcribing."""
-        if self.is_listening:
-            self._listen_cancel.set()
-            self._listen_stop.set()
-
-    def _frame_is_voiced(self, frame: "np.ndarray", rate: int) -> bool:
-        """Per-frame speech decision (webrtcvad when present, else adaptive RMS)."""
-        rms = float(np.sqrt(np.mean(frame ** 2)))
-        if self._vad is not None:
-            pcm = (np.clip(frame, -1.0, 1.0) * 32_767.0).astype(np.int16).tobytes()
-            try:
-                return bool(self._vad.is_speech(pcm, rate))
-            except Exception:
-                pass
-        # Adaptive fallback — learn the room tone, require a clear margin above it.
-        with self._noise_lock:
-            if rms < self._listen_floor * 1.5:
-                self._listen_floor = 0.9 * self._listen_floor + 0.1 * rms
-            threshold = max(self._LISTEN_ABS_FLOOR, self._listen_floor * 2.5)
-        return rms > threshold
-
-    def _listen_loop(self) -> None:
-        import queue as _queue
-
-        import sounddevice as sd
-
-        rate      = self._LISTEN_RATE
-        frame_len = int(rate * self._LISTEN_FRAME_MS / 1000.0)
-        frame_dur = self._LISTEN_FRAME_MS / 1000.0
-        preroll_frames = max(1, int(self._LISTEN_PREROLL_S / frame_dur))
-
-        audio_q: "_queue.Queue[np.ndarray]" = _queue.Queue()
-
-        def _cb(indata, frames, time_info, status):  # noqa: ANN001
-            if status:
-                log.debug("listen stream status: %s", status)
-            audio_q.put(indata[:, 0].copy())
-
-        collected: list[np.ndarray] = []
-        preroll:   list[np.ndarray] = []
-        speech_started   = False
-        trailing_silence = 0.0
-        speech_dur       = 0.0
-        start_t          = time.time()
-        done             = False
-        buf = np.empty(0, dtype=np.float32)
-
-        try:
-            with sd.InputStream(
-                samplerate = rate,
-                channels   = 1,
-                dtype      = "float32",
-                blocksize  = frame_len,
-                callback   = _cb,
-            ):
-                while not self._listen_stop.is_set() and not done:
-                    if self._finalize_now.is_set():
-                        break
-                    try:
-                        data = audio_q.get(timeout=0.1)
-                    except _queue.Empty:
-                        if (time.time() - start_t) > self._LISTEN_MAX_S:
-                            break
-                        continue
-
-                    buf = np.concatenate([buf, data]) if buf.size else data
-                    while len(buf) >= frame_len:
-                        frame = buf[:frame_len]
-                        buf   = buf[frame_len:]
-
-                        if self._frame_is_voiced(frame, rate):
-                            if not speech_started:
-                                # Splice in the pre-roll so we don't clip onset.
-                                collected.extend(preroll)
-                                preroll = []
-                                speech_started = True
-                            trailing_silence = 0.0
-                            speech_dur += frame_dur
-                            collected.append(frame)
-                        else:
-                            if speech_started:
-                                trailing_silence += frame_dur
-                                collected.append(frame)
-                                if trailing_silence >= self._ENDPOINT_SILENCE_S:
-                                    done = True
-                                    break
-                            else:
-                                preroll.append(frame)
-                                if len(preroll) > preroll_frames:
-                                    preroll.pop(0)
-
-                    if (time.time() - start_t) > self._LISTEN_MAX_S:
-                        done = True
-        except Exception as exc:
-            self._on_status(f"🎧 listen error: {exc}")
-        finally:
-            self.is_listening = False
-
-        if self._listen_cancel.is_set():
-            self._on_state("idle")
-            return
-
-        if not speech_started or speech_dur < self._LISTEN_MIN_SPEECH_S:
-            self._on_state("idle")
-            self._on_status("🎧 No speech detected")
-            return
-
-        # Trim trailing silence down to a short, natural tail before Whisper.
-        keep_tail = int(self._LISTEN_TAIL_KEEP_S / frame_dur)
-        drop = max(0, int(trailing_silence / frame_dur) - keep_tail)
-        if drop and drop < len(collected):
-            collected = collected[:-drop]
-
-        if not collected:
-            self._on_state("idle")
-            return
-
-        self._on_state("processing")
-        self._on_status("📝 Transcribing…")
-        audio = np.concatenate(collected).astype(np.float32)
-        self._transcribe_listen(audio, rate)
-
-    def _transcribe_listen(self, audio: "np.ndarray", rate: int) -> None:
-        """Transcribe a finalised utterance and emit it (or drop hallucinations)."""
-        try:
-            wav_buf = self._to_wav_buffer(audio, rate)
-            result = groq_client.audio.transcriptions.create(
-                model           = "whisper-large-v3",
-                file            = wav_buf,
-                response_format = "text",
-                language        = "en",   # lock to English — kills hallucinations
-                temperature     = 0.0,    # deterministic on ambient noise
-            )
-            txt = result.strip() if isinstance(result, str) else result.text.strip()
-            if self._is_hallucination(txt):
-                self._on_state("idle")
-                self._on_status("🎧 No speech detected")
-                return
-            self._on_transcript(txt, "ptt")
-        except Exception as exc:
-            self._on_state("idle")
-            self._on_status(f"📝 Transcription error: {exc}")
-
-    # ── Microphone ────────────────────────────────────────────────────────────
-
-    def start_ptt_recording(self) -> None:
-        """Begin explicit Push-to-Talk recording until stop_ptt_recording()."""
-        if self.ptt_active:
-            return
-        try:
-            import sounddevice as sd
-        except ImportError:
-            self._on_status("PTT: sounddevice not installed")
-            return
-
-        with self._ptt_lock:
-            self._ptt_frames = []
-            self.ptt_active = True
-
-        def _callback(indata, frames, time_info, status):  # noqa: ANN001
-            if status:
-                log.debug("PTT stream status: %s", status)
-            with self._ptt_lock:
-                self._ptt_frames.append(indata.copy())
-
-        try:
-            self._ptt_stream = sd.InputStream(
-                samplerate=self._MIC_RATE,
-                channels=1,
-                dtype="float32",
-                callback=_callback,
-            )
-            self._ptt_stream.start()
-            self._on_status("PTT recording...")
-        except Exception as exc:
-            with self._ptt_lock:
-                self.ptt_active = False
-                self._ptt_frames = []
-            self._on_status(f"PTT start failed: {exc}")
-
-    def stop_ptt_recording(self) -> None:
-        """Stop Push-to-Talk, transcribe the captured utterance, and emit it."""
-        if not self.ptt_active:
-            return
-
-        stream = self._ptt_stream
-        self._ptt_stream = None
-        try:
-            if stream is not None:
-                stream.stop()
-                stream.close()
-        except Exception as exc:
-            log.debug("PTT stream close error: %s", exc)
-
-        with self._ptt_lock:
-            frames = list(self._ptt_frames)
-            self._ptt_frames = []
-            self.ptt_active = False
-
-        if not frames:
-            self._on_status("PTT: no audio captured")
-            return
-
-        audio = np.concatenate(frames, axis=0)
-        # Lenient gate for PTT — only drop a genuinely silent recording.
-        rms = float(np.sqrt(np.mean(np.asarray(audio, dtype=np.float32) ** 2)))
-        if rms < self._PTT_MIN_RMS:
-            self._on_status("PTT: no speech detected")
-            return
-
-        threading.Thread(
-            target=self._transcribe_ptt_audio,
-            args=(audio,),
-            daemon=True,
-            name="atlas-ptt-transcribe",
-        ).start()
-
-    def _transcribe_ptt_audio(self, audio: "np.ndarray") -> None:
-        try:
-            wav_buf = self._to_wav_buffer(audio, self._MIC_RATE)
-            result = groq_client.audio.transcriptions.create(
-                model="whisper-large-v3",
-                file=wav_buf,
-                response_format="text",
-                language="en",      # lock to English — kills foreign hallucinations
-                temperature=0.0,    # deterministic, no creative drift on static
-            )
-            txt = result.strip() if isinstance(result, str) else result.text.strip()
-            if self._is_hallucination(txt):
-                self._on_status("PTT: no speech detected")
-                return
-            self._on_status("PTT transcribed")
-            self._on_transcript(txt, "ptt")
-        except Exception as exc:
-            self._on_status(f"PTT transcription error: {exc}")
-
-    def start_mic(self) -> None:
-        if self.mic_active:
-            return
-        self.mic_active = True
-        self._mic_stop.clear()
-        threading.Thread(target=self._mic_loop, daemon=True, name="atlas-mic").start()
-        self._on_status("🎤 Mic active")
-
-    def stop_mic(self) -> None:
-        self.mic_active = False
-        self._mic_stop.set()
-        self._on_status("🎤 Mic stopped")
-
-    def _mic_loop(self) -> None:
-        try:
-            import sounddevice as sd
-        except ImportError:
-            self._on_status("🎤 sounddevice not installed")
-            self.mic_active = False
-            return
-
-        chunk_samples = self._MIC_RATE * self._MIC_CHUNK_S
-
-        while not self._mic_stop.is_set():
-            try:
-                audio = sd.rec(
-                    chunk_samples,
-                    samplerate = self._MIC_RATE,
-                    channels   = 1,
-                    dtype      = "float32",
-                )
-                sd.wait()
-                # Strict two-stage voice gate — drop static before it hits the network.
-                if not self._passes_voice_gate(audio, self._MIC_RATE):
-                    continue
-
-                wav_buf = self._to_wav_buffer(audio, self._MIC_RATE)
-                result  = groq_client.audio.transcriptions.create(
-                    model           = "whisper-large-v3",
-                    file            = wav_buf,
-                    response_format = "text",
-                    language        = "en",   # lock to English — kills hallucinations
-                    temperature     = 0.0,    # deterministic on ambient noise
-                )
-                txt = result.strip() if isinstance(result, str) else result.text.strip()
-                if self._is_hallucination(txt):
-                    log.debug("Mic: dropped hallucination %r", txt)
-                    continue
-                self._on_transcript(txt, "mic")
-
-            except Exception as exc:
-                log.debug("Mic loop error: %s", exc)
-                time.sleep(1)
-
-    # ── Speaker / loopback ────────────────────────────────────────────────────
-
-    def start_speaker(self) -> None:
-        if self.speaker_active:
-            return
-        self.speaker_active = True
-        self._spk_stop.clear()
-        threading.Thread(target=self._spk_loop, daemon=True, name="atlas-spk").start()
-        self._on_status("🔊 Speaker capture active")
-
-    def stop_speaker(self) -> None:
-        self.speaker_active = False
-        self._spk_stop.set()
-        self._on_status("🔊 Speaker capture stopped")
-
-    def _spk_loop(self) -> None:
-        """
-        Speaker loopback capture loop.
-
-        FIX-4: If no native loopback/monitor device is discovered, the loop
-        hard-stops immediately, sets self.speaker_active = False, and fires an
-        explicit on_status error message.  It no longer silently falls back to
-        the default microphone input device, which would cause Atlas to
-        transcribe its own voice output as a user query.
-        """
-        try:
-            import sounddevice as sd
-        except ImportError:
-            self._on_status("🔊 sounddevice not installed")
-            self.speaker_active = False
-            return
-
-        chunk_samples = self._SPK_RATE * self._SPK_CHUNK_S
-
-        # Discover a loopback / monitor input device
-        loopback: Optional[int] = None
-        for idx, dev in enumerate(sd.query_devices()):
-            name_lower = dev["name"].lower()
-            if any(k in name_lower for k in ("loopback", "stereo mix", "what u hear", "monitor")):
-                if dev["max_input_channels"] > 0:
-                    loopback = idx
-                    break
-
-        # FIX-4: Hard-stop when no loopback device is available.
-        if loopback is None:
-            self.speaker_active = False
-            self._on_status(
-                "🔊 ERROR: No loopback/monitor audio device found. "
-                "Speaker capture is unavailable. "
-                "Enable 'Stereo Mix' or install a virtual audio cable "
-                "(e.g. VB-Cable on Windows, BlackHole on macOS)."
-            )
-            log.warning(
-                "AudioEngine._spk_loop: no loopback device discovered — "
-                "speaker capture thread exiting cleanly."
-            )
-            return
-
-        while not self._spk_stop.is_set():
-            try:
-                audio = sd.rec(
-                    chunk_samples,
-                    samplerate = self._SPK_RATE,
-                    channels   = 1,
-                    dtype      = "float32",
-                    device     = loopback,
-                )
-                sd.wait()
-                # Strict two-stage voice gate — drop static before it hits the network.
-                if not self._passes_voice_gate(audio, self._SPK_RATE):
-                    continue
-
-                wav_buf = self._to_wav_buffer(audio, self._SPK_RATE)
-                result  = groq_client.audio.transcriptions.create(
-                    model           = "whisper-large-v3",
-                    file            = wav_buf,
-                    response_format = "text",
-                    language        = "en",   # lock to English — kills hallucinations
-                    temperature     = 0.0,    # deterministic on ambient noise
-                )
-                txt = result.strip() if isinstance(result, str) else result.text.strip()
-                if self._is_hallucination(txt):
-                    log.debug("Speaker: dropped hallucination %r", txt)
-                    continue
-                self._on_transcript(txt, "speaker")
-
-            except Exception as exc:
-                log.debug("Speaker loop error: %s", exc)
-                time.sleep(1)
-
-    # ── Hallucination filter ──────────────────────────────────────────────────
-
-    # Exact and substring patterns that Whisper commonly hallucinates when fed
-    # silence or near-silence.  All comparisons are made on the lowercased,
-    # stripped transcript.
-    _HALLUCINATION_EXACT: frozenset[str] = frozenset({
-        "thank you",
-        "thanks",
-        "bye",
-        "bye bye",
-        "you",
-        "the",
-        ".",
-        "...",
-        "okay",
-        "ok",
-        "mm-hmm",
-        "uh-huh",
-        "hmm",
-        "um",
-        "uh",
-        "ah",
-        "mhm",
-    })
-
-    _HALLUCINATION_SUBSTRINGS: tuple[str, ...] = (
-        "amara.org",
-        "stavros",
-        "hiátlan szórakoz",
-        "storbritannia",
-        "subtitles by",
-        "subtitle by",
-        "transcribed by",
-        "translated by",
-        "www.",
-        ".com",
-        ".org",
-        ".net",
-        "subscribe",
-        "like and subscribe",
-        "patreon",
-        "this video",
-        "this episode",
-        "tune in",
-        "stay tuned",
-        "captions by",
-        "captioned by",
-    )
-
-    @classmethod
-    def _is_hallucination(cls, text: str) -> bool:
-        """
-        Return True if *text* looks like a Whisper hallucination and should be
-        discarded without forwarding to the application.
-
-        Rules (applied in order; any match returns True):
-        1. Empty or blank string.
-        2. Two characters or fewer after stripping.
-        3. Exact match against a known hallucination phrase (case-insensitive).
-        4. Contains a known hallucination substring (case-insensitive).
-        """
-        if not text or not text.strip():
-            return True
-
-        stripped = text.strip()
-
-        if len(stripped) <= 2:
-            return True
-
-        lower = stripped.lower()
-
-        if lower in cls._HALLUCINATION_EXACT:
-            return True
-
-        for fragment in cls._HALLUCINATION_SUBSTRINGS:
-            if fragment in lower:
-                return True
-
-        return False
-
-    # ── Shared helpers ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _to_wav_buffer(audio: "np.ndarray", rate: int) -> io.BytesIO:
-        """Convert a float32 numpy audio array to an in-memory WAV file."""
-        buf = io.BytesIO()
-        buf.name = "audio.wav"
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(rate)
-            wf.writeframes((audio * 32_767).astype("int16").tobytes())
-        buf.seek(0)
-        return buf
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 6.  KOKORO NEURAL VOICE MATRIX
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _strip_markdown(text: str) -> str:
-    """
-    Strip markdown syntax so Kokoro synthesises clean, natural speech.
-
-    Handled constructs
-    ------------------
-    Fenced code blocks, inline code, ATX headers, bold/italic (asterisk and
-    underscore), hyperlinks, images, blockquotes, horizontal rules, bullet and
-    numbered list markers, and excessive blank lines.
-    """
-    # Fenced code blocks → brief spoken placeholder
-    text = re.sub(r"```[\s\S]*?```", "code block omitted.", text)
-    # Inline code
-    text = re.sub(r"`[^`]+`", "", text)
-    # ATX headers
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    # Bold / italic  (* and _)
-    text = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", text)
-    text = re.sub(r"_{1,3}(.+?)_{1,3}", r"\1", text)
-    # Hyperlinks  [label](url)
-    text = re.sub(r"\[([^\]]+)\]\([^\)]*\)", r"\1", text)
-    # Images  ![alt](url)
-    text = re.sub(r"!\[[^\]]*\]\([^\)]*\)", "", text)
-    # Blockquotes
-    text = re.sub(r"^>\s+", "", text, flags=re.MULTILINE)
-    # Horizontal rules
-    text = re.sub(r"^[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
-    # Bullet / numbered list markers
-    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
-    # Collapse excessive blank lines
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-class KokoroVoiceEngine:
-    """
-    Singleton daemon providing offline neural TTS via kokoro-onnx + sounddevice.
-
-    Architecture
-    ------------
-    A single background daemon thread (``atlas-kokoro``) owns the Kokoro model
-    and an audio playback queue.  Any thread can enqueue speech via speak(); the
-    worker thread handles synthesis and streaming playback, allowing callers to
-    return immediately.
-
-    Interrupt model
-    ---------------
-    skip() sets a threading.Event that the playback loop checks between 250 ms
-    audio blocks.  The current utterance stops at the next block boundary;
-    pending items remain in the queue.
-
-    flush() (FIX-5) calls skip() internally before draining the backlog queue so
-    the currently playing item is killed instantly alongside clearing the backlog.
-
-    Graceful degradation
-    --------------------
-    If kokoro-onnx or sounddevice are not installed, the worker logs a single
-    warning and silently discards all enqueued items.  No crash, no exception
-    propagation to the caller.
-
-    Install
-    -------
-        pip install kokoro-onnx sounddevice
-    Model files (place alongside atlas_core.py or provide absolute paths):
-        kokoro-v0_19.onnx
-        voices.bin
-    """
-
-    # Class-level singleton reference for _instance_running()
-    _instance: Optional["KokoroVoiceEngine"] = None
-
-    # Preferred fallbacks, tried in order, when the requested voice is missing
-    # from the loaded voices.bin (e.g. a kokoro-v1.0 voice on a v0.19 pack).
-    _FALLBACK_VOICES: tuple[str, ...] = (
-        "af_sarah", "af_bella", "af_nicole", "af", "am_adam", "am_michael",
-    )
-
-    def __init__(
-        self,
-        voice:      str   = "af_sarah",
-        speed:      float = 1.0,
-        model_path: str   = "kokoro-v0_19.onnx",
-        voices_path: str  = "voices.bin",
-    ) -> None:
-        self.voice       = voice
-        self.speed       = speed
-        self._model_path  = model_path
-        self._voices_path = voices_path
-        self._muted       = False
-        self.last_error   = ""   # surfaces the most recent synth/playback failure
-
-        self._queue: queue.Queue[Optional[str]] = queue.Queue()
-        self._skip_event  = threading.Event()
-        self._ready       = False
-        self._kokoro      = None
-        self._sd          = None
-        self._cur_stream  = None   # active sd.OutputStream during playback
-        self._is_speaking = False  # True while audio is playing
-
-        self._worker_thread = threading.Thread(
-            target = self._worker,
-            daemon = True,
-            name   = "atlas-kokoro",
-        )
-        self._worker_thread.start()
-        KokoroVoiceEngine._instance = self
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def speak(self, text: str) -> None:
-        """
-        Enqueue text for synthesis and playback.  Returns immediately.
-
-        If the engine is muted or the text is empty after markdown stripping,
-        the call is a no-op.
-        """
-        if self._muted or not text or not text.strip():
-            return
-        clean = _strip_markdown(text)
-        if clean:
-            self._queue.put(clean)
-
-    def skip(self) -> None:
-        """Interrupt the currently playing utterance immediately."""
-        self._skip_event.set()
-        # Abort the active continuous stream for an instant, click-free stop.
-        stream = self._cur_stream
-        if stream is not None:
-            try:
-                stream.abort()
-            except Exception:
-                pass
-        if self._sd is not None:
-            try:
-                self._sd.stop()
-            except Exception:
-                pass
-
-    def flush(self) -> None:
-        """
-        Kill the currently playing utterance AND completely empty the TTS
-        backlog queue in one atomic operation.
-
-        FIX-5: flush() now explicitly calls self.skip() first so the item
-        currently being played by sounddevice is killed immediately rather than
-        waiting for the next 250 ms block boundary.  Queue draining proceeds
-        on top of that interrupted playback, guaranteeing both the active item
-        and all queued items are gone when this method returns.
-
-        Uses a Queue swap rather than a drain loop so that items enqueued by
-        another thread between ``empty()`` and ``get_nowait()`` are not missed.
-        The worker thread will block on the new empty queue until the next
-        ``speak()`` call.
-        """
-        # FIX-5: Kill the currently playing audio immediately.
-        self.skip()
-
-        # Swap the queue to atomically discard the entire backlog.
-        old_queue = self._queue
-        self._queue = queue.Queue()
-        # Drain the old queue so the worker's current get() unblocks cleanly
-        # if it already holds a reference to the old queue object.  In
-        # practice the worker holds ``self._queue`` by reference so it will
-        # immediately see the new queue; this drain is belt-and-suspenders.
-        while True:
-            try:
-                old_queue.get_nowait()
-            except queue.Empty:
-                break
-
-    def mute(self) -> None:
-        """Silence output; enqueued items are discarded on dequeue."""
-        self._muted = True
-        self.skip()
-
-    def unmute(self) -> None:
-        """Resume output."""
-        self._muted = False
-
-    @property
-    def is_muted(self) -> bool:
-        return self._muted
-
-    @property
-    def is_ready(self) -> bool:
-        """True once the Kokoro model has been loaded successfully."""
-        return self._ready
-
-    @property
-    def is_speaking(self) -> bool:
-        """True while TTS audio is actively playing."""
-        return self._is_speaking
-
-    def set_voice(self, voice: str) -> None:
-        """Change the active voice (takes effect on the next utterance)."""
-        voice = (voice or "").strip()
-        if not voice:
-            return
-        # If the model is loaded, only accept voices it actually has.
-        if self._kokoro is not None:
-            try:
-                if voice not in self._kokoro.voices:
-                    log.warning("set_voice: %r unavailable; keeping %r", voice, self.voice)
-                    return
-            except Exception:
-                pass
-        self.voice = voice
-
-    def available_voices(self) -> list[str]:
-        """Return the voices contained in the loaded voices.bin (or [])."""
-        if self._kokoro is None:
-            return []
-        try:
-            return sorted(self._kokoro.voices.keys())
-        except Exception:
-            return []
-
-    def set_speed(self, speed: float) -> None:
-        """Change the synthesis speed (takes effect on the next utterance)."""
-        self.speed = max(0.5, min(2.0, speed))
-
-    def shutdown(self) -> None:
-        """Gracefully stop the worker thread."""
-        self._queue.put(None)  # sentinel
-
-    @staticmethod
-    def _instance_running() -> bool:
-        """Return True if the module-level singleton is alive."""
-        inst = KokoroVoiceEngine._instance
-        return inst is not None and inst._worker_thread.is_alive()
-
-    @staticmethod
-    def models_present(model_path: str = "kokoro-v0_19.onnx",
-                       voices_path: str = "voices.bin") -> bool:
-        """Return True if both required model files exist on disk."""
-        return Path(model_path).exists() and Path(voices_path).exists()
-
-    # ── Worker daemon ─────────────────────────────────────────────────────────
-
-    def _ensure_kokoro_loaded(self) -> bool:
-        """Lazy-load Kokoro on first speak (not at thread start)."""
-        if self._ready:
-            return True
-        if self._kokoro is not None and not self._ready:
-            return False
-        try:
-            from kokoro_onnx import Kokoro  # type: ignore
-            import sounddevice as _sd
-
-            self._kokoro = Kokoro(self._model_path, self._voices_path)
-            self._sd = _sd
-
-            # Self-heal an invalid voice so TTS never silently dies on an
-            # unknown voice name (the #1 cause of "Atlas won't talk").
-            try:
-                available = set(self._kokoro.voices.keys())
-            except Exception:
-                available = set()
-            if available and self.voice not in available:
-                fallback = next(
-                    (v for v in self._FALLBACK_VOICES if v in available), None
-                )
-                if fallback is None:
-                    fallback = sorted(available)[0]
-                log.warning(
-                    "Kokoro voice %r not in voices.bin; falling back to %r. "
-                    "Available voices: %s",
-                    self.voice, fallback, sorted(available),
-                )
-                self.voice = fallback
-
-            self._ready = True
-            log.info("Kokoro voice engine ready — voice=%s speed=%.1f", self.voice, self.speed)
-            return True
-        except Exception as exc:
-            self._kokoro = None
-            log.warning(
-                "KokoroVoiceEngine: load failed (%s). TTS disabled.",
-                exc,
-            )
-            return False
-
-    def _worker(self) -> None:
-        """Background daemon; model loads on first queued item."""
-        load_failed_logged = False
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-
-            if self._muted:
-                continue
-
-            if not self._ready:
-                if not self._ensure_kokoro_loaded():
-                    if not load_failed_logged:
-                        load_failed_logged = True
-                    continue
-
-            self._skip_event.clear()
-            self._synthesise_and_play(item)
-
-    def _synthesise_and_play(self, text: str) -> None:
-        """
-        Synthesise a single utterance and stream it GAPLESSLY to the default
-        audio device.
-
-        A single continuous ``sd.OutputStream`` is written block-by-block.  This
-        eliminates the clicks/cracking caused by issuing a fresh ``sd.play()``
-        call per chunk (each of which tore down and re-opened the device, leaving
-        audible gaps).  Playback can still be interrupted within ~80 ms because
-        the skip event is checked between writes and skip() aborts the stream.
-        """
-        try:
-            self._is_speaking = True
-            samples, sample_rate = self._kokoro.create(
-                text,
-                voice = self.voice,
-                speed = self.speed,
-                lang  = "en-us",
-            )
-
-            # Normalise to a contiguous float32 mono buffer in [-1, 1].
-            audio = np.ascontiguousarray(np.asarray(samples, dtype=np.float32))
-            peak  = float(np.max(np.abs(audio))) if audio.size else 0.0
-            if peak > 1.0:
-                audio = audio / peak
-
-            block_size = max(256, int(sample_rate * 0.08))  # ~80 ms write blocks
-
-            stream = self._sd.OutputStream(
-                samplerate = sample_rate,
-                channels   = 1,
-                dtype      = "float32",
-                blocksize  = block_size,
-            )
-            stream.start()
-            self._cur_stream = stream
-            try:
-                offset = 0
-                total  = len(audio)
-                while offset < total:
-                    if self._skip_event.is_set():
-                        break
-                    chunk = audio[offset: offset + block_size]
-                    # Single contiguous stream → no inter-chunk silence/clicks.
-                    stream.write(chunk)
-                    offset += block_size
-            finally:
-                self._cur_stream = None
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:
-                    pass
-
-        except Exception as exc:
-            # Surface at WARNING (not debug) so silent TTS failures are visible.
-            self.last_error = str(exc)
-            log.warning("Kokoro synthesis/playback error: %s", exc)
-        finally:
-            self._is_speaking = False
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 6b.  ELEVENLABS STREAMING VOICE  (premium real-time track, optional)
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Optional premium streaming TTS.  Enabled ONLY when the `elevenlabs` package is
-# installed AND ELEVENLABS_API_KEY (+ ELEVENLABS_VOICE_ID / VOICE_ID) are set.
-# Otherwise Atlas transparently uses the offline Kokoro matrix.  Uses raw PCM
-# output so playback needs nothing more than sounddevice — no ffmpeg/mpv.
-#
-# Optional alternate premium endpoint (commented config):
-#   ELEVENLABS_MODEL = "eleven_turbo_v2_5"   # <300 ms real-time stream
-#   ELEVENLABS_MODEL = "eleven_multilingual_v2"  # higher fidelity, slower
-_ELEVEN_MODEL       = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
-_ELEVEN_PCM_RATE    = 24_000   # matches output_format "pcm_24000"
-
-# Default premade voices usable on the ElevenLabs free tier via the API
-# (library voices require a paid plan).  Name → voice_id, surfaced in Settings.
-ELEVEN_VOICES: dict = {
-    "Brian":  "nPczCjzI2devNBz1zQrb",
-    "George": "JBFqnCBsd6RMkjVDRZzb",
-    "Sarah":  "EXAVITQu4vr4xnSDxMaL",
-    "Laura":  "FGY2WhTYpPnrIDTdsKH5",
-}
-# Brian is the launch default; .env ELEVENLABS_VOICE_ID overrides only if set.
-ELEVEN_DEFAULT_VOICE_ID = ELEVEN_VOICES["Brian"]
-
-
-def _eleven_configured() -> bool:
-    """True when an ElevenLabs key is present (voice defaults to Brian)."""
-    return bool((os.environ.get("ELEVENLABS_API_KEY") or "").strip())
-
-
-class ElevenLabsVoiceEngine:
-    """
-    Low-latency streaming neural TTS via ElevenLabs (eleven_turbo_v2_5).
-
-    Mirrors the KokoroVoiceEngine public surface (speak / skip / flush / mute /
-    is_speaking …) so it is a drop-in for the voice router.  Audio is requested
-    as raw 16-bit PCM and streamed straight into a single sounddevice
-    OutputStream for gapless, click-free playback.
-
-    Fallback security
-    -----------------
-    Any failure — missing package, auth error, over-capacity, credit
-    exhaustion, network drop — is caught.  The offending utterance is handed to
-    the supplied ``fallback`` engine (Kokoro) and the premium track self-disables
-    for the rest of the session so Atlas never goes silent.
-    """
-
-    def __init__(
-        self,
-        fallback: "KokoroVoiceEngine",
-        speed: float = 1.0,
-    ) -> None:
-        self._fallback   = fallback
-        self.speed       = speed
-        self._muted      = False
-        self.last_error  = ""
-        self._available  = False     # flips True once the client is live
-        self._disabled   = False     # set True permanently after a hard failure
-        self._client     = None
-        self._sd         = None
-        self._voice_id   = (os.environ.get("ELEVENLABS_VOICE_ID")
-                            or os.environ.get("VOICE_ID") or "").strip() \
-                            or ELEVEN_DEFAULT_VOICE_ID
-
-        self._queue: queue.Queue[Optional[str]] = queue.Queue()
-        self._skip_event  = threading.Event()
-        self._cur_stream  = None
-        self._is_speaking = False
-
-        self._worker_thread = threading.Thread(
-            target=self._worker, daemon=True, name="atlas-elevenlabs"
-        )
-        self._worker_thread.start()
-
-    # ── lazy client load ──────────────────────────────────────────────────────
-
-    def _ensure_client(self) -> bool:
-        if self._disabled:
-            return False
-        if self._available:
-            return True
-        if not _eleven_configured():
-            self._disabled = True
-            return False
-        try:
-            from elevenlabs.client import ElevenLabs  # type: ignore
-            import sounddevice as _sd
-
-            key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
-            self._client = ElevenLabs(api_key=key)
-            self._sd = _sd
-            self._available = True
-            log.info("ElevenLabs streaming voice ready — model=%s voice=%s",
-                     _ELEVEN_MODEL, self._voice_id)
-            return True
-        except Exception as exc:
-            self.last_error = str(exc)
-            self._disabled  = True
-            log.warning("ElevenLabs unavailable (%s); using Kokoro fallback.", exc)
-            return False
-
-    # ── public API ────────────────────────────────────────────────────────────
-
-    @property
-    def is_active(self) -> bool:
-        """True when the premium track is usable (configured + not disabled)."""
-        return _eleven_configured() and not self._disabled
-
-    def speak(self, text: str) -> None:
-        if self._muted or not text or not text.strip():
-            return
-        clean = _strip_markdown(text)
-        if clean:
-            self._queue.put(clean)
-
-    def skip(self) -> None:
-        self._skip_event.set()
-        stream = self._cur_stream
-        if stream is not None:
-            try:
-                stream.abort()
-            except Exception:
-                pass
-
-    def flush(self) -> None:
-        self.skip()
-        old = self._queue
-        self._queue = queue.Queue()
-        while True:
-            try:
-                old.get_nowait()
-            except queue.Empty:
-                break
-
-    def mute(self) -> None:
-        self._muted = True
-        self.skip()
-
-    def unmute(self) -> None:
-        self._muted = False
-
-    @property
-    def is_muted(self) -> bool:
-        return self._muted
-
-    @property
-    def is_speaking(self) -> bool:
-        return self._is_speaking
-
-    def set_speed(self, speed: float) -> None:
-        self.speed = max(0.5, min(2.0, speed))
-
-    @property
-    def voice_id(self) -> str:
-        return self._voice_id
-
-    def set_voice_id(self, voice_id: str) -> None:
-        """
-        Switch the streaming voice at runtime (takes effect next utterance).
-
-        A voice change also clears any prior hard-failure latch so that selecting
-        a valid voice recovers the premium track after an earlier bad-voice error.
-        """
-        voice_id = (voice_id or "").strip()
-        if not voice_id or voice_id == self._voice_id:
-            return
-        self._voice_id  = voice_id
-        self._disabled  = False
-        self.last_error = ""
-
-    def shutdown(self) -> None:
-        self._queue.put(None)
-
-    # ── worker ──────────────────────────────────────────────────────────────--
-
-    def _worker(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-            if self._muted:
-                continue
-            self._skip_event.clear()
-            self._stream_one(item)
-
-    def _stream_one(self, text: str) -> None:
-        if not self._ensure_client():
-            self._fallback.speak(text)
-            return
-        try:
-            self._is_speaking = True
-            audio_iter = self._client.text_to_speech.convert(
-                voice_id      = self._voice_id,
-                model_id      = _ELEVEN_MODEL,
-                text          = text,
-                output_format = "pcm_24000",
-            )
-            stream = self._sd.OutputStream(
-                samplerate=_ELEVEN_PCM_RATE, channels=1, dtype="int16",
-            )
-            stream.start()
-            self._cur_stream = stream
-            leftover = b""
-            try:
-                for chunk in audio_iter:
-                    if self._skip_event.is_set():
-                        break
-                    if not chunk:
-                        continue
-                    buf = leftover + chunk
-                    # Keep writes aligned to whole 16-bit samples.
-                    usable = len(buf) - (len(buf) % 2)
-                    leftover = buf[usable:]
-                    if usable:
-                        stream.write(
-                            np.frombuffer(buf[:usable], dtype=np.int16)
-                        )
-            finally:
-                self._cur_stream = None
-                try:
-                    stream.stop(); stream.close()
-                except Exception:
-                    pass
-        except Exception as exc:
-            # Over-capacity / quota / network — degrade to Kokoro and stay there.
-            self.last_error = str(exc)
-            self._disabled  = True
-            log.warning("ElevenLabs stream failed (%s); falling back to Kokoro.", exc)
-            self._fallback.speak(text)
-        finally:
-            self._is_speaking = False
-
-
-class VoiceRouter:
-    """
-    Unified voice front end the UI talks to as ``voice_engine``.
-
-    Routes speech to ElevenLabs streaming when it is configured and healthy,
-    otherwise to the offline Kokoro matrix.  Interrupt / mute / flush commands
-    fan out to BOTH engines so a break-in is always instant regardless of which
-    track produced the audio.  Exposes the full KokoroVoiceEngine API surface so
-    nothing downstream needs to change.
-    """
-
-    def __init__(self, voice: str = "af_sarah", speed: float = 1.0) -> None:
-        self.kokoro = KokoroVoiceEngine(voice=voice, speed=speed)
-        self.eleven = ElevenLabsVoiceEngine(fallback=self.kokoro, speed=speed)
-
-    def _active(self):
-        return self.eleven if self.eleven.is_active else self.kokoro
-
-    # ── speech ────────────────────────────────────────────────────────────────
-    def speak(self, text: str) -> None:
-        self._active().speak(text)
-
-    def skip(self) -> None:
-        self.eleven.skip(); self.kokoro.skip()
-
-    def flush(self) -> None:
-        self.eleven.flush(); self.kokoro.flush()
-
-    def mute(self) -> None:
-        self.eleven.mute(); self.kokoro.mute()
-
-    def unmute(self) -> None:
-        self.eleven.unmute(); self.kokoro.unmute()
-
-    # ── status (mirror Kokoro's surface) ───────────────────────────────────────
-    @property
-    def is_muted(self) -> bool:
-        return self.kokoro.is_muted
-
-    @property
-    def is_ready(self) -> bool:
-        return self.eleven.is_active or self.kokoro.is_ready
-
-    @property
-    def is_speaking(self) -> bool:
-        return self.eleven.is_speaking or self.kokoro.is_speaking
-
-    @property
-    def last_error(self) -> str:
-        return self.eleven.last_error or self.kokoro.last_error
-
-    @property
-    def active_engine(self) -> str:
-        return "elevenlabs" if self.eleven.is_active else "kokoro"
-
-    # ── config (voice/speed apply to whichever engine supports them) ───────────
-    def set_voice(self, voice: str) -> None:
-        self.kokoro.set_voice(voice)
-
-    @property
-    def eleven_voice_id(self) -> str:
-        return self.eleven.voice_id
-
-    def set_eleven_voice(self, voice_id: str) -> None:
-        """Switch the ElevenLabs (premium) streaming voice at runtime."""
-        self.eleven.set_voice_id(voice_id)
-
-    def available_voices(self) -> list[str]:
-        return self.kokoro.available_voices()
-
-    def set_speed(self, speed: float) -> None:
-        self.kokoro.set_speed(speed)
-        self.eleven.set_speed(speed)
-
-    def shutdown(self) -> None:
-        self.eleven.shutdown(); self.kokoro.shutdown()
-
-
-# Module-level singleton — the UI imports and uses this directly.
-# voice_engine.speak(text)  →  enqueue (ElevenLabs stream if configured, else Kokoro)
-# voice_engine.skip()       →  interrupt both tracks
-# voice_engine.flush()      →  kill current + drain queue  (FIX-5)
-# voice_engine.mute()       →  silence
-voice_engine = VoiceRouter(voice="af_sarah", speed=1.0)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

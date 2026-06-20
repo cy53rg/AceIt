@@ -6,11 +6,13 @@ Logs go to stderr and ~/.atlas/atlas.log.
 """
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import threading
 import uuid
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 
 _LOG_DIR = Path.home() / ".atlas"
@@ -73,6 +75,21 @@ def task_scope(task_id: str | None = None):
             _task_id.reset(self._token)
 
     return _Scope()
+
+
+def log_outcome_json(record: dict) -> None:
+    """Append one structured JSON line to ~/.atlas/atlas.log (fail-open)."""
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = dict(record)
+        payload.setdefault(
+            "ts",
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def install_thread_exception_hook(on_error=None) -> None:
