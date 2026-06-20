@@ -233,7 +233,7 @@ class UserMemory:
                 "VALUES (?, ?, ?, ?, ?)",
                 (clean_name, email, now, now, now),
             )
-            return int(cur.lastrowid)
+            return int(cur.lastrowid or 0)
 
     # ── Accounts / profiles ───────────────────────────────────────────────────
 
@@ -386,7 +386,7 @@ class UserMemory:
                 (user_id, content, scope, time.time()),
             )
         self._invalidate_cache()
-        return int(cur.lastrowid)
+        return int(cur.lastrowid or 0)
 
     def list_context(self, user_id: int) -> list[dict[str, Any]]:
         with self._connect() as conn:

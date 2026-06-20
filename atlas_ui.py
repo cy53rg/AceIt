@@ -57,7 +57,7 @@ from PySide6.QtWidgets import (
     QDialog, QSlider, QComboBox, QTabWidget, QScrollArea,
     QListWidget, QListWidgetItem, QStackedWidget, QCheckBox,
     QProgressBar, QFileDialog, QMenu, QCompleter, QTableWidget,
-    QTableWidgetItem, QHeaderView,
+    QTableWidgetItem, QHeaderView, QMessageBox,
 )
 
 # ── Markdown renderer ─────────────────────────────────────────────────────────
@@ -75,6 +75,7 @@ try:
         ModeState, StateEngine, AudioEngine,
         groq_client, GROQ_MODEL, GROQ_MODELS, GROQ_MODEL_LABELS,
         RESPONSE_STYLES, voice_engine, atlas_fs, atlas_hands,
+        step_orchestrator,
     )
     import atlas_core as _core_mod
     _CORE = True
@@ -95,11 +96,30 @@ except ImportError:
     HAS_CV2 = False
 
 try:
-    from atlas_overlay import HoloOverlay
+    from atlas_overlay import HoloOverlay, AgentCursorOverlay
     HAS_OVERLAY = True
 except ImportError:
     HoloOverlay = None  # type: ignore
+    AgentCursorOverlay = None  # type: ignore
     HAS_OVERLAY = False
+
+try:
+    from atlas_telemetry import TelemetryClient, APP_VERSION
+    HAS_TELEMETRY = True
+except Exception:
+    TelemetryClient = None  # type: ignore
+    APP_VERSION = "0.9.0-mvp"
+    HAS_TELEMETRY = False
+
+try:
+    from atlas_logging import setup_logging, install_thread_exception_hook, get_logger
+    setup_logging()
+    HAS_LOGGING = True
+except Exception:
+    HAS_LOGGING = False
+    def get_logger(_n):  # type: ignore
+        import logging
+        return logging.getLogger(_n)
 
 try:
     from atlas_accounts import AccountManager
@@ -239,6 +259,9 @@ class SignalBridge(QObject):
     listen_state       = Signal(str)
     request_permission = Signal(str, str, object, object)
     accent_changed     = Signal(str)
+    step_pending       = Signal(object)
+    user_notice        = Signal(str, str)   # title, message
+    safety_prompt_req  = Signal(str)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -868,6 +891,18 @@ class SettingsDialog(QDialog):
         btn_export.clicked.connect(self._security_export_data)
         lay.addWidget(btn_export)
 
+        lay.addWidget(QLabel("<b>Computer Use — Safety Mode</b>"))
+        self.safety_combo = QComboBox()
+        self.safety_combo.addItems([
+            "Off — act without prompts",
+            "Always — confirm each action",
+            "Trusted — confirm once per session",
+        ])
+        btn_safety = QPushButton("Apply safety mode")
+        btn_safety.clicked.connect(self._apply_safety_mode)
+        lay.addWidget(self.safety_combo)
+        lay.addWidget(btn_safety)
+
         lay.addStretch()
         self.tabs.addTab(w, "Security")
         self.tabs.currentChanged.connect(
@@ -889,6 +924,21 @@ class SettingsDialog(QDialog):
                 f"2FA active via {'email' if method == 'email' else 'authenticator app'}.")
         else:
             self.twofa_status.setText("Two-step verification is off.")
+        mode = "off"
+        if self.engine:
+            mode = str(self.engine.get_user_prefs().get("safety_mode", "off"))
+        self.safety_combo.setCurrentIndex(
+            {"off": 0, "always": 1, "trusted": 2}.get(mode, 0))
+
+    def _apply_safety_mode(self) -> None:
+        if not self.engine:
+            return
+        idx = self.safety_combo.currentIndex()
+        mode = ("off", "always", "trusted")[idx]
+        self.engine.safety_mode = mode
+        self.engine.set_user_pref("safety_mode", mode)
+        self.engine._safety_session_ok = False
+        self.ui.bridge.set_status.emit(f"Safety mode: {mode}")
 
     def _apply_twofa(self) -> None:
         acct = getattr(self.ui, "account", None)
@@ -1648,7 +1698,8 @@ class WatchWorker(QThread):
                 }],
                 max_tokens=800,
             )
-            return resp.choices[0].message.content.strip()
+            raw = resp.choices[0].message.content
+            return (raw or "").strip()
         except Exception:
             return ""
 
@@ -2148,6 +2199,63 @@ PASSWORD_RULES = [
 ]
 
 
+class FeedbackDialog(QDialog):
+    """Send Feedback — posts to configured endpoint (stub OK offline)."""
+
+    def __init__(self, telemetry, parent=None, email: str = "") -> None:
+        super().__init__(parent)
+        self.telemetry = telemetry
+        self._email = email
+        self.setWindowTitle("Send Feedback")
+        self.setMinimumWidth(420)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Tell us what happened — bugs, ideas, or praise."))
+        self.msg = QTextEdit()
+        self.msg.setPlaceholderText("Your message…")
+        self.msg.setMaximumHeight(140)
+        lay.addWidget(self.msg)
+        self.chk_shot = QCheckBox("Include a screenshot with this report")
+        lay.addWidget(self.chk_shot)
+        self.chk_ctx = QCheckBox("Include anonymized app context (version, OS)")
+        self.chk_ctx.setChecked(True)
+        lay.addWidget(self.chk_ctx)
+        row = QHBoxLayout()
+        send = QPushButton("Send")
+        send.clicked.connect(self._send)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addStretch()
+        row.addWidget(cancel)
+        row.addWidget(send)
+        lay.addLayout(row)
+
+    def _send(self) -> None:
+        text = self.msg.toPlainText().strip()
+        if len(text) < 3:
+            return
+        shot = None
+        if self.chk_shot.isChecked() and _CORE:
+            try:
+                from atlas_core import capture_screen_b64
+                shot = capture_screen_b64()
+            except Exception:
+                pass
+        if self.telemetry:
+            ok, msg = self.telemetry.send_feedback(
+                text,
+                email=self._email,
+                screenshot_b64=shot,
+                include_context=self.chk_ctx.isChecked(),
+            )
+        else:
+            ok, msg = False, "Feedback service unavailable."
+        parent = self.parent()
+        if parent and hasattr(parent, "bridge"):
+            parent.bridge.set_status.emit(msg)
+        if ok:
+            self.accept()
+
+
 class TwoFactorDialog(QDialog):
     """Second-step verification after password sign-in."""
 
@@ -2603,11 +2711,14 @@ class AtlasWindow(QMainWindow):
         self.bridge.listen_state.connect(self._on_listen_state)
         self.bridge.request_permission.connect(self._on_permission_request)
         self.bridge.accent_changed.connect(self._on_accent_changed)
+        self.bridge.step_pending.connect(self._on_step_pending)
+        self.bridge.user_notice.connect(self._on_user_notice)
+        self.bridge.safety_prompt_req.connect(self._on_safety_prompt_req)
 
-        # Hands clicks and task automation always need a permission dialog — not
-        # tied to the optional file-system write toggle.
         if atlas_fs:
             atlas_fs.register_permission_callback(self._fs_permission_callback)
+
+        self.telemetry = TelemetryClient() if HAS_TELEMETRY and TelemetryClient else None
 
         # ── Status-bar persistence (Bug #23) ──────────────────────────────────
         # Messages are held for at least _STATUS_MIN_MS before being replaced.
@@ -2689,6 +2800,20 @@ class AtlasWindow(QMainWindow):
         self.overlay = HoloOverlay() if HAS_OVERLAY and HoloOverlay else None
         if self.overlay:
             self.overlay.show()
+
+        self.agent_cursor = (
+            AgentCursorOverlay() if HAS_OVERLAY and AgentCursorOverlay else None
+        )
+        if self.agent_cursor:
+            self.agent_cursor.show_cursor()
+
+        if _CORE and step_orchestrator:
+            step_orchestrator.set_ui_handler(self._post_step_pending)
+
+        if self.state:
+            self.state._safety_prompt = self._safety_prompt
+            self._safety_event = threading.Event()
+            self._safety_answer = True
 
         self._chat_messages: list[dict] = []
         self._streaming_html = ""
@@ -3315,11 +3440,12 @@ class AtlasWindow(QMainWindow):
     @Slot(str, str, object, object)
     def _on_permission_request(self, action: str, path: str,
                                approve_fn, deny_fn) -> None:
-        """Show the PermissionDialog on the main thread."""
+        """Auto-approve agent hands/task; gate file writes on fs_access toggle."""
         p = str(path)
-        if not self.fs_access_active and not (
-            p.startswith("atlas-hands://") or p.startswith("atlas-task://")
-        ):
+        if p.startswith("atlas-hands://") or p.startswith("atlas-task://"):
+            approve_fn()
+            return
+        if not self.fs_access_active:
             deny_fn()
             self.bridge.set_status.emit(
                 "File system access is off — enable it in settings for file operations."
@@ -3327,6 +3453,100 @@ class AtlasWindow(QMainWindow):
             return
         dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
         dlg.exec()
+
+    def _post_step_pending(self, pending) -> None:
+        """Called from worker threads — marshal step sync to the Qt main thread."""
+        self.bridge.step_pending.emit(pending)
+
+    @Slot(object)
+    def _on_step_pending(self, pending) -> None:
+        """Animate agent cursor + narrate + execute one StepEvent in order."""
+        evt = pending.event
+        evt.status = "animating"
+        narr = bool(
+            _CORE and step_orchestrator and step_orchestrator.narration_enabled
+            and voice_engine
+        )
+        if narr and evt.description:
+            voice_engine.speak(evt.description)
+
+        def _after_action() -> None:
+            if self.agent_cursor and pending.do_action:
+                self.agent_cursor.pulse_click(on_done=_finish_step)
+            else:
+                _finish_step()
+
+        def _after_anim() -> None:
+            evt.status = "executing"
+            if pending.do_action:
+                try:
+                    pending.do_action()
+                except Exception as exc:
+                    pending.result_ok = False
+                    evt.error = str(exc)
+                    evt.status = "failed"
+                    _finish_step()
+                    return
+            min_ms = step_orchestrator.min_step_ms if step_orchestrator else 400
+            QTimer.singleShot(min_ms, _after_action)
+
+        def _finish_step() -> None:
+            evt.status = "completed" if pending.result_ok else "failed"
+            pending.done.set()
+
+        if self.agent_cursor:
+            self.agent_cursor.animate_to(
+                int(evt.x), int(evt.y), duration_ms=250, on_done=_after_anim,
+            )
+        else:
+            _after_anim()
+
+    def _safety_prompt(self, description: str) -> bool:
+        if threading.current_thread() is threading.main_thread():
+            return self._safety_prompt_ui(description)
+        self._safety_event.clear()
+        self.bridge.safety_prompt_req.emit(description or "Allow this action?")
+        self._safety_event.wait(timeout=120.0)
+        return self._safety_answer
+
+    def _safety_prompt_ui(self, description: str) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle("Confirm action")
+        box.setText(description or "Allow this action?")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        return box.exec() == QMessageBox.Yes
+
+    @Slot(str)
+    def _on_safety_prompt_req(self, description: str) -> None:
+        self._safety_answer = self._safety_prompt_ui(description)
+        self._safety_event.set()
+
+    @Slot(str, str)
+    def _on_user_notice(self, title: str, message: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle(title or "Atlas")
+        box.setText(message)
+        box.setIcon(QMessageBox.Warning)
+        box.exec()
+
+    def _send_feedback(self) -> None:
+        email = ""
+        acct = getattr(self, "account", None)
+        if acct:
+            email = getattr(acct, "email", "") or ""
+        dlg = FeedbackDialog(self.telemetry, parent=self, email=email)
+        dlg.exec()
+
+    def _on_license_update(self, status) -> None:
+        if not status.allowed:
+            self.bridge.user_notice.emit(
+                "Account status",
+                status.message or "Agent actions are paused for your account.",
+            )
+        if self.telemetry and self.state:
+            self.telemetry.apply_execution_gate(self.state)
+        if status.source == "network" and status.allowed:
+            self.bridge.set_status.emit("Account status verified.")
 
     # ═════════════════════════════════════════════════════════════════════════
     # WEBCAM CAPTURE HELPER  (Requirement 4)
@@ -3888,6 +4108,7 @@ class AtlasWindow(QMainWindow):
         menu.addAction("🔗 Connect Account…", self._connect_account)
         menu.addAction("💳 Billing  (soon)", lambda: self.bridge.set_status.emit(
             "Billing is coming soon."))
+        menu.addAction("💬 Send Feedback…", self._send_feedback)
         menu.addSeparator()
         menu.addAction("⎋ Sign out / Switch user", self._sign_out)
         menu.exec(self.btn_profile.mapToGlobal(self.btn_profile.rect().bottomLeft()))
@@ -4018,18 +4239,15 @@ class AtlasWindow(QMainWindow):
 
     @Slot(dict)
     def _on_spatial_coords(self, coords: dict) -> None:
-        if not (coords.get("found") and self.overlay):
+        if not coords.get("found"):
             return
         x, y = int(coords["x"]), int(coords["y"])
         w, h = int(coords.get("w", 0)), int(coords.get("h", 0))
-        if coords.get("guide"):
-            # GUIDING marker: bounding box + ring + label. Instruction is spoken
-            # by the core action dispatcher, so don't double-speak here.
+        if coords.get("guide") and self.overlay:
             self.overlay.mark_target(x, y, w, h, label=str(coords.get("label", "")))
-        else:
-            self.overlay.focus_on(x, y, w, h)
-            if voice_engine:
-                voice_engine.speak("Right here")
+        elif not coords.get("guide"):
+            # DO path: agent cursor handles visuals via StepEvent; skip teleport ring.
+            pass
 
     # ── Talk hotkey — conversation loop (tap-to-talk + silence endpointing) ───
 
@@ -4901,6 +5119,32 @@ class AtlasWindow(QMainWindow):
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    def _global_excepthook(exc_type, exc_value, exc_tb) -> None:
+        import traceback
+        tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        get_logger("ui").error("Uncaught exception:\n%s", tb)
+        try:
+            app = QApplication.instance()
+            if app:
+                from PySide6.QtWidgets import QMessageBox
+                box = QMessageBox()
+                box.setWindowTitle("Atlas hit a problem")
+                box.setText(
+                    "Something unexpected happened, but Atlas is still running.\n"
+                    f"{exc_value}"
+                )
+                box.setDetailedText(tb)
+                box.setIcon(QMessageBox.Warning)
+                box.exec()
+        except Exception:
+            pass
+
+    sys.excepthook = _global_excepthook
+    if HAS_LOGGING:
+        install_thread_exception_hook(
+            lambda t, v, tb: _global_excepthook(t, v, tb)
+        )
+
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
@@ -4924,5 +5168,12 @@ if __name__ == "__main__":
     win.apply_account_identity(chosen_name or "Guest")
     if win.state and win.state.focus_mode:
         win._sync_focus_ui(True)
+    if win.telemetry and win.state:
+        email = getattr(account, "email", "") if account else ""
+        st = win.telemetry.check_license(email)
+        win.telemetry.apply_execution_gate(win.state)
+        if not st.allowed:
+            win._on_license_update(st)
+        win.telemetry.start_daily_check(email, on_update=win._on_license_update)
     win.show()
     sys.exit(app.exec())

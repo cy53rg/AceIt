@@ -83,10 +83,11 @@ except Exception:  # pragma: no cover - optional dependency
 from atlas_learning import LearningEngine
 from atlas_memory import UserMemory
 from atlas_skills import SkillRegistry
+from atlas_logging import get_logger, setup_logging, task_scope, new_task_id
+from atlas_stepevent import StepOrchestrator
 
-load_dotenv()
-
-# ── Per-monitor DPI awareness (Windows) ───────────────────────────────────────
+setup_logging()
+log = get_logger("core")
 # Make this process per-monitor DPI aware at import time (before Qt and before
 # any automation).  Without it, on displays scaled above 100% the mss/PIL
 # screenshot is in physical pixels while pyautogui clicks in logical pixels, so
@@ -102,11 +103,9 @@ if platform.system() == "Windows":
     except Exception:
         pass
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.WARNING)
-log = logging.getLogger("atlas_core")
+load_dotenv()
 
-# ── Groq client & model registry ─────────────────────────────────────────────
+# ── Per-monitor DPI awareness (Windows) ───────────────────────────────────────
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -950,25 +949,23 @@ class StateEngine:
     _TASK_SETTLE_S  = 0.8    # pause after each action for the UI to react
 
     def run_task(self, task: str) -> None:
-        """Request one approval, then run the autonomous task loop off-thread."""
+        """Run the autonomous task loop off-thread (no permission gate)."""
         task = (task or "").strip()
         if not task:
             return
         if getattr(self, "_task_running", False):
             self._emit("task_status", {"text": "A task is already running."})
             return
+        if self.execution_blocked:
+            self._announce("Agent actions are paused — check your account status.")
+            return
 
-        def _approved() -> None:
-            self._task_running = True
-            self._task_stop = threading.Event()
-            atlas_hands.auto_approve = True
-            threading.Thread(
-                target=self._task_loop, args=(task,), daemon=True, name="atlas-task"
-            ).start()
-
-        atlas_fs._request_permission(
-            FSPermission.EXECUTE, Path(f"atlas-task://{task[:90]}"), _approved
-        )
+        self._task_running = True
+        self._task_stop = threading.Event()
+        atlas_hands.auto_approve = True
+        threading.Thread(
+            target=self._task_loop, args=(task,), daemon=True, name="atlas-task"
+        ).start()
 
     def stop_task(self) -> None:
         ev = getattr(self, "_task_stop", None)
@@ -1575,13 +1572,26 @@ class StateEngine:
             return f"'{target}' not visible on screen"
         cx = int(coords["x"] + coords.get("w", 0) / 2)
         cy = int(coords["y"] + coords.get("h", 0) / 2)
-        try:
-            self._on_coordinates({"target": target, **coords})
-        except Exception:
-            pass
-        atlas_hands.click(cx, cy)
-        if double:
+        desc = f"Clicking {target}"
+
+        def _do() -> None:
             atlas_hands.click(cx, cy)
+            if double:
+                atlas_hands.click(cx, cy)
+
+        if not self._safety_allows(desc):
+            return "action denied by safety mode"
+        ok = step_orchestrator.run_step(
+            desc, cx, cy,
+            int(coords.get("w", 0)),
+            int(coords.get("h", 0)),
+            action="double" if double else "click",
+            target=target,
+            do_action=_do,
+        )
+        if not ok:
+            return f"failed to click '{target}'"
+        if double:
             return f"double-clicked '{target}' at {cx},{cy}"
         return f"clicked '{target}' at {cx},{cy}"
 
@@ -1687,6 +1697,10 @@ class StateEngine:
         self.spatial = SpatialBrain(groq_client)
         self._recorder: Optional[RoutineRecorder] = None
         self.screen_vision = False   # set True by the UI while the watcher runs
+        self.execution_blocked = False
+        # Safety mode: off = auto actions, always = confirm each action, trusted = confirm once per session
+        self.safety_mode = str(self.get_user_prefs().get("safety_mode", "off"))
+        self._safety_session_ok = False
 
     def get_system_prompt(self) -> str:
         """Effective system prompt for the current mode + focus toggle."""
@@ -2149,6 +2163,8 @@ class StateEngine:
                     log.debug("_on_ai_query: cancelled mid-stream")
                     break
 
+                if not getattr(chunk, "choices", None):
+                    continue
                 delta = chunk.choices[0].delta.content or ""
                 if not delta:
                     continue
@@ -2414,7 +2430,17 @@ class StateEngine:
             label=instruction,
         )
         if coords.get("found") and instruction:
-            voice_engine.speak(instruction)
+            cx = int(coords["x"] + coords.get("w", 0) / 2)
+            cy = int(coords["y"] + coords.get("h", 0) / 2)
+            step_orchestrator.run_step(
+                instruction or f"Look at {target}",
+                cx, cy,
+                int(coords.get("w", 0)),
+                int(coords.get("h", 0)),
+                action="guide",
+                target=target,
+                do_action=None,
+            )
         return coords
 
     def act_on_target(
@@ -2426,22 +2452,53 @@ class StateEngine:
     ) -> dict:
         """
         DOING — autonomous OS automation; physically operates the cursor.
-
-        Locates *target* then drives ``atlas_hands`` to perform *action*.  Every
-        hands call is intercepted by the permission gate (PermissionDialog), so
-        no real click/keystroke fires without explicit human verification.
         """
+        if self.execution_blocked:
+            self._announce("Agent actions are paused — check your account status.")
+            return {"target": target, "found": False, "x": 0, "y": 0, "w": 0, "h": 0}
         coords = self.locate_ui_element(target, screen_b64=screen_b64, scale=scale)
         if not coords.get("found"):
             return coords
         cx = int(coords["x"] + coords.get("w", 0) / 2)
         cy = int(coords["y"] + coords.get("h", 0) / 2)
-        if action == "click":
-            atlas_hands.click(cx, cy)
-        elif action == "double":
-            atlas_hands.click(cx, cy)
-            atlas_hands.click(cx, cy)
+        act = (action or "click").lower()
+        desc = f"Clicking {target}"
+
+        def _do() -> None:
+            if act == "click":
+                atlas_hands.click(cx, cy)
+            elif act == "double":
+                atlas_hands.click(cx, cy)
+                atlas_hands.click(cx, cy)
+
+        if not self._safety_allows(desc):
+            return coords
+        ok = step_orchestrator.run_step(
+            desc, cx, cy,
+            int(coords.get("w", 0)),
+            int(coords.get("h", 0)),
+            action=act,
+            target=target,
+            do_action=_do,
+        )
+        if not ok:
+            coords = dict(coords)
+            coords["found"] = False
         return coords
+
+    def _safety_allows(self, description: str) -> bool:
+        mode = (getattr(self, "safety_mode", "off") or "off").lower()
+        if mode == "off":
+            return True
+        if mode == "trusted" and getattr(self, "_safety_session_ok", False):
+            return True
+        cb = getattr(self, "_safety_prompt", None)
+        if cb is None:
+            return True
+        ok = bool(cb(description))
+        if ok and mode == "trusted":
+            self._safety_session_ok = True
+        return ok
 
     def get_debug_state(self) -> str:
         """Return a formatted debug string for the UI diagnostics panel."""
@@ -4311,6 +4368,8 @@ class AtlasHands:
 # blocked with a logged warning rather than crashing.
 atlas_fs = AtlasFileSystem()
 atlas_hands = AtlasHands(atlas_fs)
+atlas_hands.auto_approve = True
+step_orchestrator = StepOrchestrator()
 
 # FIX-6: Run the .env gitignore safety check at module import time so developers
 # see the warning in their console the moment they load atlas_core.
