@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from typing import Any, Optional
@@ -12,6 +13,11 @@ from typing import Any, Optional
 from atlas_memory import UserMemory
 
 log = logging.getLogger("atlas_learning")
+
+_default_fast_model = "llama-3.1-8b-instant"
+ATLAS_FAST_MODEL = (
+    os.environ.get("ATLAS_FAST_MODEL") or _default_fast_model
+).strip() or _default_fast_model
 
 PERSONA_BASELINE = ["precise", "direct", "confident"]
 DRIFT_CHECK_EVERY = 10
@@ -100,7 +106,7 @@ class LearningEngine:
         )
         try:
             resp = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=ATLAS_FAST_MODEL,
                 messages=[
                     {"role": "system", "content": "Return valid JSON only."},
                     {"role": "user", "content": prompt},

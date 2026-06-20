@@ -1,0 +1,3 @@
+save_button.png|Save button|180|140
+settings_icon.png|settings gear icon|360|40
+search_field.png|search field|120|80
