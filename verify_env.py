@@ -1,4 +1,4 @@
-"""Quick check: Python version, AceIt imports, Tesseract, stray easyocr."""
+"""Quick check: Python version, Atlas imports, Tesseract, optional packages."""
 
 from __future__ import annotations
 
@@ -12,26 +12,51 @@ def main() -> None:
     print("Python:", sys.version.replace("\n", " "))
     print()
 
-    for name, mod in (
+    packages = (
         ("pyautogui", "pyautogui"),
         ("Pillow", "PIL"),
         ("pytesseract", "pytesseract"),
         ("python-dotenv", "dotenv"),
-        ("google-generativeai", "google.generativeai"),
+        ("groq", "groq"),
         ("keyboard", "keyboard"),
-    ):
+        ("PySide6", "PySide6"),
+        ("opencv-python", "cv2"),
+        ("sounddevice", "sounddevice"),
+        ("kokoro-onnx", "kokoro_onnx"),
+        ("mss", "mss"),
+        ("pyperclip", "pyperclip"),
+        ("markdown-it-py", "markdown_it"),
+        ("pymupdf", "fitz"),
+        ("numpy", "numpy"),
+    )
+    for name, mod in packages:
         try:
             importlib.import_module(mod)
             print(f"[OK] {name}")
         except Exception as exc:  # noqa: BLE001
             print(f"[MISSING] {name}: {exc}")
 
+    print()
+    for label, mod in (
+        ("atlas_memory", "atlas_memory"),
+        ("atlas_skills", "atlas_skills"),
+        ("atlas_learning", "atlas_learning"),
+        ("atlas_core", "atlas_core"),
+        ("atlas_overlay", "atlas_overlay"),
+        ("atlas_ui", "atlas_ui"),
+    ):
+        try:
+            importlib.import_module(mod)
+            print(f"[OK] {label}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[MISSING] {label}: {exc}")
+
     try:
         import easyocr  # noqa: F401
 
         print()
         print(
-            "[WARN] easyocr is installed. AceIt uses pytesseract only. "
+            "[WARN] easyocr is installed. Atlas uses pytesseract only. "
             "Uninstall to avoid python-bidi / torch builds:",
         )
         print("       python -m pip uninstall -y easyocr")
@@ -55,6 +80,12 @@ def main() -> None:
                 "[MISSING] tesseract.exe - install Tesseract (see INSTALL_WINDOWS.txt) "
                 "or set TESSERACT_CMD.",
             )
+
+    groq_key = Path(".env")
+    if groq_key.is_file():
+        print("[OK] .env present")
+    else:
+        print("[WARN] .env not found — set GROQ_API_KEY for AI features")
 
 
 if __name__ == "__main__":
