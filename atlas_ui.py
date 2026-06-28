@@ -2173,6 +2173,7 @@ class FeedbackDialog(QDialog):
             try:
                 from atlas_core import capture_screen_b64
                 shot = capture_screen_b64()
+                shot = shot.b64 if shot else None
             except Exception:
                 pass
         if self.telemetry:
@@ -2755,6 +2756,7 @@ class AtlasWindow(QMainWindow):
 
         if self.state:
             self.state._safety_prompt = self._safety_prompt
+            self.state._task_confirm_cb = self._task_confirm
             self._safety_event = threading.Event()
             self._safety_answer = True
 
@@ -3585,6 +3587,13 @@ class AtlasWindow(QMainWindow):
         self._safety_event.wait(timeout=120.0)
         return self._safety_answer
 
+    def _task_confirm(self, task: str) -> bool:
+        """Safety gate for starting an autonomous [[TASK:]] loop."""
+        summary = (task or "").strip()
+        if len(summary) > 400:
+            summary = summary[:397] + "…"
+        return self._safety_prompt(f"Run autonomous task:\n{summary}")
+
     def _safety_prompt_ui(self, description: str) -> bool:
         box = QMessageBox(self)
         box.setWindowTitle("Confirm action")
@@ -3786,6 +3795,19 @@ class AtlasWindow(QMainWindow):
         elif event_type == "copilot_changed":
             QTimer.singleShot(0, lambda: self._sync_copilot_ui(
                 payload.get("active", False)))
+        elif event_type == "query_started":
+            src = str(payload.get("source", "user"))
+
+            def _start_query(s: str = src) -> None:
+                self._begin_interaction(s)
+                self.bridge.set_status.emit("Thinking…")
+
+            QTimer.singleShot(0, _start_query)
+        elif event_type == "command_handled":
+            QTimer.singleShot(0, lambda: self._release_companion_mode(
+                status="Done ✓",
+                finalize_thinking=False,
+            ))
         elif event_type == "query_rejected":
             from atlas_interaction import friendly_error
             QTimer.singleShot(0, lambda: self._release_companion_mode(
@@ -3974,17 +3996,11 @@ class AtlasWindow(QMainWindow):
         if text.startswith("/"):
             if self._handle_slash_command(text):
                 return
-        if self.state and self._try_route_command(text):
-            return
         if self.state:
             msg = self.chat_view.add_message("user", text)
             self._chat_messages.append(msg)
-            if getattr(self.state, "audio_watcher", None):
-                self.state.audio_watcher.mark_user_typed()
             if not self.chat_composer.tts_enabled_for_next() and voice_engine:
                 voice_engine.flush()
-            self._begin_interaction("user")
-            self.bridge.set_status.emit("Thinking…")
             webcam_b64 = self._capture_webcam_frame()
             screen_b64 = None
             doc_ctx = ""
@@ -4009,26 +4025,6 @@ class AtlasWindow(QMainWindow):
             ).start()
             self._pending_attachments.clear()
             self.chat_composer.set_attach_label("")
-
-    def _try_route_command(self, text: str) -> bool:
-        """Intercept natural-language control commands before the LLM.
-
-        Classification is a fast regex pass on the UI thread; execution (which
-        may speak or switch mode) runs off-thread so the UI never blocks.
-        Returns True when the utterance was a control command.
-        """
-        try:
-            intent = self.state.route_command(text)
-        except Exception:
-            return False
-        if not intent or intent.get("intent") == "chat":
-            return False
-        self._append_response(f"[COMMAND]: {text}")
-        threading.Thread(
-            target=self.state.execute_command, args=(intent,),
-            daemon=True, name="atlas-command",
-        ).start()
-        return True
 
     def _start_thinking(self):
         self.thinking_bar.setRange(0, 0)
@@ -4211,8 +4207,8 @@ class AtlasWindow(QMainWindow):
 
     def _on_composer_screenshot(self) -> None:
         try:
-            from atlas_core import capture_screen_b64
-            b64 = capture_screen_b64()
+            from atlas_core import capture_screen_b64_str
+            b64 = capture_screen_b64_str()
         except Exception:
             b64 = None
         if not b64:
@@ -4924,12 +4920,7 @@ class AtlasWindow(QMainWindow):
         self.bridge.set_status.emit(f"🎤 Heard ({source}) — processing…")
         msg = self.chat_view.add_message("user", clean)
         self._chat_messages.append(msg)
-        # Voice control commands ("stop", "guided mode", "run X routine"…) are
-        # intercepted here before reaching the LLM, so spoken control works too.
-        if self.state and self._try_route_command(text):
-            return
         if self.state and routed != "consumed":
-            self._begin_interaction(source)
             self.bridge.set_status.emit(f"🎤 Heard ({source}) — processing…")
             threading.Thread(
                 target=self.state.handle_input,

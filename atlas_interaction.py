@@ -48,9 +48,9 @@ def gather_screen_frame() -> tuple[Optional[str], str]:
     try:
         from atlas_vision import capture_screen_b64
 
-        b64 = capture_screen_b64()
-        if b64:
-            return b64, "Live desktop screenshot captured for this turn."
+        cap = capture_screen_b64()
+        if cap:
+            return cap.b64, "Live desktop screenshot captured for this turn."
     except Exception as exc:
         log.debug("gather_screen_frame failed: %s", exc)
     return None, ""

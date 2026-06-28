@@ -11,6 +11,8 @@ import os
 import re
 import threading
 import time
+import warnings
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from groq import Groq
@@ -37,10 +39,48 @@ def base64_decode(text: str) -> bytes:
     return base64.b64decode(text)
 
 
-# Scale factor from the most recent capture_screen_b64() call (1.0 = full resolution).
+# Legacy module-level capture metadata — updated by capture_screen_b64(); prefer
+# ScreenCapture.scale / .screen_size on the returned object instead.
 _LAST_CAPTURE_SCALE: float = 1.0
 _LAST_CAPTURE_SIZE: tuple[int, int] = (0, 0)   # (w, h) of image sent to the vision model
 _LAST_SCREEN_SIZE: tuple[int, int] = (0, 0)    # native desktop pixels for the grab
+_LAST_CAPTURE_MONO: float = 0.0
+_LEGACY_CAPTURE_STALE_S = 2.0
+
+
+@dataclass
+class ScreenCapture:
+    """One screen grab with scale metadata bound to that specific frame."""
+
+    b64: str
+    scale: float
+    capture_size: tuple[int, int]
+    screen_size: tuple[int, int]
+
+
+def _publish_legacy_capture_metadata(cap: ScreenCapture) -> None:
+    global _LAST_CAPTURE_SCALE, _LAST_CAPTURE_SIZE, _LAST_SCREEN_SIZE, _LAST_CAPTURE_MONO
+    _LAST_CAPTURE_SCALE = cap.scale
+    _LAST_CAPTURE_SIZE = cap.capture_size
+    _LAST_SCREEN_SIZE = cap.screen_size
+    _LAST_CAPTURE_MONO = time.monotonic()
+
+
+def _warn_if_stale_legacy_read(caller: str) -> None:
+    if _LAST_CAPTURE_MONO <= 0.0:
+        log.warning(
+            "%s called before any capture_screen_b64() — returning defaults; "
+            "pass ScreenCapture through call chains instead.",
+            caller,
+        )
+        return
+    if time.monotonic() - _LAST_CAPTURE_MONO > _LEGACY_CAPTURE_STALE_S:
+        warnings.warn(
+            f"{caller}() read module-level capture metadata without a recent "
+            "capture_screen_b64() call — migrate to ScreenCapture.scale",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 def desktop_geometry() -> tuple[int, int, int, int]:
@@ -71,12 +111,14 @@ def desktop_geometry() -> tuple[int, int, int, int]:
 
 
 def last_capture_scale() -> float:
-    """Return the pixel scale for the last downscaled screen capture."""
+    """Return the pixel scale for the last downscaled screen capture (legacy)."""
+    _warn_if_stale_legacy_read("last_capture_scale")
     return _LAST_CAPTURE_SCALE
 
 
 def last_screen_size() -> tuple[int, int]:
-    """Native desktop width/height of the last screen capture."""
+    """Native desktop width/height of the last screen capture (legacy)."""
+    _warn_if_stale_legacy_read("last_screen_size")
     return _LAST_SCREEN_SIZE
 
 
@@ -136,9 +178,13 @@ def extract_target_coordinate(text: str) -> tuple[str, dict | None]:
     }
 
 
-def normalized_coord_to_desktop(nx: float, ny: float) -> tuple[int, int]:
+def normalized_coord_to_desktop(
+    nx: float,
+    ny: float,
+    screen_size: tuple[int, int] | None = None,
+) -> tuple[int, int]:
     """Map normalized 0–1000 vision coords to absolute desktop pixels."""
-    sw, sh = _LAST_SCREEN_SIZE
+    sw, sh = screen_size or _LAST_SCREEN_SIZE
     if sw <= 0 or sh <= 0:
         sw, sh = 1920, 1080
     px = int(round(max(0.0, min(1000.0, nx)) / 1000.0 * sw))
@@ -158,29 +204,27 @@ def record_capture_from_b64(b64: str) -> None:
         from PIL import Image
 
         img = Image.open(io.BytesIO(base64_decode(b64))).convert("RGB")
-        _LAST_SCREEN_SIZE = (img.width, img.height)
-        _LAST_CAPTURE_SIZE = (img.width, img.height)
-        _LAST_CAPTURE_SCALE = 1.0
+        cap = ScreenCapture(
+            b64=b64,
+            scale=1.0,
+            capture_size=(img.width, img.height),
+            screen_size=(img.width, img.height),
+        )
+        _publish_legacy_capture_metadata(cap)
     except Exception as exc:
         log.debug("record_capture_from_b64 failed: %s", exc)
 
 
-def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
+def capture_screen_b64(max_width: int = 1280) -> Optional[ScreenCapture]:
     """
-    Grab the primary display silently and return a base64 PNG, or None.
+    Grab the primary display silently and return capture metadata, or None.
 
     Prefers ``mss`` (fast, headless) and falls back to Pillow ImageGrab.  The
-    frame is downscaled to ``max_width`` so vision calls stay quick — Interview
-    Mode captures one of these before every query so the LLM can actually see
-    the screen and never claims it cannot.
+    frame is downscaled to ``max_width`` so vision calls stay quick.
 
     Vision models return coordinates in *image* pixel space; multiply by
-    ``last_capture_scale()`` to map clicks and overlay markers to the desktop.
+    ``ScreenCapture.scale`` to map clicks and overlay markers to the desktop.
     """
-    global _LAST_CAPTURE_SCALE, _LAST_CAPTURE_SIZE, _LAST_SCREEN_SIZE
-    _LAST_CAPTURE_SCALE = 1.0
-    _LAST_CAPTURE_SIZE = (0, 0)
-    _LAST_SCREEN_SIZE = (0, 0)
     try:
         from PIL import Image
         try:
@@ -195,20 +239,32 @@ def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
             img = ImageGrab.grab().convert("RGB")
 
         orig_w, orig_h = img.width, img.height
-        _LAST_SCREEN_SIZE = (orig_w, orig_h)
+        scale = 1.0
 
         if img.width > max_width:
             ratio = max_width / float(orig_w)
             img = img.resize((max_width, int(img.height * ratio)))
-            _LAST_CAPTURE_SCALE = orig_w / float(max_width)
+            scale = orig_w / float(max_width)
 
-        _LAST_CAPTURE_SIZE = (img.width, img.height)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        return base64_encode(buf.getvalue())
+        cap = ScreenCapture(
+            b64=base64_encode(buf.getvalue()),
+            scale=scale,
+            capture_size=(img.width, img.height),
+            screen_size=(orig_w, orig_h),
+        )
+        _publish_legacy_capture_metadata(cap)
+        return cap
     except Exception as exc:  # pragma: no cover - capture is best-effort
         log.debug("capture_screen_b64 failed: %s", exc)
         return None
+
+
+def capture_screen_b64_str(max_width: int = 1280) -> Optional[str]:
+    """Thin wrapper when only the PNG base64 string is needed."""
+    cap = capture_screen_b64(max_width=max_width)
+    return cap.b64 if cap else None
 
 
 class SpatialBrain:
@@ -269,6 +325,7 @@ class SpatialBrain:
     def locate(
         self,
         target: str,
+        screen: ScreenCapture | None = None,
         screen_b64: Optional[str] = None,
         scale: Optional[float] = None,
         *,
@@ -278,7 +335,10 @@ class SpatialBrain:
         if not clean_target:
             return {"found": False, "x": 0, "y": 0, "w": 0, "h": 0, "confidence": 0.0}
 
-        result = self._locate_once(clean_target, screen_b64, scale)
+        frame_b64, scale_val = self._resolve_frame_and_scale(
+            screen, screen_b64, scale,
+        )
+        result = self._locate_once(clean_target, frame_b64, scale_val)
         if not refine or not result.get("found"):
             self._log_locate_outcome(clean_target, result)
             return result
@@ -288,11 +348,23 @@ class SpatialBrain:
             return result
 
         refined = self._locate_crop_refine(
-            clean_target, result, screen_b64=screen_b64, scale=scale,
+            clean_target, result, screen_b64=frame_b64, scale=scale_val,
         )
         final = refined if refined.get("found") else result
         self._log_locate_outcome(clean_target, final)
         return final
+
+    @staticmethod
+    def _resolve_frame_and_scale(
+        screen: ScreenCapture | None,
+        screen_b64: Optional[str],
+        scale: Optional[float],
+    ) -> tuple[Optional[str], float]:
+        if screen is not None:
+            return screen.b64, screen.scale
+        if screen_b64 is not None:
+            return screen_b64, float(scale if scale is not None else last_capture_scale())
+        return None, 1.0
 
     def _log_locate_outcome(self, target: str, result: dict) -> None:
         try:
@@ -569,7 +641,7 @@ class ScreenWatcher:
             log.warning("ScreenWatcher error detection failed: %s", exc)
 
     def _capture_b64(self) -> Optional[str]:
-        return capture_screen_b64()
+        return capture_screen_b64_str()
 
     def _compute_hash(self, b64: str) -> tuple:
         try:
@@ -648,6 +720,7 @@ class ScreenWatcher:
 
 __all__ = [
     "GROQ_VISION_MODEL",
+    "ScreenCapture",
     "SpatialBrain",
     "ScreenWatcher",
     "_ERROR_DETECT_PROMPT",
@@ -656,5 +729,7 @@ __all__ = [
     "base64_decode",
     "base64_encode",
     "capture_screen_b64",
+    "capture_screen_b64_str",
     "last_capture_scale",
+    "last_screen_size",
 ]

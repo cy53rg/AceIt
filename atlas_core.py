@@ -73,7 +73,7 @@ from atlas_memory_manager import MemoryManager
 from atlas_memory import UserMemory
 from atlas_skills import SkillRegistry
 from atlas_logging import get_logger, setup_logging, task_scope, new_task_id, log_outcome_json
-from atlas_stepevent import StepOrchestrator
+from atlas_stepevent import StepOrchestrator, StepOrchestratorStalled
 
 setup_logging()
 log = get_logger("core")
@@ -133,9 +133,9 @@ from atlas_vision import (
     GROQ_VISION_MODEL,
     SpatialBrain,
     ScreenWatcher,
+    ScreenCapture,
     capture_screen_b64,
-    last_capture_scale,
-    last_screen_size,
+    capture_screen_b64_str,
     base64_encode,
     base64_decode,
     extract_target_coordinate,
@@ -320,8 +320,11 @@ You are in unified adaptive mode — one assistant for everything.
 Read each message and choose the right behaviour (chat, guide, do, or task) \
 without asking the user to switch modes. When guiding a complex workflow, \
 deliver ONE step per message, confirm they are ready, then emit [[GUIDE:…]] \
-for the element they should interact with next. When they ask you to take over, \
-use [[DO:…]] or [[TASK:…]] as appropriate.\
+for the element they should interact with next. Only emit [[DO:…]] or [[TASK:…]] \
+when the user has clearly asked you to act on their behalf in THIS message or the \
+immediately preceding one — never infer permission to take control from ambiguous \
+phrasing. If you're unsure whether they want you to just talk them through it \
+versus do it yourself, ask which they'd prefer before emitting either token.\
 """
 
 # Legacy alias — default runtime mode maps here.
@@ -634,13 +637,11 @@ class StateEngine:
         """
         try:
             screen = capture_screen_b64()
-            scale = last_capture_scale()
             if kind == "GUIDE":
                 coords = self.guide_to_target(
                     target,
                     payload,
-                    screen_b64=screen,
-                    scale=scale,
+                    screen=screen,
                 )
                 if not coords.get("found"):
                     self._announce(
@@ -651,8 +652,7 @@ class StateEngine:
                 coords = self.act_on_target(
                     target,
                     action=(payload or "click").lower(),
-                    screen_b64=screen,
-                    scale=scale,
+                    screen=screen,
                 )
                 if not coords.get("found"):
                     self._announce(
@@ -673,7 +673,7 @@ class StateEngine:
     _TASK_SETTLE_S  = 0.8    # pause after each action for the UI to react
 
     def run_task(self, task: str) -> None:
-        """Run the autonomous task loop off-thread (no permission gate)."""
+        """Run the autonomous task loop off-thread after optional safety confirmation."""
         task = (task or "").strip()
         if not task:
             return
@@ -683,6 +683,11 @@ class StateEngine:
         if self.execution_blocked:
             self._announce("Agent actions are paused — check your account status.")
             return
+
+        if self.safety_mode != "off" and self._task_confirm_cb is not None:
+            if not self._task_confirm_cb(task):
+                self._emit("task_status", {"text": "Task cancelled — not confirmed."})
+                return
 
         self._task_running = True
         self._task_stop = threading.Event()
@@ -928,8 +933,7 @@ class StateEngine:
         coords = self.guide_to_target(
             target,
             instruction or f"Click {target}.",
-            screen_b64=screen,
-            scale=last_capture_scale(),
+            screen=screen,
         )
         if coords.get("found"):
             self._emit("guide_marker", {**coords, "guide": True})
@@ -949,8 +953,7 @@ class StateEngine:
         coords = self.act_on_target(
             target,
             action=(action or "click").lower(),
-            screen_b64=screen,
-            scale=last_capture_scale(),
+            screen=screen,
         )
         if not coords.get("found"):
             self._announce(f"I couldn't find \"{target}\" on your screen.")
@@ -1035,7 +1038,9 @@ class StateEngine:
                     self._emit("task_status",
                                {"text": f"   adapting: {result}"})
                     frame = capture_screen_b64()
-                    fix = self._decide_next_step(goal, [], frame)
+                    fix = self._decide_next_step(
+                        goal, [], frame.b64 if frame else None,
+                    )
                     if fix and str(fix.get("action", "")).lower() not in ("done", "fail"):
                         self._execute_step(str(fix.get("action", "")).lower(), fix)
                     else:
@@ -1192,6 +1197,7 @@ class StateEngine:
     def _task_loop(self, task: str) -> None:
         steps: list[dict] = []
         screen_hashes: list[str] = []
+        false_done_retries = 0
         try:
             self._emit("task_status", {"text": f"▶ Task: {task}"})
             voice_engine.speak("On it.")
@@ -1200,7 +1206,8 @@ class StateEngine:
                     self._emit("task_status", {"text": "■ Task stopped."})
                     break
                 frame = capture_screen_b64()
-                screen_hash = hashlib.md5((frame or "").encode("ascii")).hexdigest()
+                frame_b64 = frame.b64 if frame else ""
+                screen_hash = hashlib.md5(frame_b64.encode("ascii")).hexdigest()
                 screen_hashes.append(screen_hash)
                 if len(screen_hashes) >= 3 and len(set(screen_hashes[-3:])) == 1:
                     stuck_msg = (
@@ -1211,7 +1218,9 @@ class StateEngine:
                     voice_engine.speak(stuck_msg)
                     self._log_task_step(step_no, "stuck", "stuck", screen_hash)
                     break
-                decision = self._decide_next_step(task, steps, frame)
+                decision = self._decide_next_step(
+                    task, steps, frame.b64 if frame else None,
+                )
                 if not decision:
                     self._emit("task_status", {"text": "Couldn't plan the next step."})
                     self._log_task_step(step_no, "plan", "error", screen_hash)
@@ -1223,10 +1232,43 @@ class StateEngine:
                     voice_engine.speak(say)
                 if action in ("done", "finish", "complete"):
                     summary = decision.get("summary") or "Task complete."
-                    self._emit("task_status", {"text": f"✓ {summary}"})
-                    voice_engine.speak(summary)
-                    self._log_task_step(step_no, action, "success", screen_hash)
-                    break
+                    verify_cap = capture_screen_b64()
+                    verify_b64 = verify_cap.b64 if verify_cap else None
+                    verification = self._verify_task_completion(task, verify_b64)
+                    if verification.get("completed"):
+                        self._emit("task_status", {"text": f"✓ {summary}"})
+                        voice_engine.speak(summary)
+                        self._log_task_step(step_no, action, "success", screen_hash)
+                        break
+                    reason = str(
+                        verification.get("reason") or "Task does not appear complete on screen."
+                    ).strip()
+                    log.warning(
+                        "Task planner claimed done but verification failed for %r: %s",
+                        task,
+                        reason,
+                    )
+                    steps.append({
+                        "step": step_no,
+                        "action": "done_rejected",
+                        "detail": {
+                            "claimed_summary": summary,
+                            "verification_reason": reason,
+                        },
+                        "result": f"premature done: {reason}",
+                    })
+                    self._emit(
+                        "task_status",
+                        {"text": f"   not done yet — {reason}"},
+                    )
+                    if false_done_retries >= 1:
+                        fail_msg = f"Couldn't confirm the task finished: {reason}"
+                        self._emit("task_status", {"text": f"✗ {fail_msg}"})
+                        voice_engine.speak(fail_msg)
+                        self._log_task_step(step_no, action, "verify_failed", screen_hash)
+                        break
+                    false_done_retries += 1
+                    continue
                 if action in ("fail", "abort", "stuck", "error"):
                     reason = decision.get("reason") or "I couldn't complete that."
                     self._emit("task_status", {"text": f"✗ {reason}"})
@@ -1246,6 +1288,14 @@ class StateEngine:
                     "error",
                     screen_hashes[-1] if screen_hashes else "",
                 )
+        except StepOrchestratorStalled as exc:
+            log.error("task loop stalled: %s", exc)
+            stalled_msg = (
+                "The on-screen guide froze — the UI step handler stopped responding. "
+                "Stopping the task."
+            )
+            self._emit("task_status", {"text": f"✗ {stalled_msg}"})
+            voice_engine.speak(stalled_msg)
         except Exception as exc:
             log.error("task loop failed: %s", exc)
             self._emit("task_status", {"text": f"Task error: {exc}"})
@@ -1293,16 +1343,78 @@ class StateEngine:
             log.warning("_decide_next_step failed: %s", exc)
             return None
 
+    def _verify_task_completion(
+        self,
+        task: str,
+        frame_b64: Optional[str],
+    ) -> dict:
+        """
+        Vision check after the planner claims ``done``.
+
+        Returns ``{"completed": bool, "reason": str}``.
+        """
+        if not frame_b64:
+            return {
+                "completed": False,
+                "reason": "No screenshot available for completion check.",
+            }
+        prompt = (
+            f"Given this screenshot and the original task '{task}', has the task actually "
+            'been completed? Answer with strict JSON '
+            '{"completed": true|false, "reason": "<short>"}'
+        )
+        content: list[dict] = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{frame_b64}"},
+            },
+            {"type": "text", "text": prompt},
+        ]
+        try:
+            resp = groq_client.chat.completions.create(
+                model=GROQ_VISION_MODEL,
+                messages=[{"role": "user", "content": content}],
+                temperature=0,
+                max_tokens=120,
+            )
+            raw = resp.choices[0].message.content or "{}"
+            match = re.search(r"\{[\s\S]*\}", raw)
+            data = json.loads(match.group(0) if match else raw)
+            if not isinstance(data, dict):
+                return {"completed": False, "reason": "Invalid verification response."}
+            completed = data.get("completed", False)
+            if isinstance(completed, str):
+                completed = completed.strip().lower() in ("true", "yes", "1")
+            return {
+                "completed": bool(completed),
+                "reason": str(data.get("reason") or "").strip(),
+            }
+        except Exception as exc:
+            log.warning("_verify_task_completion failed: %s", exc)
+            return {
+                "completed": False,
+                "reason": "Completion check failed.",
+            }
+
     def _execute_step(self, action: str, d: dict) -> str:
         """Carry out one planner action via atlas_hands; return a short result."""
+        action = str(action or "").strip().lower()
+        d = d or {}
+        if action not in ("wait", "sleep", "pause"):
+            if not self._safety_allows(f"{action}: {d}"):
+                return "action denied by safety mode"
         try:
             if action in ("launch", "open", "open_app", "start"):
                 return self._launch_app(d.get("app") or d.get("target")
                                         or d.get("text") or "")
             if action in ("click", "left_click", "tap"):
-                return self._locate_and_click(d.get("target", ""), double=False)
+                return self._locate_and_click(
+                    d.get("target", ""), double=False, skip_safety=True,
+                )
             if action in ("double_click", "doubleclick", "double"):
-                return self._locate_and_click(d.get("target", ""), double=True)
+                return self._locate_and_click(
+                    d.get("target", ""), double=True, skip_safety=True,
+                )
             if action in ("type", "type_text", "write", "input"):
                 text = str(d.get("text", ""))
                 atlas_hands.type_text(text)
@@ -1332,11 +1444,16 @@ class StateEngine:
         finally:
             time.sleep(self._TASK_SETTLE_S)
 
-    def _locate_and_click(self, target: str, double: bool = False) -> str:
+    def _locate_and_click(
+        self, target: str, double: bool = False, *, skip_safety: bool = False,
+    ) -> str:
         target = (target or "").strip()
         if not target:
             return "no target given"
-        coords = self.spatial.locate(target)   # fresh full-res capture, absolute px
+        cap = capture_screen_b64()
+        if not cap:
+            return "screen capture failed"
+        coords = self.spatial.locate(target, screen=cap)
         if not coords.get("found"):
             return f"'{target}' not visible on screen"
         cx = int(coords["x"] + coords.get("w", 0) / 2)
@@ -1348,7 +1465,7 @@ class StateEngine:
             if double:
                 atlas_hands.click(cx, cy)
 
-        if not self._safety_allows(desc):
+        if not skip_safety and not self._safety_allows(desc):
             return "action denied by safety mode"
         ok = step_orchestrator.run_step(
             desc, cx, cy,
@@ -1430,6 +1547,10 @@ class StateEngine:
         # immediately rather than racing against each other.
         self._query_semaphore = threading.Semaphore(1)
 
+        # Set while learning.on_turn_complete runs; handle_input waits briefly so
+        # a fast follow-up query sees freshly extracted facts in build_memory_prompt.
+        self._facts_pending = threading.Event()
+
         # Cancellation token — set by cancel_current() to break the live Groq
         # stream so a user can interrupt Atlas mid-reply (conversational break-in).
         self._cancel = threading.Event()
@@ -1481,6 +1602,7 @@ class StateEngine:
         # Safety mode: off = auto actions, always = confirm each action, trusted = confirm once per session
         self.safety_mode = str(self.get_user_prefs().get("safety_mode", "off"))
         self._safety_session_ok = False
+        self._task_confirm_cb: Optional[Callable[[str], bool]] = None
         threading.Thread(
             target=self._model_health_check,
             daemon=True,
@@ -1516,6 +1638,7 @@ class StateEngine:
     def set_focus_mode(self, enabled: bool) -> None:
         with self._lock:
             self.focus_mode = bool(enabled)
+            self._clear_context_buffer()
             if self.session.is_active:
                 self.session.start(self.get_system_prompt())
             self.set_user_pref("focus_mode", self.focus_mode)
@@ -1768,6 +1891,10 @@ class StateEngine:
             self._push_context(text)
             return
 
+        if self.try_handle_command(text):
+            self._emit("command_handled", {"text": text, "source": source})
+            return
+
         if source == "user":
             self.audio_watcher.mark_user_typed()
 
@@ -1783,6 +1910,7 @@ class StateEngine:
             return
 
         try:
+            self._emit("query_started", {"source": source, "text": text})
             if not self.session.is_active:
                 self.session.start(self.get_system_prompt())
 
@@ -1835,7 +1963,7 @@ class StateEngine:
             if wants_screen and self._pending_screen_b64 is None:
                 frame = capture_screen_b64()
                 if frame:
-                    self.inject_screen_capture(frame)
+                    self.inject_screen_capture(frame.b64)
 
             screen_b64 = self._consume_screen_capture()
 
@@ -1843,8 +1971,8 @@ class StateEngine:
                 try:
                     frame = capture_screen_b64()
                     if frame:
-                        self.inject_screen_capture(frame)
-                        screen_b64 = frame
+                        self.inject_screen_capture(frame.b64)
+                        screen_b64 = frame.b64
                 except Exception as exc:
                     log.debug("handle_input capture frame failed: %s", exc)
 
@@ -1852,6 +1980,8 @@ class StateEngine:
                 self._maybe_capture_identity(text)
 
             context_block = self.memory.build_context_prompt(self.user_id)
+            if self._facts_pending.is_set():
+                self._facts_pending.wait(timeout=0.6)
             memory_prompt  = self.memory.build_memory_prompt(self.user_id)
             if context_block:
                 memory_prompt = (context_block + "\n\n" + memory_prompt).strip()
@@ -1951,11 +2081,7 @@ class StateEngine:
                     )
             self.memory.log_skill_outcome(self.user_id, skill_name, True, "")
             self._on_complete(response)
-            threading.Thread(
-                target=self.learning.on_turn_complete,
-                args=(raw_user_text, response),
-                daemon=True,
-            ).start()
+            self._schedule_learning_on_turn_complete(raw_user_text, response)
             self.local_memory.on_turn_complete(
                 raw_user_text,
                 response,
@@ -1966,6 +2092,23 @@ class StateEngine:
             self._on_error(str(exc))
         finally:
             self._query_semaphore.release()
+
+    def _schedule_learning_on_turn_complete(self, user_text: str, ai_text: str) -> None:
+        """Run fact extraction off-thread; gate the next prompt build briefly."""
+        self._facts_pending.set()
+
+        def _run_and_clear(ut: str, at: str) -> None:
+            try:
+                self.learning.on_turn_complete(ut, at)
+            finally:
+                self._facts_pending.clear()
+
+        threading.Thread(
+            target=_run_and_clear,
+            args=(user_text, ai_text),
+            daemon=True,
+            name="atlas-learning",
+        ).start()
 
     def _evaluate_skill(self, user_text: str, ai_text: str, skill_name: str) -> None:
         """Heuristic skill success logging after LLM-assisted skill use."""
@@ -2174,12 +2317,7 @@ class StateEngine:
                 # Single cognition pipeline: on_turn_complete extracts durable
                 # facts (with reinforcement) AND drives persona-drift checks on
                 # one daemon thread — no duplicate extraction call.
-                threading.Thread(
-                    target=self.learning.on_turn_complete,
-                    args=(raw_user_text, full_response),
-                    daemon=True,
-                    name="atlas-learning",
-                ).start()
+                self._schedule_learning_on_turn_complete(raw_user_text, full_response)
                 self.local_memory.on_turn_complete(
                     raw_user_text,
                     full_response,
@@ -2292,6 +2430,7 @@ class StateEngine:
     def locate_ui_element(
         self,
         target: str,
+        screen: ScreenCapture | None = None,
         screen_b64: Optional[str] = None,
         scale: Optional[float] = None,
         guide: bool = False,
@@ -2304,9 +2443,12 @@ class StateEngine:
         HoloOverlay focus ring when found.
         """
         try:
-            if scale is None:
-                scale = last_capture_scale() if screen_b64 else 1.0
-            coords = self.spatial.locate(target, screen_b64=screen_b64, scale=scale)
+            if screen is not None:
+                coords = self.spatial.locate(target, screen=screen)
+            else:
+                coords = self.spatial.locate(
+                    target, screen_b64=screen_b64, scale=scale,
+                )
             payload = {
                 "target": target,
                 "guide": guide,
@@ -2343,6 +2485,7 @@ class StateEngine:
         self,
         target: str,
         instruction: str = "",
+        screen: ScreenCapture | None = None,
         screen_b64: Optional[str] = None,
         scale: Optional[float] = None,
     ) -> dict:
@@ -2355,6 +2498,7 @@ class StateEngine:
         """
         coords = self.locate_ui_element(
             target,
+            screen=screen,
             screen_b64=screen_b64,
             scale=scale,
             guide=True,
@@ -2378,6 +2522,7 @@ class StateEngine:
         self,
         target: str,
         action: str = "click",
+        screen: ScreenCapture | None = None,
         screen_b64: Optional[str] = None,
         scale: Optional[float] = None,
     ) -> dict:
@@ -2387,7 +2532,9 @@ class StateEngine:
         if self.execution_blocked:
             self._announce("Agent actions are paused — check your account status.")
             return {"target": target, "found": False, "x": 0, "y": 0, "w": 0, "h": 0}
-        coords = self.locate_ui_element(target, screen_b64=screen_b64, scale=scale)
+        coords = self.locate_ui_element(
+            target, screen=screen, screen_b64=screen_b64, scale=scale,
+        )
         if not coords.get("found"):
             return coords
         cx = int(coords["x"] + coords.get("w", 0) / 2)

@@ -19,7 +19,15 @@ ATLAS_FAST_MODEL = (
     os.environ.get("ATLAS_FAST_MODEL") or _default_fast_model
 ).strip() or _default_fast_model
 
-PERSONA_BASELINE = ["precise", "direct", "confident"]
+PERSONA_BASELINE = (
+    "Atlas should sound like a trusted senior technical mentor: approachable and "
+    "human without being chatty or performative. Lead with the answer; keep replies "
+    "concise but not cold. Adapt register to the moment — exploratory when someone "
+    "is learning, surgical when they're under pressure. Plain-spoken and confident "
+    "without arrogance. No filler affirmations ('Great question!'), no rambling, "
+    "no apology for brevity, no documentation-style walls of text."
+)
+PERSONA_DRIFT_THRESHOLD = 4  # 0–10 match score; correct when below this
 DRIFT_CHECK_EVERY = 10
 DRIFT_SAMPLE_SIZE = 20
 
@@ -99,9 +107,11 @@ class LearningEngine:
             return None
         sample = "\n---\n".join(recent_responses[-DRIFT_SAMPLE_SIZE:])
         prompt = (
-            "Summarize the assistant tone in exactly 3 words. "
-            f'Baseline tone: {", ".join(PERSONA_BASELINE)}. '
-            'Return JSON: {"tone":["word1","word2","word3"]}\n\n'
+            "You evaluate whether an AI assistant's recent replies match a target persona.\n\n"
+            f"TARGET PERSONA:\n{PERSONA_BASELINE}\n\n"
+            "Read the assistant samples below. Rate how well they match the target persona "
+            "on a 0–10 scale (10 = excellent match, 0 = completely off).\n"
+            'Return JSON only: {"score": int, "brief_reason": "one sentence"}\n\n'
             f"ASSISTANT SAMPLES:\n{sample[:4000]}"
         )
         try:
@@ -116,19 +126,22 @@ class LearningEngine:
                 response_format={"type": "json_object"},
             )
             data = json.loads(resp.choices[0].message.content or "{}")
-            tone = data.get("tone", [])
-            if not isinstance(tone, list):
+            raw_score = data.get("score")
+            if raw_score is None:
                 return None
-            tone_words = {str(t).lower().strip() for t in tone}
-            baseline = {w.lower() for w in PERSONA_BASELINE}
-            if len(tone_words & baseline) < 2:
-                return (
-                    "Persona correction: stay precise, direct, and confident. "
-                    "Avoid rambling or overly casual tone."
-                )
+            score = int(raw_score)
+            if score >= PERSONA_DRIFT_THRESHOLD:
+                return None
+            reason = str(data.get("brief_reason", "")).strip()
+            correction = (
+                "Persona correction: realign with your Atlas voice — lead with the answer, "
+                "stay concise and plain-spoken, warm but not chatty, no filler or rambling."
+            )
+            if reason:
+                return f"{correction} ({reason})"
+            return correction
         except Exception:
             return None
-        return None
 
     def get_correction(self) -> str | None:
         """Return pending drift correction and clear it."""
