@@ -4,6 +4,8 @@ atlas_settings_ui.py — Atlas settings dialog (extracted from atlas_ui.py).
 from __future__ import annotations
 
 import json
+import os
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -468,6 +470,8 @@ class SettingsDialog(QDialog):
         threading.Thread(target=_work, daemon=True, name="atlas-sync").start()
 
     def _account_switch(self) -> None:
+        from atlas_ui import LoginDialog
+
         acct = getattr(self.ui, "account", None)
         if not acct:
             return

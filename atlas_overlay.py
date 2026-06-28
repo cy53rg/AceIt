@@ -105,9 +105,9 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
 
-        screen = QApplication.primaryScreen()
-        if screen:
-            self.setGeometry(screen.geometry())
+        self._origin_x = 0
+        self._origin_y = 0
+        self._sync_desktop_geometry()
 
         self._ring_pos = QPointF(0, 0)
         self._ring_scale = 1.0
@@ -166,10 +166,31 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
             self._seq.stop()
             self._seq = None
 
+    def _sync_desktop_geometry(self) -> None:
+        """Cover the full virtual desktop so markers align on every monitor."""
+        try:
+            from atlas_vision import desktop_geometry
+
+            left, top, w, h = desktop_geometry()
+        except Exception:
+            screen = QApplication.primaryScreen()
+            if screen:
+                g = screen.geometry()
+                left, top, w, h = g.x(), g.y(), g.width(), g.height()
+            else:
+                left, top, w, h = 0, 0, 1920, 1080
+        self._origin_x = left
+        self._origin_y = top
+        self.setGeometry(left, top, w, h)
+
+    def _to_local(self, x: float, y: float) -> QPointF:
+        return QPointF(x - self._origin_x, y - self._origin_y)
+
     def focus_on(self, x: int, y: int, w: int, h: int) -> None:
         """Animate ring to center of target rect, pulse, auto-hide after 3s."""
         self._cancel_anims()
-        target = QPointF(x + w / 2.0, y + h / 2.0)
+        self._sync_desktop_geometry()
+        target = self._to_local(x + w / 2.0, y + h / 2.0)
         if not self.isVisible():
             self.show()
 
@@ -221,7 +242,9 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
         Atlas never clicks it for the user, it shows them where to go.
         """
         self._marker_timer.stop()
-        self._box = QRectF(float(x), float(y), float(max(1, w)), float(max(1, h)))
+        self._sync_desktop_geometry()
+        lx, ly = float(x - self._origin_x), float(y - self._origin_y)
+        self._box = QRectF(lx, ly, float(max(1, w)), float(max(1, h)))
         self._label = str(label or "")
         self.focus_on(x, y, w, h)
         if hold_ms > 0:
@@ -230,7 +253,10 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
     def draw_path(self, points: list[tuple[int, int]], hold_ms: int = 4500) -> None:
         """Draw a trajectory vector path (connected arrowed line) over the screen."""
         self._marker_timer.stop()
-        self._path = [QPointF(float(px), float(py)) for px, py in points]
+        self._sync_desktop_geometry()
+        self._path = [
+            self._to_local(float(px), float(py)) for px, py in points
+        ]
         if self._ring_opacity <= 0.01:
             self.set_ring_opacity(1.0)
         if not self.isVisible():
@@ -324,8 +350,8 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
 
 class AgentCursorOverlay(_CaptureExclusionMixin, QWidget):
     """
-    Persistent animated agent cursor — moves smoothly between targets, never
-    teleports or disappears between steps.  Click-through, always on top.
+    Animated agent cursor for DO-mode steps — visible only while a task step
+    is running.  Moves smoothly between targets; hidden when idle.
     """
 
     CURSOR_W, CURSOR_H = 48, 48
@@ -400,6 +426,20 @@ class AgentCursorOverlay(_CaptureExclusionMixin, QWidget):
         if not self.isVisible():
             self.show()
         self._opacity = 1.0
+        self.update()
+
+    def hide_cursor(self) -> None:
+        """Fade out and hide — companion desktop stays unobstructed when idle."""
+        if self._move_grp:
+            self._move_grp.stop()
+            self._move_grp = None
+        if self._pulse_anim:
+            self._pulse_anim.stop()
+            self._pulse_anim = None
+        self._on_move_done = None
+        self._pulse = 1.0
+        self._opacity = 0.0
+        self.hide()
         self.update()
 
     def animate_to(

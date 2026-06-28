@@ -69,6 +69,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from atlas_learning import LearningEngine
+from atlas_memory_manager import MemoryManager
 from atlas_memory import UserMemory
 from atlas_skills import SkillRegistry
 from atlas_logging import get_logger, setup_logging, task_scope, new_task_id, log_outcome_json
@@ -134,16 +135,23 @@ from atlas_vision import (
     ScreenWatcher,
     capture_screen_b64,
     last_capture_scale,
+    last_screen_size,
     base64_encode,
     base64_decode,
+    extract_target_coordinate,
+    normalized_coord_to_desktop,
+    record_capture_from_b64,
+    _ATLAS_POINT_AND_TALK_VISION,
     _HAS_SCREEN_DEPS,
     _SCREEN_POLL_INTERVAL,
     _ERROR_DETECT_PROMPT,
 )
 from atlas_recorder import (
+    ActionTokenPatterns,
+    HarmonyStreamFilter,
     RoutineRecorder,
     StreamBracketFilter,
-    ActionTokenPatterns,
+    StreamCoordinateFilter,
 )
 from atlas_audio import (
     ATLAS_WHISPER_MODEL,
@@ -153,6 +161,7 @@ from atlas_audio import (
     KokoroVoiceEngine,
     VoiceRouter,
     voice_engine,
+    _strip_markdown,
 )
 
 # Backward-compatible alias used by StateEngine streaming filter
@@ -240,6 +249,7 @@ the restraint of someone who knows when one sentence beats a paragraph.
 Your communication style:
 - You speak in natural dialogue, not documentation. Never dump walls of text.
 - You lead with the answer. Context and reasoning follow only when they add value.
+- Never expose chain-of-thought, analysis, or internal reasoning — only the final answer.
 - You ask one sharp clarifying question when context is genuinely thin — not as \
 a stall, but because the right question saves ten wrong answers.
 - You adapt your register instantly: casual with someone exploring, surgical with \
@@ -580,7 +590,7 @@ class StateEngine:
     # Interview Mode speaks in short phrase chunks rather than whole sentences so
     # the voice track keeps pace with the instant text render and trailing
     # punctuation never causes a stutter.
-    _VOICE_WORD_CHUNK = 5
+    _VOICE_WORD_CHUNK = 4
 
     # Visual function bindings (Section 6): the agent emits these inline so the
     # engine can drive the HUD ("GUIDE") or autonomous automation ("DO").
@@ -1443,6 +1453,8 @@ class StateEngine:
         # Persistent user memory, skills, learning, spatial co-pilot.
         self.memory = UserMemory()
         self.user_id = self.memory.create_or_login(user_name)
+        self.local_memory = MemoryManager()
+        self.local_memory.ensure_session()
         self.skill_registry = SkillRegistry()
         self.learning = LearningEngine(self.memory, self.user_id)
         self.active_skill: Optional[str] = None
@@ -1678,6 +1690,27 @@ class StateEngine:
             log.warning("identity capture failed: %s", exc)
         return name
 
+    @staticmethod
+    def _infer_user_goal(text: str) -> str:
+        """Lightweight goal hint for local session memory (first-turn heuristic)."""
+        t = (text or "").strip()
+        if not t:
+            return ""
+        low = t.lower()
+        for prefix in (
+            "help me ",
+            "i want to ",
+            "i need to ",
+            "my goal is ",
+            "i'm trying to ",
+            "i am trying to ",
+        ):
+            if low.startswith(prefix):
+                return t[:240]
+        if "?" not in t and len(t.split()) >= 4:
+            return t[:240]
+        return ""
+
     def _mentions_screen(self, text: str) -> bool:
         t = (text or "").lower()
         return any(p in t for p in self._SCREEN_PHRASES)
@@ -1691,6 +1724,8 @@ class StateEngine:
         """
         with self._screen_lock:
             self._pending_screen_b64 = screen_b64
+        if screen_b64:
+            record_capture_from_b64(screen_b64)
 
     def _consume_screen_capture(self) -> Optional[str]:
         """Pop and return the pending screen capture (one-shot)."""
@@ -1744,123 +1779,150 @@ class StateEngine:
                 "a query is already in flight.",
                 source,
             )
+            self._emit("query_rejected", {"source": source, "reason": "busy"})
             return
 
-        if not self.session.is_active:
-            self.session.start(self.get_system_prompt())
+        try:
+            if not self.session.is_active:
+                self.session.start(self.get_system_prompt())
 
-        # ── Enrich the user input with ambient screen context ─────────────────
-        context_snap   = self._get_context_snapshot()
-        enriched_input = text
-        if context_snap:
-            enriched_input = (
-                "[AMBIENT SCREEN CONTEXT — background awareness only; "
-                "do not narrate unless directly relevant to the user's question]\n"
-                f"{context_snap}\n\n"
-                "[USER INPUT]\n"
-                f"{text}"
+            # ── Enrich the user input with ambient screen context ─────────────────
+            context_snap   = self._get_context_snapshot()
+            enriched_input = text
+            if context_snap:
+                enriched_input = (
+                    "[AMBIENT SCREEN CONTEXT — background awareness only; "
+                    "do not narrate unless directly relevant to the user's question]\n"
+                    f"{context_snap}\n\n"
+                    "[USER INPUT]\n"
+                    f"{text}"
+                )
+
+            audio_ctx = self.audio_watcher.get_audio_context(20.0)
+            if audio_ctx:
+                enriched_input = (
+                    f"Audio context from the user's screen: [{audio_ctx}]\n\n"
+                    f"{enriched_input}"
+                )
+
+            screen_analyzed = False
+            if (
+                os.environ.get("ATLAS_SCREEN_PREFETCH", "").strip().lower() in ("1", "true", "yes", "on")
+                and source in ("user", "mic", "highlight", "capture")
+                and self._mentions_screen(text)
+            ):
+                analysis = self.screen_watcher.take_and_analyze(text)
+                if analysis:
+                    enriched_input = f"[SCREEN ANALYSIS]\n{analysis}\n\n{enriched_input}"
+                    screen_analyzed = True
+
+            wants_screen = (
+                not screen_analyzed
+                and (
+                    source == "capture"
+                    or self._mentions_screen(text)
+                    or self.focus_mode
+                    or self.mode in (ModeState.INTERVIEW, ModeState.GUIDED)
+                    or (
+                        getattr(self, "_copilot_active", False)
+                        and (
+                            getattr(self, "screen_vision", False)
+                            or source in ("user", "mic", "highlight")
+                        )
+                    )
+                )
             )
+            if wants_screen and self._pending_screen_b64 is None:
+                frame = capture_screen_b64()
+                if frame:
+                    self.inject_screen_capture(frame)
 
-        audio_ctx = self.audio_watcher.get_audio_context(20.0)
-        if audio_ctx:
-            enriched_input = (
-                f"Audio context from the user's screen: [{audio_ctx}]\n\n"
-                f"{enriched_input}"
-            )
+            screen_b64 = self._consume_screen_capture()
 
-        screen_analyzed = False
-        if source in ("user", "mic", "highlight", "capture") and self._mentions_screen(text):
-            analysis = self.screen_watcher.take_and_analyze(text)
-            if analysis:
-                enriched_input = f"[SCREEN ANALYSIS]\n{analysis}\n\n{enriched_input}"
-                screen_analyzed = True
+            if source == "capture" and not screen_b64:
+                try:
+                    frame = capture_screen_b64()
+                    if frame:
+                        self.inject_screen_capture(frame)
+                        screen_b64 = frame
+                except Exception as exc:
+                    log.debug("handle_input capture frame failed: %s", exc)
 
-        # ── Grab the screen silently so Atlas can SEE it ──────────────────────
-        # Captured headlessly here (off the UI thread — handle_input already runs
-        # on a worker) and attached as a vision frame to this query.  We capture
-        # in Interview and Guided modes, whenever the screen-vision flag is on
-        # (e.g. the screen watcher is active), or when the user references their
-        # screen — so "can you see my screen?" actually works.
-        wants_screen = (
-            not screen_analyzed
-            and (
-                self.focus_mode
-                or self.mode in (ModeState.INTERVIEW, ModeState.GUIDED)
-                or getattr(self, "screen_vision", False)
-                or self._mentions_screen(text)
-            )
-        )
-        if wants_screen and self._pending_screen_b64 is None:
-            frame = capture_screen_b64()
-            if frame:
-                self.inject_screen_capture(frame)
+            if source in ("user", "mic", "highlight"):
+                self._maybe_capture_identity(text)
 
-        # ── Route to vision builder if any image frame is available ──────────
-        screen_b64 = self._consume_screen_capture()
+            context_block = self.memory.build_context_prompt(self.user_id)
+            memory_prompt  = self.memory.build_memory_prompt(self.user_id)
+            if context_block:
+                memory_prompt = (context_block + "\n\n" + memory_prompt).strip()
+            local_block = self.local_memory.build_local_context_block(enriched_input, top_k=5)
+            if local_block:
+                memory_prompt = (
+                    (memory_prompt + "\n\n" + local_block).strip()
+                    if memory_prompt else local_block
+                )
+            drift_correction = self.learning.get_correction() or ""
+            skill_context = ""
+            skill_name = self._resolve_skill(text)
+            if skill_name:
+                self.active_skill = skill_name
+                warn = self.learning.get_skill_warning(skill_name)
+                if warn:
+                    skill_context = warn
+                result = self.skill_registry.execute(
+                    skill_name,
+                    enriched_input,
+                    list(self.session._history),
+                    self.memory,
+                    atlas_fs,
+                    atlas_hands,
+                    groq_client,
+                )
+                if result.get("success") and result.get("response"):
+                    self._finish_skill_response(text, skill_name, result)
+                    return
 
-        # Capture an explicitly-stated name immediately (permanent) so it's part
-        # of THIS turn's memory block and survives across sessions.
-        if source in ("user", "mic", "highlight"):
-            self._maybe_capture_identity(text)
+            if self.active_skill and not skill_context:
+                warn = self.learning.get_skill_warning(self.active_skill)
+                if warn:
+                    skill_context = warn
 
-        # Standing instructions ("global context") apply to every mode/feature,
-        # so they ride at the front of the memory block injected into all prompts.
-        context_block = self.memory.build_context_prompt(self.user_id)
-        memory_prompt  = self.memory.build_memory_prompt(self.user_id)
-        if context_block:
-            memory_prompt = (context_block + "\n\n" + memory_prompt).strip()
-        drift_correction = self.learning.get_correction() or ""
-        skill_context = ""
-        skill_name = self._resolve_skill(text)
-        if skill_name:
-            self.active_skill = skill_name
-            warn = self.learning.get_skill_warning(skill_name)
-            if warn:
-                skill_context = warn
-            result = self.skill_registry.execute(
-                skill_name,
-                enriched_input,
-                list(self.session._history),
-                self.memory,
-                atlas_fs,
-                atlas_hands,
-                groq_client,
-            )
-            if result.get("success") and result.get("response"):
-                self._finish_skill_response(text, skill_name, result)
-                return
+            screen_ctx_summary = ""
+            if screen_b64:
+                screen_ctx_summary = "Live desktop screenshot attached to this turn."
+            elif context_snap:
+                screen_ctx_summary = context_snap[:320].strip()
+            self._last_turn_screen_context = screen_ctx_summary
+            self._last_turn_goal_hint = self._infer_user_goal(text)
 
-        if self.active_skill and not skill_context:
-            warn = self.learning.get_skill_warning(self.active_skill)
-            if warn:
-                skill_context = warn
+            if webcam_b64 or screen_b64:
+                messages = self.build_messages_with_vision(
+                    user_text=enriched_input,
+                    webcam_b64=webcam_b64,
+                    screen_b64=screen_b64,
+                    memory_prompt=memory_prompt,
+                    skill_context=skill_context,
+                    drift_correction=drift_correction,
+                )
+            else:
+                messages = self.session.build_messages(
+                    enriched_input,
+                    memory_prompt=memory_prompt,
+                    skill_context=skill_context,
+                    drift_correction=drift_correction,
+                )
 
-        if webcam_b64 or screen_b64:
-            messages = self.build_messages_with_vision(
-                user_text=enriched_input,
-                webcam_b64=webcam_b64,
-                screen_b64=screen_b64,
-                memory_prompt=memory_prompt,
-                skill_context=skill_context,
-                drift_correction=drift_correction,
-            )
-        else:
-            messages = self.session.build_messages(
-                enriched_input,
-                memory_prompt=memory_prompt,
-                skill_context=skill_context,
-                drift_correction=drift_correction,
-            )
+            threading.Thread(
+                target=self._on_ai_query,
+                args=(messages, text, bool(screen_b64)),
+                daemon=True,
+                name="atlas-query",
+            ).start()
 
-        # FIX-3: push_user is called INSIDE _on_ai_query, only after the stream
-        # emits its first chunk.  We pass the raw (non-enriched) text so the
-        # history entry matches what the user actually sent.
-        threading.Thread(
-            target  = self._on_ai_query,
-            args    = (messages, text),
-            daemon  = True,
-            name    = "atlas-query",
-        ).start()
+        except Exception as exc:
+            log.warning("handle_input failed before query dispatch: %s", exc)
+            self._query_semaphore.release()
+            self._emit("query_failed", {"source": source, "error": str(exc)})
 
     def _resolve_skill(self, text: str) -> Optional[str]:
         """Match @skill_name prefix or trigger keywords."""
@@ -1894,6 +1956,12 @@ class StateEngine:
                 args=(raw_user_text, response),
                 daemon=True,
             ).start()
+            self.local_memory.on_turn_complete(
+                raw_user_text,
+                response,
+                screen_context_summary=getattr(self, "_last_turn_screen_context", ""),
+                user_goal_hint=getattr(self, "_last_turn_goal_hint", ""),
+            )
         except Exception as exc:
             self._on_error(str(exc))
         finally:
@@ -1911,7 +1979,28 @@ class StateEngine:
 
     # ── Groq streaming query — owns TTS sentence pipeline (FIX-1 & FIX-3) ────
 
-    def _on_ai_query(self, messages: list[dict], raw_user_text: str) -> None:
+    def _emit_point_and_talk_coordinate(self, coord: dict, target_hint: str = "") -> None:
+        """Forward a model-emitted ``[TARGET_COORDINATE: X, Y]`` tag to the HUD."""
+        px, py = normalized_coord_to_desktop(coord["x"], coord["y"])
+        box_w, box_h = 96, 48
+        payload = {
+            "found": True,
+            "x": max(0, px - box_w // 2),
+            "y": max(0, py - box_h // 2),
+            "w": box_w,
+            "h": box_h,
+            "guide": True,
+            "label": target_hint or "Here",
+            "target": target_hint or "on-screen element",
+            "source": "point_and_talk",
+        }
+        self._emit("spatial_coordinates", payload)
+        try:
+            self._on_coordinates(payload)
+        except Exception as exc:
+            log.debug("on_coordinates callback raised: %s", exc)
+
+    def _on_ai_query(self, messages: list[dict], raw_user_text: str, had_screen: bool = False) -> None:
         """
         Execute a Groq streaming API call, pipe text deltas to the UI and to
         the TTS sentence buffer, then commit both history turns on success.
@@ -1944,23 +2033,27 @@ class StateEngine:
         # text model.  Interview Mode streams voice in short word-window chunks.
         use_vision = self._messages_have_image(messages)
         model      = GROQ_VISION_MODEL if use_vision else GROQ_MODEL
-        word_mode  = self.focus_mode or (self.mode == ModeState.INTERVIEW)
+        word_mode  = True  # flush TTS in small word chunks — speak sooner while streaming
         # Strips [[GUIDE/DO:…]] tokens from the visible/spoken stream in real time
         # and surfaces them to the action dispatcher (Section 6).
         bracket    = _StreamBracketFilter()
+        harmony    = HarmonyStreamFilter()
+        coord_filt = StreamCoordinateFilter()
+        coord_tag: dict | None = None
 
         try:
             from groq import APIConnectionError, RateLimitError
 
             stream = None
             backoffs = (1, 2, 4)
+            create_kwargs: dict = {"model": model, "messages": messages, "stream": True}
+            if str(model).startswith("openai/gpt-oss"):
+                effort = (os.environ.get("ATLAS_REASONING_EFFORT") or "low").strip().lower()
+                if effort in ("low", "medium", "high"):
+                    create_kwargs["reasoning_effort"] = effort
             for attempt, delay in enumerate(backoffs):
                 try:
-                    stream = groq_client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        stream=True,
-                    )
+                    stream = groq_client.chat.completions.create(**create_kwargs)
                     break
                 except (APIConnectionError, RateLimitError) as exc:
                     if attempt + 1 >= len(backoffs):
@@ -1979,22 +2072,27 @@ class StateEngine:
 
                 if not getattr(chunk, "choices", None):
                     continue
-                delta = chunk.choices[0].delta.content or ""
+                delta_obj = chunk.choices[0].delta
+                if getattr(delta_obj, "reasoning", None):
+                    continue
+                delta = delta_obj.content or ""
                 if not delta:
                     continue
 
-                # FIX-3: Record the user turn only once, on first live chunk.
-                if not first_chunk_received:
-                    self.session.push_user(raw_user_text)
-                    first_chunk_received = True
-
                 # Section 6: split visible prose from inline action tokens.
                 visible, action_tokens = bracket.feed(delta)
+                visible = harmony.feed(visible)
+                visible = coord_filt.feed(visible)
                 for tok in action_tokens:
                     self._dispatch_action_token(tok)
 
                 if not visible:
                     continue
+
+                # FIX-3: Record the user turn only once, on first user-visible chunk.
+                if not first_chunk_received:
+                    self.session.push_user(raw_user_text)
+                    first_chunk_received = True
 
                 # Forward the clean (token-free) delta to the UI for display.
                 try:
@@ -2031,8 +2129,12 @@ class StateEngine:
 
             # Release any text the bracket filter was holding at stream end.
             tail, tail_tokens = bracket.flush()
+            tail = harmony.feed(tail) + harmony.flush()
+            tail = coord_filt.feed(tail)
             for tok in tail_tokens:
                 self._dispatch_action_token(tok)
+            tail_remainder, coord_tag = coord_filt.flush()
+            tail = (tail + tail_remainder).strip()
             if tail:
                 try:
                     self._on_chunk(tail)
@@ -2048,6 +2150,14 @@ class StateEngine:
 
             # Commit the assistant turn to history only if we have a response.
             if full_response:
+                # Safety net: strip any coordinate tag the stream filter missed.
+                clean_response, late_coord = extract_target_coordinate(full_response)
+                if late_coord:
+                    coord_tag = late_coord
+                full_response = clean_response
+                if had_screen and coord_tag:
+                    self._emit_point_and_talk_coordinate(coord_tag)
+
                 self.session.push_assistant(full_response)
                 prompt_tok = max(1, len(raw_user_text) // 4)
                 completion_tok = max(1, len(full_response) // 4)
@@ -2070,6 +2180,14 @@ class StateEngine:
                     daemon=True,
                     name="atlas-learning",
                 ).start()
+                self.local_memory.on_turn_complete(
+                    raw_user_text,
+                    full_response,
+                    screen_context_summary=getattr(
+                        self, "_last_turn_screen_context", ""
+                    ),
+                    user_goal_hint=getattr(self, "_last_turn_goal_hint", ""),
+                )
                 if self.active_skill:
                     skill = self.active_skill
                     threading.Thread(
@@ -2086,7 +2204,9 @@ class StateEngine:
         except Exception as exc:
             log.error("_on_ai_query: Groq stream error: %s", exc)
             try:
-                self._on_error(str(exc))
+                from atlas_interaction import friendly_error
+                msg = friendly_error("api", str(exc))
+                self._on_error(msg)
             except Exception as cb_exc:
                 log.debug("on_error callback raised: %s", cb_exc)
         finally:
@@ -2129,10 +2249,7 @@ class StateEngine:
 
         messages: list[dict] = [{"role": "system", "content": system_content}]
         if screen_b64:
-            messages.append({"role": "system", "content": (
-                "A live screenshot of the user's screen is attached to their "
-                "message. You CAN see their screen — read what's on it directly "
-                "and answer about it. Never claim you cannot see the screen.")})
+            messages.append({"role": "system", "content": _ATLAS_POINT_AND_TALK_VISION})
         if webcam_b64:
             messages.append({"role": "system", "content": (
                 "A live webcam frame from the user is attached; you can see it.")})

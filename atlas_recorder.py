@@ -12,7 +12,7 @@ import time
 from typing import Optional
 
 from atlas_logging import get_logger
-from atlas_vision import base64_encode
+from atlas_vision import base64_encode, extract_target_coordinate
 
 log = get_logger("recorder")
 
@@ -273,13 +273,137 @@ class StreamBracketFilter:
         return visible, tokens
 
 
+class StreamCoordinateFilter:
+    """
+    Incrementally strips trailing ``[TARGET_COORDINATE: X, Y]`` tags from streamed
+    LLM output so they never reach chat or TTS, while preserving partial tags at
+    chunk boundaries until the stream completes.
+    """
+
+    _PARTIAL_TAIL_RE = re.compile(r"\[TARGET_COORDINATE[^\]]*$", re.IGNORECASE)
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._coords: dict | None = None
+
+    def feed(self, delta: str) -> str:
+        self._buf += delta
+        # Hold an incomplete tag suffix across chunks.
+        hold = self._PARTIAL_TAIL_RE.search(self._buf)
+        if hold:
+            emit = self._buf[: hold.start()]
+            self._buf = self._buf[hold.start() :]
+        else:
+            emit = self._buf
+            self._buf = ""
+        # Strip any fully-formed tag that arrived in this slice.
+        clean, coord = extract_target_coordinate(emit)
+        if coord:
+            self._coords = coord
+        return clean
+
+    def flush(self) -> tuple[str, dict | None]:
+        """Return leftover visible text and any captured coordinate tag."""
+        clean, coord = extract_target_coordinate(self._buf)
+        if coord:
+            self._coords = coord
+        self._buf = ""
+        captured = self._coords
+        self._coords = None
+        return clean, captured
+
+
 # Backward-compatible alias used by atlas_core during migration.
 _StreamBracketFilter = StreamBracketFilter
 
 
+class HarmonyStreamFilter:
+    """
+    Strip GPT-OSS / harmony *analysis* channel tokens from streamed text.
+
+    Models like ``openai/gpt-oss-120b`` emit an internal reasoning channel before
+    the user-facing *final* channel.  This filter keeps only final-channel prose
+    for chat display and TTS.
+    """
+
+    _ANALYSIS_RE = re.compile(
+        r"<\|start\|>assistant<\|channel\|>analysis",
+        re.IGNORECASE,
+    )
+    _FINAL_RE = re.compile(
+        r"<\|start\|>assistant<\|channel\|>final",
+        re.IGNORECASE,
+    )
+    _CONTROL_TOKEN_RE = re.compile(r"<\|[^|]+\|>")
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._emitting = True
+
+    def feed(self, delta: str) -> str:
+        if not delta:
+            return ""
+        self._buf += delta
+        out: list[str] = []
+
+        while self._buf:
+            if not self._emitting:
+                final = self._FINAL_RE.search(self._buf)
+                if not final:
+                    self._buf = self._buf[-80:]
+                    break
+                self._buf = self._buf[final.end():]
+                if self._buf.startswith("<|message|>"):
+                    self._buf = self._buf[len("<|message|>") :]
+                self._emitting = True
+                continue
+
+            analysis = self._ANALYSIS_RE.search(self._buf)
+            if analysis:
+                prefix = self._buf[: analysis.start()]
+                if prefix:
+                    cleaned = self._clean(prefix)
+                    if cleaned:
+                        out.append(cleaned)
+                self._buf = self._buf[analysis.end() :]
+                self._emitting = False
+                continue
+
+            hold = 0
+            for i in range(min(64, len(self._buf)), 0, -1):
+                tail = self._buf[-i:]
+                if "<|" in tail and "|>" not in tail[tail.rfind("<|") :]:
+                    hold = i
+                    break
+            emit_len = len(self._buf) - hold
+            if emit_len <= 0:
+                break
+            chunk = self._buf[:emit_len]
+            self._buf = self._buf[emit_len:]
+            cleaned = self._clean(chunk)
+            if cleaned:
+                out.append(cleaned)
+
+        return "".join(out)
+
+    def flush(self) -> str:
+        if not self._emitting:
+            self._buf = ""
+            return ""
+        rest = self._clean(self._buf)
+        self._buf = ""
+        return rest
+
+    @classmethod
+    def _clean(cls, text: str) -> str:
+        return cls._CONTROL_TOKEN_RE.sub("", text or "")
+
+
 __all__ = [
     "ActionTokenPatterns",
+    "HarmonyStreamFilter",
     "RoutineRecorder",
     "StreamBracketFilter",
+    "StreamCoordinateFilter",
     "_StreamBracketFilter",
 ]

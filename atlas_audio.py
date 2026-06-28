@@ -32,10 +32,18 @@ except Exception:  # pragma: no cover - optional dependency
     webrtcvad = None  # type: ignore
     _HAS_WEBRTCVAD = False
 
-_default_whisper = "whisper-large-v3"
+_default_whisper = "whisper-large-v3-turbo"
 ATLAS_WHISPER_MODEL = (
     os.environ.get("ATLAS_WHISPER_MODEL") or _default_whisper
 ).strip() or _default_whisper
+
+def _endpoint_silence_s() -> float:
+    """Trailing silence (seconds) after speech before Atlas transcribes and replies."""
+    raw = (os.environ.get("ATLAS_ENDPOINT_SILENCE_S") or "1.5").strip()
+    try:
+        return max(0.8, min(4.0, float(raw)))
+    except ValueError:
+        return 1.5
 
 _VOICE_ALWAYS_ON = os.environ.get("ATLAS_VOICE_ALWAYS_ON", "").strip().lower() in (
     "1", "true", "yes", "on",
@@ -189,11 +197,11 @@ class AudioEngine:
 
     _LISTEN_RATE         = 16_000
     _LISTEN_FRAME_MS     = 30      # 480 samples @ 16 kHz — valid webrtcvad frame
-    _ENDPOINT_SILENCE_S  = 3.0     # trailing silence that ends the utterance
-    _LISTEN_MIN_SPEECH_S = 0.30    # ignore sub-300 ms blips (clicks, taps)
+    _ENDPOINT_SILENCE_S  = 1.5     # trailing silence before transcribe (override via env)
+    _LISTEN_MIN_SPEECH_S = 0.25    # ignore sub-250 ms blips (clicks, taps)
     _LISTEN_MAX_S        = 30.0    # hard safety cap on a single utterance
-    _LISTEN_PREROLL_S    = 0.30    # audio kept just before speech onset
-    _LISTEN_TAIL_KEEP_S  = 0.30    # trailing silence kept before Whisper
+    _LISTEN_PREROLL_S    = 0.20    # audio kept just before speech onset
+    _LISTEN_TAIL_KEEP_S  = 0.12    # minimal trailing silence sent to Whisper
     _LISTEN_ABS_FLOOR    = 0.010   # absolute RMS floor for the fallback detector
 
     def __init__(
@@ -285,6 +293,7 @@ class AudioEngine:
         self._finalize_now.clear()
         self._listen_cancel.clear()
         self._listen_floor = 0.005
+        self._endpoint_silence_s = _endpoint_silence_s()
         self._on_state("listening")
         self._on_status("🎧 Listening…")
         self._listen_thread = threading.Thread(
@@ -376,7 +385,7 @@ class AudioEngine:
                             if speech_started:
                                 trailing_silence += frame_dur
                                 collected.append(frame)
-                                if trailing_silence >= self._ENDPOINT_SILENCE_S:
+                                if trailing_silence >= self._endpoint_silence_s:
                                     done = True
                                     break
                             else:
@@ -781,6 +790,16 @@ class KokoroVoiceEngine:
         )
         self._worker_thread.start()
         KokoroVoiceEngine._instance = self
+
+    def preload(self) -> None:
+        """Load Kokoro models in the background so the first speak() is instant."""
+        if self._ready:
+            return
+        threading.Thread(
+            target=self._ensure_kokoro_loaded,
+            daemon=True,
+            name="atlas-kokoro-preload",
+        ).start()
 
     def speak(self, text: str) -> None:
         if self._muted or not text or not text.strip():
@@ -1224,6 +1243,16 @@ class VoiceRouter:
     def set_speed(self, speed: float) -> None:
         self.kokoro.set_speed(speed)
         self.eleven.set_speed(speed)
+
+    def preload(self) -> None:
+        """Warm up TTS backends before the first utterance."""
+        self.kokoro.preload()
+        if self.eleven.is_active:
+            threading.Thread(
+                target=self.eleven._ensure_client,
+                daemon=True,
+                name="atlas-eleven-preload",
+            ).start()
 
     def shutdown(self) -> None:
         self.eleven.shutdown(); self.kokoro.shutdown()
