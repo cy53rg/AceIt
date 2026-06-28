@@ -39,6 +39,8 @@ def main() -> None:
     print()
     for label, mod in (
         ("atlas_memory", "atlas_memory"),
+        ("atlas_memory_manager", "atlas_memory_manager"),
+        ("atlas_interaction", "atlas_interaction"),
         ("atlas_skills", "atlas_skills"),
         ("atlas_learning", "atlas_learning"),
         ("atlas_core", "atlas_core"),

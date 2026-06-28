@@ -39,11 +39,130 @@ def base64_decode(text: str) -> bytes:
 
 # Scale factor from the most recent capture_screen_b64() call (1.0 = full resolution).
 _LAST_CAPTURE_SCALE: float = 1.0
+_LAST_CAPTURE_SIZE: tuple[int, int] = (0, 0)   # (w, h) of image sent to the vision model
+_LAST_SCREEN_SIZE: tuple[int, int] = (0, 0)    # native desktop pixels for the grab
+
+
+def desktop_geometry() -> tuple[int, int, int, int]:
+    """
+    Virtual desktop bounds as (left, top, width, height).
+
+    Matches ``mss.monitors[0]`` — the same coordinate space used by screen
+    capture and Point-and-Talk mapping.  Falls back to the Qt primary screen.
+    """
+    try:
+        import mss  # type: ignore
+
+        with mss.mss() as sct:
+            m = sct.monitors[0]
+            return int(m["left"]), int(m["top"]), int(m["width"]), int(m["height"])
+    except Exception:
+        pass
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        screen = QApplication.primaryScreen()
+        if screen:
+            g = screen.geometry()
+            return g.x(), g.y(), g.width(), g.height()
+    except Exception:
+        pass
+    return 0, 0, 1920, 1080
 
 
 def last_capture_scale() -> float:
     """Return the pixel scale for the last downscaled screen capture."""
     return _LAST_CAPTURE_SCALE
+
+
+def last_screen_size() -> tuple[int, int]:
+    """Native desktop width/height of the last screen capture."""
+    return _LAST_SCREEN_SIZE
+
+
+# Trailing coordinate tag emitted by the vision LLM (Point-and-Talk / HeyClicky style).
+TARGET_COORDINATE_RE = re.compile(
+    r"\[TARGET_COORDINATE:\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]\s*",
+    re.IGNORECASE,
+)
+
+_ATLAS_POINT_AND_TALK_VISION = """\
+POINT-AND-TALK — SCREEN-AWARE DESKTOP AGENT (screenshot attached):
+
+You are a spatial, screen-aware desktop co-pilot. The attached image is the user's \
+live desktop — treat it as ground truth.
+
+STRUCTURAL ANALYSIS (do this silently before answering):
+- Map the layout: windows, panes, toolbars, dialogs, menus, text fields, buttons, icons.
+- Note what is foreground vs background and which controls look active or focused.
+- Ground every claim in what is actually visible — never invent UI that is not on screen.
+
+RESPONSE STYLE:
+- Concise, clear, human dialogue. Lead with the answer.
+- Name on-screen elements by their visible labels (e.g. "the blue Save button, top-right").
+- Never say you cannot see the screen when an image is attached.
+
+COORDINATE TAG — machine-only metadata (HeyClicky-style Point-and-Talk):
+- When your answer refers to ONE specific control, field, button, icon, or region the \
+user should notice or interact with, append EXACTLY ONE tag as the absolute final \
+characters of your raw response (after all prose; nothing may follow it):
+  [TARGET_COORDINATE: X, Y]
+- X and Y use normalized screenshot space: 0 = left/top edge, 1000 = right/bottom edge \
+of the attached image (not raw pixels).
+- Put the point at the visual center of the element you mean.
+- Omit the tag when no specific on-screen target is needed.
+- Never mention, describe, or speak the coordinate tag — the user must not see or hear it.
+
+Example ending: "...tap the gear icon in the toolbar. [TARGET_COORDINATE: 842, 127]"
+"""
+
+
+def extract_target_coordinate(text: str) -> tuple[str, dict | None]:
+    """
+    Strip a trailing ``[TARGET_COORDINATE: X, Y]`` tag from *text*.
+
+    Returns (clean_text, coord_dict|None).  Coordinates are normalized 0–1000.
+    """
+    if not text:
+        return text, None
+    match = TARGET_COORDINATE_RE.search(text)
+    if not match:
+        return text, None
+    clean = TARGET_COORDINATE_RE.sub("", text).rstrip()
+    return clean, {
+        "x": float(match.group(1)),
+        "y": float(match.group(2)),
+        "normalized": True,
+    }
+
+
+def normalized_coord_to_desktop(nx: float, ny: float) -> tuple[int, int]:
+    """Map normalized 0–1000 vision coords to absolute desktop pixels."""
+    sw, sh = _LAST_SCREEN_SIZE
+    if sw <= 0 or sh <= 0:
+        sw, sh = 1920, 1080
+    px = int(round(max(0.0, min(1000.0, nx)) / 1000.0 * sw))
+    py = int(round(max(0.0, min(1000.0, ny)) / 1000.0 * sh))
+    return px, py
+
+
+def record_capture_from_b64(b64: str) -> None:
+    """
+    Update desktop/capture dimension metadata from a base64 PNG or JPEG frame.
+
+    Called when the UI injects a user-attached screenshot so Point-and-Talk
+    coordinate tags map correctly even if ``capture_screen_b64()`` was not used.
+    """
+    global _LAST_CAPTURE_SCALE, _LAST_CAPTURE_SIZE, _LAST_SCREEN_SIZE
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(base64_decode(b64))).convert("RGB")
+        _LAST_SCREEN_SIZE = (img.width, img.height)
+        _LAST_CAPTURE_SIZE = (img.width, img.height)
+        _LAST_CAPTURE_SCALE = 1.0
+    except Exception as exc:
+        log.debug("record_capture_from_b64 failed: %s", exc)
 
 
 def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
@@ -58,8 +177,10 @@ def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
     Vision models return coordinates in *image* pixel space; multiply by
     ``last_capture_scale()`` to map clicks and overlay markers to the desktop.
     """
-    global _LAST_CAPTURE_SCALE
+    global _LAST_CAPTURE_SCALE, _LAST_CAPTURE_SIZE, _LAST_SCREEN_SIZE
     _LAST_CAPTURE_SCALE = 1.0
+    _LAST_CAPTURE_SIZE = (0, 0)
+    _LAST_SCREEN_SIZE = (0, 0)
     try:
         from PIL import Image
         try:
@@ -73,11 +194,15 @@ def capture_screen_b64(max_width: int = 1280) -> Optional[str]:
 
             img = ImageGrab.grab().convert("RGB")
 
+        orig_w, orig_h = img.width, img.height
+        _LAST_SCREEN_SIZE = (orig_w, orig_h)
+
         if img.width > max_width:
-            orig_w = img.width
             ratio = max_width / float(orig_w)
             img = img.resize((max_width, int(img.height * ratio)))
             _LAST_CAPTURE_SCALE = orig_w / float(max_width)
+
+        _LAST_CAPTURE_SIZE = (img.width, img.height)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return base64_encode(buf.getvalue())

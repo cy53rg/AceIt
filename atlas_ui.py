@@ -24,7 +24,7 @@ Phase 1 Architectural Changes
 from __future__ import annotations
 
 # ── DPI Awareness — MUST be set before any Qt or third-party import ────────────
-import os, sys
+import os, sys, platform
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
 import base64
@@ -58,7 +58,7 @@ from PySide6.QtWidgets import (
     QDialog, QSlider, QComboBox, QTabWidget, QScrollArea,
     QListWidget, QListWidgetItem, QStackedWidget, QCheckBox,
     QProgressBar, QFileDialog, QMenu, QCompleter, QTableWidget,
-    QTableWidgetItem, QHeaderView, QMessageBox, QGridLayout, QToolButton,
+    QTableWidgetItem, QHeaderView, QMessageBox, QGridLayout, QToolButton, QSizeGrip,
 )
 
 # ── Markdown renderer ─────────────────────────────────────────────────────────
@@ -234,13 +234,13 @@ except ImportError:
     HAS_PYGMENTS = False
 
 QSS_BASE = f"""
-QWidget {{ background: transparent; color: {PAL['text']}; font-family: 'Segoe UI'; font-size: 12px; }}
-QFrame#titlebar {{ background: {PAL['surface']}; border-radius: 14px; border: 1px solid {PAL['border']}; }}
-QFrame#floating_header {{ background: {PAL['surface']}; border-radius: 14px; border: 1px solid {PAL['border']}; }}
-QFrame#orbzone {{ background: transparent; }}
-QFrame#workspace {{ background: {PAL['surface']}; border-radius: 14px; border: 1px solid {PAL['border']}; }}
-QFrame#action_dock {{ background: {PAL['surface_2']}; border-radius: 12px; border: 1px solid {PAL['border']}; }}
-QPushButton {{ background: transparent; border: none; }}
+QWidget {{ background: transparent; color: {PAL['text']}; font-family: 'Segoe UI'; font-size: 12px; cursor: default; }}
+QFrame#titlebar {{ background: {PAL['surface']}; border-radius: 14px; border: 1px solid {PAL['border']}; cursor: default; }}
+QFrame#floating_header {{ background: {PAL['surface']}; border-radius: 14px; border: 1px solid {PAL['border']}; cursor: default; }}
+QFrame#orbzone {{ background: transparent; cursor: default; }}
+QFrame#workspace {{ background: {PAL['surface']}; border-radius: 14px; border: 1px solid {PAL['border']}; cursor: default; }}
+QFrame#action_dock {{ background: {PAL['surface_2']}; border-radius: 12px; border: 1px solid {PAL['border']}; cursor: default; }}
+QPushButton {{ background: transparent; border: none; cursor: pointer; }}
 QPushButton:hover {{ background: {PAL['surface_2']}; border-radius: 6px; }}
 QPushButton#dock_btn {{ font-size: 14px; background: {PAL['surface_2']}; border-radius: 6px; }}
 QPushButton#dock_btn:hover {{ background: {PAL['border']}; color: {PAL['cyan']}; }}
@@ -281,6 +281,7 @@ class SignalBridge(QObject):
     accent_changed     = Signal(str)
     step_pending       = Signal(object)
     user_notice        = Signal(str, str)   # title, message
+    interaction_error  = Signal(str)
     safety_prompt_req  = Signal(str)
 
 
@@ -531,21 +532,34 @@ class ChatMessageCard(QFrame):
             self._add_action("⎘", "Copy", self._copy_self)
             self._add_action("🔊", "Read aloud", lambda: self.read_aloud_requested.emit(self.text))
 
-        self._body = QTextBrowser()
-        self._body.setOpenExternalLinks(False)
-        self._body.setFrameShape(QFrame.NoFrame)
-        self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._body.setTextInteractionFlags(
-            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard | Qt.LinksAccessibleByMouse)
-        self._body.document().setDocumentMargin(0)
-        self._body.setStyleSheet("background: transparent; border: none;")
-        self._body.setHtml(html_body or ChatMarkdown.render(text))
-        self._body.document().contentsChanged.connect(self._fit_body_height)
+        if role == "user":
+            self._body = QLabel()
+            self._body.setWordWrap(True)
+            self._body.setText(text or "")
+            self._body.setStyleSheet(
+                f"color: {PAL['bg']}; font-family: Segoe UI, sans-serif; "
+                f"font-size: 13px; line-height: 1.5; background: transparent; border: none;"
+            )
+            self._body.setTextInteractionFlags(
+                Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+            )
+        else:
+            self._body = QTextBrowser()
+            self._body.setOpenExternalLinks(False)
+            self._body.setFrameShape(QFrame.NoFrame)
+            self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._body.setTextInteractionFlags(
+                Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard | Qt.LinksAccessibleByMouse)
+            self._body.document().setDocumentMargin(0)
+            self._body.setStyleSheet("background: transparent; border: none;")
+            self._body.setHtml(html_body or ChatMarkdown.render(text))
+            self._body.document().contentsChanged.connect(self._fit_body_height)
 
         if role == "user":
             outer.addStretch(1)
             card = QFrame()
+            card.setMaximumWidth(440)
             card.setStyleSheet(
                 f"background: {PAL['cyan']}; color: {PAL['bg']}; "
                 f"border-radius: 18px 18px 4px 18px; padding: 12px;")
@@ -585,16 +599,8 @@ class ChatMessageCard(QFrame):
             outer.addStretch(1)
 
         self.setToolTip(datetime.fromtimestamp(self.ts).strftime("%H:%M:%S"))
-        self._fit_body_height()
-        opacity = QGraphicsOpacityEffect(self)
-        opacity.setOpacity(0.0)
-        self.setGraphicsEffect(opacity)
-        anim = QPropertyAnimation(opacity, b"opacity", self)
-        anim.setDuration(150)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.OutCubic)
-        QTimer.singleShot(0, anim.start)
+        if role != "user":
+            self._fit_body_height()
 
     def _add_action(self, glyph: str, tip: str, fn: Callable) -> None:
         btn = QToolButton()
@@ -610,6 +616,8 @@ class ChatMessageCard(QFrame):
         self._actions.addWidget(btn)
 
     def _fit_body_height(self) -> None:
+        if not isinstance(self._body, QTextBrowser):
+            return
         doc = self._body.document()
         w = max(self._body.viewport().width(), 220)
         doc.setTextWidth(w)
@@ -617,7 +625,8 @@ class ChatMessageCard(QFrame):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        self._fit_body_height()
+        if isinstance(self._body, QTextBrowser):
+            self._fit_body_height()
 
     def enterEvent(self, event: QEvent) -> None:
         for btn in self.findChildren(QToolButton):
@@ -631,8 +640,9 @@ class ChatMessageCard(QFrame):
 
     def set_markdown(self, md_text: str, *, streaming: bool = False) -> None:
         self.text = md_text
-        self._body.setHtml(ChatMarkdown.render(md_text, streaming=streaming))
-        self._fit_body_height()
+        if isinstance(self._body, QTextBrowser):
+            self._body.setHtml(ChatMarkdown.render(md_text, streaming=streaming))
+            self._fit_body_height()
 
     def _copy_self(self) -> None:
         pyperclip.copy(self.text)
@@ -701,7 +711,8 @@ class ChatView(QWidget):
     def _insert_card(self, card: ChatMessageCard) -> None:
         self._layout.insertWidget(self._layout.count() - 1, card)
         self._cards.append(card)
-        card._body.anchorClicked.connect(self.anchor_clicked.emit)
+        if isinstance(card._body, QTextBrowser):
+            card._body.anchorClicked.connect(self.anchor_clicked.emit)
         self.message_added.emit(card)
         QTimer.singleShot(50, self._scroll_to_bottom_if_pinned)
 
@@ -844,7 +855,7 @@ class ChatComposer(QFrame):
             ("📎", "Attach file", self._pick_attach, False),
             ("📸", "Screenshot for next message", self._shot, False),
             ("🎤", "Hold to record (PTT)", None, True),
-            ("🔊", "Read next reply aloud", self._toggle_tts, False),
+            ("🔊", "Speak replies aloud (on by default)", self._toggle_tts, False),
             ("😊", "Emoji", self._emoji_menu, False),
             ("+", "More actions", self._overflow, False),
         ]:
@@ -2613,7 +2624,10 @@ class AtlasWindow(QMainWindow):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMinimumSize(420, 520)
         self.resize(540, 760)
+        # Companion overlay: no native edge resize bands (prevents stray resize cursors).
+        self._mouse_capture_locked = False
 
         self._is_floating   = False
         self.bridge         = SignalBridge()
@@ -2637,6 +2651,7 @@ class AtlasWindow(QMainWindow):
         self.bridge.accent_changed.connect(self._on_accent_changed)
         self.bridge.step_pending.connect(self._on_step_pending)
         self.bridge.user_notice.connect(self._on_user_notice)
+        self.bridge.interaction_error.connect(self._on_interaction_error)
         self.bridge.safety_prompt_req.connect(self._on_safety_prompt_req)
 
         if atlas_fs:
@@ -2661,7 +2676,7 @@ class AtlasWindow(QMainWindow):
             StateEngine(
                 on_chunk=self.bridge.stream_token.emit,
                 on_complete=self._on_stream_complete,
-                on_error=lambda e: self.bridge.set_status.emit(f"Error: {e}"),
+                on_error=self._on_engine_error,
                 on_coordinates=self.bridge.spatial_coords.emit,
                 on_token_usage=self.bridge.token_usage.emit,
                 user_name=self._get_username(),
@@ -2728,14 +2743,12 @@ class AtlasWindow(QMainWindow):
 
         # ── Holo overlay + autosave ───────────────────────────────────────────
         self.overlay = HoloOverlay() if HAS_OVERLAY and HoloOverlay else None
-        if self.overlay:
-            self.overlay.show()
+        # Holo overlay stays hidden until a guide marker or focus ring is needed.
 
         self.agent_cursor = (
             AgentCursorOverlay() if HAS_OVERLAY and AgentCursorOverlay else None
         )
-        if self.agent_cursor:
-            self.agent_cursor.show_cursor()
+        # Agent cursor stays hidden until a DO-mode step animates it.
 
         if _CORE and step_orchestrator:
             step_orchestrator.set_ui_handler(self._post_step_pending)
@@ -2748,6 +2761,7 @@ class AtlasWindow(QMainWindow):
         self._chat_messages: list[dict] = []
         self._streaming_html = ""
         self._is_streaming = False
+        self._interaction_source = ""
         self._stream_start_ts = 0.0
         self._render_pending = False
         self._token_prompt = 0
@@ -2769,6 +2783,7 @@ class AtlasWindow(QMainWindow):
         if voice_engine:
             # TTS is live by default — reflect that in the toggle so users know
             # Atlas WILL speak its replies (and can mute it here if desired).
+            voice_engine.unmute()
             self._action_ve.setChecked(True)
             self._action_ve.toggled.connect(self._toggle_voice_action)
 
@@ -2785,9 +2800,11 @@ class AtlasWindow(QMainWindow):
         self._autosave_timer.start()
 
         # ── Deferred startup checks ───────────────────────────────────────────
-        QTimer.singleShot(400, self._show_startup_message)
-        QTimer.singleShot(600, self._run_startup_checks)
-        QTimer.singleShot(800, self._offer_autosave_restore)
+        if voice_engine:
+            voice_engine.preload()
+        QTimer.singleShot(80, self._show_startup_message)
+        QTimer.singleShot(250, self._run_startup_checks)
+        QTimer.singleShot(400, self._offer_autosave_restore)
 
     # ═════════════════════════════════════════════════════════════════════════
     # UI CONSTRUCTION
@@ -2824,17 +2841,6 @@ class AtlasWindow(QMainWindow):
         self.alive_dot.setStyleSheet(
             f"color: {PAL['cyan']}; font-size: 10px; background: transparent; padding-left: 2px;"
         )
-        self._alive_opacity = QGraphicsOpacityEffect(self.alive_dot)
-        self._alive_opacity.setOpacity(0.30)
-        self.alive_dot.setGraphicsEffect(self._alive_opacity)
-        self._alive_anim = QPropertyAnimation(self._alive_opacity, b"opacity", self)
-        self._alive_anim.setDuration(2200)
-        self._alive_anim.setStartValue(0.15)
-        self._alive_anim.setKeyValueAt(0.5, 0.40)   # smooth ping-pong 0.15→0.40→0.15
-        self._alive_anim.setEndValue(0.15)
-        self._alive_anim.setEasingCurve(QEasingCurve.InOutSine)
-        self._alive_anim.setLoopCount(-1)
-        self._alive_anim.start()
 
         hdr_lay.addWidget(self.logo)
         hdr_lay.addWidget(self.alive_dot)
@@ -2919,22 +2925,13 @@ class AtlasWindow(QMainWindow):
             f"QPushButton#profile_btn:hover {{ background: {PAL['text']}; }}")
         self.btn_profile.clicked.connect(self._show_profile_menu)
         hdr_lay.addWidget(self.btn_profile)
+        self.header.installEventFilter(self)
+        self.header.setStyleSheet(
+            f"QFrame#titlebar {{ background: rgba(14,14,16,0.94); "
+            f"border: 1px solid {PAL['border']}; border-radius: 8px; }}"
+        )
 
-        # ── Control Ribbon opacity engine (dim at rest, full on hover) ─────────
-        self._RIBBON_REST = 0.20
-        self._ribbon_opacity = QGraphicsOpacityEffect(self.header)
-        self._ribbon_opacity.setOpacity(self._RIBBON_REST)
-        self.header.setGraphicsEffect(self._ribbon_opacity)
-        self._ribbon_anim = QPropertyAnimation(self._ribbon_opacity, b"opacity", self)
-        self._ribbon_anim.setDuration(200)
-        self._ribbon_anim.setEasingCurve(QEasingCurve.InOutCubic)
-        self._ribbon_visible = False
-        # Poll the cursor so the reveal works regardless of which child widget is
-        # under the mouse (child widgets would otherwise swallow hover events).
-        self._ribbon_timer = QTimer(self)
-        self._ribbon_timer.setInterval(90)
-        self._ribbon_timer.timeout.connect(self._check_ribbon_hover)
-        self._ribbon_timer.start()
+        # ── Control Ribbon (always readable — no opacity effect) ──────────────
 
         # ══ ORB ZONE — voice-first hero ═══════════════════════════════════════
         self.orb_zone = QFrame()
@@ -3085,6 +3082,14 @@ class AtlasWindow(QMainWindow):
         ws_lay.addWidget(self.token_footer)
         self.main_lay.addWidget(self.workspace, 1)
 
+        grip_row = QHBoxLayout()
+        grip_row.setContentsMargins(0, 0, 4, 2)
+        grip_row.addStretch()
+        self._size_grip = QSizeGrip(self)
+        self._size_grip.setToolTip("Drag to resize the window")
+        grip_row.addWidget(self._size_grip, 0, Qt.AlignRight | Qt.AlignBottom)
+        self.main_lay.addLayout(grip_row)
+
         self.setStyleSheet(QSS_BASE)
         self.setWindowOpacity(0.95)
         self._orb_state = "idle"
@@ -3097,27 +3102,12 @@ class AtlasWindow(QMainWindow):
         return
 
     def _animate_ribbon(self, target: float) -> None:
-        self._ribbon_anim.stop()
-        self._ribbon_anim.setStartValue(self._ribbon_opacity.opacity())
-        self._ribbon_anim.setEndValue(target)
-        self._ribbon_anim.start()
+        """Legacy no-op — ribbon uses a static opaque stylesheet now."""
+        return
 
     def _check_ribbon_hover(self) -> None:
-        """Brighten the ribbon to full while the cursor is over it; rest dim otherwise."""
-        if self._is_floating or not self.isVisible():
-            if self._ribbon_visible:
-                self._animate_ribbon(self._RIBBON_REST)
-                self._ribbon_visible = False
-            return
-        top_left = self.header.mapToGlobal(QPoint(0, 0))
-        rect = QRect(top_left, self.header.size()).adjusted(-6, -6, 6, 8)
-        over = rect.contains(QCursor.pos())
-        if over and not self._ribbon_visible:
-            self._ribbon_visible = True
-            self._animate_ribbon(1.0)
-        elif not over and self._ribbon_visible:
-            self._ribbon_visible = False
-            self._animate_ribbon(self._RIBBON_REST)
+        """Legacy no-op — hover dimming removed to avoid QPainter conflicts."""
+        return
 
     # ── Widget factories ──────────────────────────────────────────────────────
 
@@ -3157,18 +3147,166 @@ class AtlasWindow(QMainWindow):
         btn.style().unpolish(btn)
         btn.style().polish(btn)
 
-    # ── Dragging ──────────────────────────────────────────────────────────────
+    # ── Dragging (title bar only) + companion click-through ───────────────────
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+    def _interactive_shell_widgets(self) -> list[QWidget]:
+        """Top-level panels that must receive mouse input (not click-through)."""
+        shells: list[QWidget] = []
+        for name in (
+            "header", "orb_zone", "workspace", "chat_composer",
+            "token_footer", "copilot_status_lbl", "_size_grip",
+        ):
+            w = getattr(self, name, None)
+            if isinstance(w, QWidget):
+                shells.append(w)
+        return shells
 
-    def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton and hasattr(self, "_drag_pos"):
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
+    def _mouse_target_accepts_input(self, local: QPoint) -> bool:
+        """True when *local* coords hit a real UI control (not a transparent gutter)."""
+        if self._mouse_capture_locked:
+            return True
+        target = self.childAt(local)
+        if target is None:
+            return False
+        if target in (self.root_widget, self.centralWidget()):
+            return False
+        shells = self._interactive_shell_widgets()
+        w: QWidget | None = target
+        while w is not None and w is not self:
+            if w in shells:
+                return True
+            w = w.parentWidget()
+        return False
 
-    def mouseReleaseEvent(self, event):
-        pass
+    def lock_mouse_capture(self, locked: bool = True) -> None:
+        """Engage full hit-testing (e.g. while dragging the title bar or a modal)."""
+        self._mouse_capture_locked = locked
+        if not locked:
+            self.unsetCursor()
+
+    # ── Interaction lifecycle — companion mode state machine ──────────────────
+
+    def _begin_interaction(self, source: str = "user") -> None:
+        """Enter active processing state (thinking / capture / API)."""
+        self._interaction_source = source
+        self._stop_gen.clear()
+        self._stream_start_ts = time.time()
+        self._is_streaming = True
+        self.lock_mouse_capture(False)
+        self.unsetCursor()
+        self.bridge.start_thinking.emit()
+
+    def _sync_companion_visual_idle(self) -> None:
+        """Return orb/accent/float bubble to idle when nothing is active."""
+        if self._is_streaming:
+            return
+        if self.audio and getattr(self.audio, "is_listening", False):
+            return
+        if voice_engine and getattr(voice_engine, "is_speaking", False):
+            return
+        self._set_accent_state("stealth" if self.stealth_active else "idle")
+        self._set_orb_state("idle")
+        if self._is_floating:
+            self._bubble.set_active(False)
+
+    def _release_companion_mode(
+        self,
+        *,
+        status: str = "Ready",
+        error: str = "",
+        finalize_thinking: bool = True,
+    ) -> None:
+        """
+        Gracefully exit an interaction — non-obstructive companion layer restored.
+
+        Clears streaming flags, mouse capture lock, and stray cursors so the
+        desktop passthrough layer behaves correctly after every turn.
+        """
+        self._is_streaming = False
+        self._md_ai_streaming = False
+        self._md_ai_buffer = ""
+        self._streaming_html = ""
+        self.lock_mouse_capture(False)
+        self.unsetCursor()
+        if self.agent_cursor:
+            self.agent_cursor.hide_cursor()
+        self.chat_composer.set_streaming(False)
+        if finalize_thinking:
+            self.thinking_bar.hide()
+            self.bridge.thinking_done.emit()
+        if error:
+            self.bridge.set_status.emit(f"  {error}")
+            self._show_pill(error[:72])
+        else:
+            self.bridge.set_status.emit(f"  {status}")
+        QTimer.singleShot(400, self._sync_companion_visual_idle)
+
+    def _on_engine_error(self, msg: str) -> None:
+        """Worker-thread API error → main-thread companion recovery."""
+        self.bridge.interaction_error.emit(msg)
+
+    @Slot(str)
+    def _on_interaction_error(self, msg: str) -> None:
+        from atlas_interaction import friendly_error
+        text = msg if msg.startswith("⚠") or "Couldn't" in msg else friendly_error("api", msg)
+        self._release_companion_mode(error=f"⚠ {text.lstrip('⚠ ')}", finalize_thinking=True)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is getattr(self, "header", None):
+            et = event.type()
+            if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self.lock_mouse_capture(True)
+                self.header.setCursor(Qt.ClosedHandCursor)
+                self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                return True
+            if et == QEvent.MouseMove and event.buttons() & Qt.LeftButton and hasattr(self, "_drag_pos"):
+                self.move(event.globalPosition().toPoint() - self._drag_pos)
+                return True
+            if et == QEvent.MouseButtonRelease:
+                self.lock_mouse_capture(False)
+                self.header.unsetCursor()
+                if hasattr(self, "_drag_pos"):
+                    del self._drag_pos
+                return False
+        return super().eventFilter(obj, event)
+
+    def leaveEvent(self, event) -> None:
+        """Clear stale resize/drag cursors when the pointer exits the window."""
+        self.unsetCursor()
+        super().leaveEvent(event)
+
+    def nativeEvent(self, eventType, message):
+        """
+        Windows companion-layer hit testing.
+
+        Transparent layout gutters and outer margins return HTTRANSPARENT so the
+        cursor and clicks pass through to the desktop (Skales / HeyClicky style).
+        Edge resize bands are intentionally disabled — only the QSizeGrip resizes.
+        """
+        if platform.system() == "Windows" and eventType == b"windows_generic_MSG":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                WM_NCHITTEST = 0x0084
+                HTCLIENT = 1
+                HTTRANSPARENT = -1
+
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == WM_NCHITTEST:
+                    gx = ctypes.c_short(msg.lParam & 0xFFFF).value
+                    gy = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                    local = self.mapFromGlobal(QPoint(gx, gy))
+                    if not self.rect().contains(local):
+                        return super().nativeEvent(eventType, message)
+                    if self._is_floating or not self.isVisible():
+                        return True, HTTRANSPARENT
+                    if self._mouse_target_accepts_input(local):
+                        return True, HTCLIENT
+                    return True, HTTRANSPARENT
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
 
     # ═════════════════════════════════════════════════════════════════════════
     # ACCENT ENGINE — dynamic colour updates  (Requirement 3)
@@ -3204,12 +3342,6 @@ class AtlasWindow(QMainWindow):
         self.alive_dot.setStyleSheet(
             f"color: {hex_color}; font-size: 11px; background: transparent; padding-left: 2px;"
         )
-        if state == "idle":
-            if self._alive_anim.state() != QPropertyAnimation.Running:
-                self._alive_anim.start()
-        else:
-            self._alive_anim.stop()
-            self._alive_opacity.setOpacity(0.9)
 
         if self._is_floating:
             self._bubble.set_border_color(hex_color)
@@ -3359,10 +3491,9 @@ class AtlasWindow(QMainWindow):
                 self._set_stealth_active(True, update_ui=True)
             self._show_interview_headphone_reminder()
             self.style_combo_set("Direct")
-            if self.audio and not self.audio.mic_active:
-                self.audio.start_mic()
-                self._action_mic.setChecked(True)
-            self.bridge.set_status.emit("Focus mode on")
+            self.bridge.set_status.emit(
+                "Focus mode on — use Ctrl+Space to talk; enable mic in settings if needed"
+            )
         else:
             if not self._stealth_before_interview and self.stealth_active:
                 self._set_stealth_active(False, update_ui=True)
@@ -3435,6 +3566,8 @@ class AtlasWindow(QMainWindow):
 
         def _finish_step() -> None:
             evt.status = "completed" if pending.result_ok else "failed"
+            if self.agent_cursor:
+                self.agent_cursor.hide_cursor()
             pending.done.set()
 
         if self.agent_cursor:
@@ -3568,7 +3701,7 @@ class AtlasWindow(QMainWindow):
         lines.append(
             "  🎧  TALK TO ATLAS:  tap  Ctrl + Space  (or Alt + Space), then speak.\n"
             "       Atlas keeps listening and replies automatically after you pause\n"
-            "       for ~3 seconds. The ring glows scarlet while listening, gold\n"
+            "       for about 1.5 seconds. The ring glows scarlet while listening, gold\n"
             "       while thinking.\n"
             "  🔇  Tap Ctrl + Space again while Atlas is talking to interrupt it and\n"
             "       immediately start listening again.\n"
@@ -3584,14 +3717,8 @@ class AtlasWindow(QMainWindow):
 
         self._append_response("".join(lines))
 
-        # Audibly greet so the user immediately knows TTS works.
         if voice_engine is not None:
-            QTimer.singleShot(
-                900,
-                lambda: voice_engine.speak(
-                    "Atlas online. Tap control and space, then talk to me."
-                ),
-            )
+            QTimer.singleShot(150, lambda: voice_engine.speak("Atlas ready."))
 
     # ═════════════════════════════════════════════════════════════════════════
     # VOICE ENGINE — speak & skip  (Requirement 8)
@@ -3646,7 +3773,12 @@ class AtlasWindow(QMainWindow):
                 )
         elif event_type == "spatial_error":
             err = str(payload.get("error", "Location failed"))
-            self.bridge.set_status.emit(err)
+
+            def _notify_spatial_err(e: str = err) -> None:
+                self.bridge.set_status.emit(f"  ⚠ {e}")
+                self._show_pill(e[:72])
+
+            QTimer.singleShot(0, _notify_spatial_err)
         elif event_type == "proactive_alert":
             msg = str(payload.get("message") or payload.get("summary") or "")
             if msg:
@@ -3654,6 +3786,17 @@ class AtlasWindow(QMainWindow):
         elif event_type == "copilot_changed":
             QTimer.singleShot(0, lambda: self._sync_copilot_ui(
                 payload.get("active", False)))
+        elif event_type == "query_rejected":
+            from atlas_interaction import friendly_error
+            QTimer.singleShot(0, lambda: self._release_companion_mode(
+                error=f"⚠ {friendly_error('busy')}",
+            ))
+        elif event_type == "query_failed":
+            from atlas_interaction import friendly_error
+            err = str(payload.get("error", ""))
+            QTimer.singleShot(0, lambda e=err: self._release_companion_mode(
+                error=f"⚠ {friendly_error('generic', e)}",
+            ))
 
     def _on_copilot_toggled(self, checked: bool) -> None:
         self.copilot_active = checked
@@ -3803,7 +3946,7 @@ class AtlasWindow(QMainWindow):
         keyboard.add_hotkey("ctrl+e", lambda: self._export_session())
 
         # ── Talk hotkey: dedicated global shortcut (Ctrl+Space / Alt+Space) ───
-        # TAP to start a listening session; Atlas auto-responds after a ~3s pause.
+        # TAP to start a listening session; Atlas auto-responds after a ~1.5s pause.
         # Tap again while it is thinking/talking to interrupt and start listening
         # anew. A single low-level Space hook keeps the gesture from getting stuck
         # when the UI loses focus; the modifier is checked at press time. These
@@ -3836,10 +3979,11 @@ class AtlasWindow(QMainWindow):
         if self.state:
             msg = self.chat_view.add_message("user", text)
             self._chat_messages.append(msg)
-            self._stop_gen.clear()
-            self._stream_start_ts = time.time()
-            self._is_streaming = True
-            self.bridge.start_thinking.emit()
+            if getattr(self.state, "audio_watcher", None):
+                self.state.audio_watcher.mark_user_typed()
+            if not self.chat_composer.tts_enabled_for_next() and voice_engine:
+                voice_engine.flush()
+            self._begin_interaction("user")
             self.bridge.set_status.emit("Thinking…")
             webcam_b64 = self._capture_webcam_frame()
             screen_b64 = None
@@ -3860,7 +4004,7 @@ class AtlasWindow(QMainWindow):
             threading.Thread(
                 target=self.state.handle_input,
                 args=(text,),
-                kwargs={"source": "user", "webcam_b64": webcam_b64 or screen_b64},
+                kwargs={"source": "user", "webcam_b64": webcam_b64},
                 daemon=True,
             ).start()
             self._pending_attachments.clear()
@@ -3900,9 +4044,9 @@ class AtlasWindow(QMainWindow):
         self.thinking_bar.setValue(1)
         self.thinking_bar.hide()
         self.chat_composer.set_streaming(False)
+        self.lock_mouse_capture(False)
+        self.unsetCursor()
         self._set_accent_state("stealth" if self.stealth_active else "idle")
-        # If TTS is about to speak, the skip-audio poll will flip the orb to
-        # "speaking"; otherwise settle to idle.
         if not (voice_engine and getattr(voice_engine, "is_speaking", False)):
             self._set_orb_state("idle")
         if self._is_floating:
@@ -3918,9 +4062,6 @@ class AtlasWindow(QMainWindow):
     @Slot(str)
     def _on_stream_complete_slot(self, full_text: str) -> None:
         elapsed = time.time() - self._stream_start_ts if self._stream_start_ts else 0.0
-        self._is_streaming = False
-        self.bridge.thinking_done.emit()
-        self.bridge.set_status.emit("Done ✓")
         if full_text:
             self.chat_view.finish_stream(full_text, elapsed)
             self._chat_messages.append(
@@ -3932,6 +4073,17 @@ class AtlasWindow(QMainWindow):
         if not self.chat_composer.tts_enabled_for_next() and voice_engine:
             voice_engine.flush()
             voice_engine.skip()
+        elif full_text and voice_engine and not voice_engine.is_muted:
+            if self.chat_composer.tts_enabled_for_next():
+                pending = (
+                    getattr(voice_engine.kokoro, "_is_speaking", False)
+                    or not voice_engine.kokoro._queue.empty()
+                )
+                if not pending:
+                    from atlas_audio import _strip_markdown
+                    clean = _strip_markdown(full_text.strip())
+                    if clean:
+                        voice_engine.speak(clean)
         if full_text:
             if self._is_floating:
                 self.bridge.notify_pill.emit(full_text.replace("\n", " ")[:60] + "…")
@@ -3947,6 +4099,7 @@ class AtlasWindow(QMainWindow):
                     sfx.play()
                 except Exception:
                     pass
+        self._release_companion_mode(status="Done ✓", finalize_thinking=True)
 
     @Slot()
     def _on_stream_started(self) -> None:
@@ -3963,7 +4116,7 @@ class AtlasWindow(QMainWindow):
         self._md_ai_buffer += token
         if not self._render_pending:
             self._render_pending = True
-            QTimer.singleShot(50, self._flush_render)
+            QTimer.singleShot(120, self._flush_render)
 
     def _flush_render(self) -> None:
         self._render_pending = False
@@ -4304,14 +4457,25 @@ class AtlasWindow(QMainWindow):
 
     @Slot(dict)
     def _on_spatial_coords(self, coords: dict) -> None:
+        target = str(coords.get("target", "") or "target")
         if not coords.get("found"):
+            self.bridge.set_status.emit(
+                f"Couldn't find \"{target}\" on screen — try making it visible or describe it differently."
+            )
             return
         x, y = int(coords["x"]), int(coords["y"])
         w, h = int(coords.get("w", 0)), int(coords.get("h", 0))
-        if coords.get("guide") and self.overlay:
+        if coords.get("source") == "point_and_talk" and self.overlay:
+            label = str(coords.get("label", "") or "Here")
+            self.overlay.mark_target(x, y, w, h, label=label)
+            self.bridge.set_status.emit("Point-and-Talk — highlighting target on screen")
+        elif coords.get("guide") and self.overlay:
             self.overlay.mark_target(x, y, w, h, label=str(coords.get("label", "")))
+            self.bridge.set_status.emit(f"Guide: highlighting {target}")
         elif not coords.get("guide"):
             # DO path: agent cursor handles visuals via StepEvent; skip teleport ring.
+            self.bridge.set_status.emit(f"Located {target} — executing…")
+        else:
             pass
 
     # ── Talk hotkey — conversation loop (tap-to-talk + silence endpointing) ───
@@ -4390,7 +4554,7 @@ class AtlasWindow(QMainWindow):
         }
         hints = {
             "idle":       "hold a thought, pause when you're done",
-            "listening":  "pause ~3s when you finish speaking",
+            "listening":  "pause ~1.5s when you finish speaking",
             "thinking":   "composing a response",
             "processing": "turning your speech into text",
             "speaking":   "tap Ctrl + Space to interrupt",
@@ -4406,7 +4570,7 @@ class AtlasWindow(QMainWindow):
         if state == "listening":
             self._set_accent_state("ptt")
             self._set_orb_state("listening")
-            self.bridge.set_status.emit("🎧 Listening… (pause ~3s when done)")
+            self.bridge.set_status.emit("🎧 Listening… (pause ~1.5s when done)")
             if self._is_floating:
                 self._bubble.set_border_color(PAL["danger"])
                 self._bubble.set_active(True)
@@ -4553,8 +4717,7 @@ class AtlasWindow(QMainWindow):
             voice_engine.flush()
             voice_engine.skip()
         self.chat_composer.set_streaming(False)
-        self.bridge.thinking_done.emit()
-        self.bridge.set_status.emit("Stopped ⏹")
+        self._release_companion_mode(status="Stopped ⏹", finalize_thinking=True)
 
     # ═════════════════════════════════════════════════════════════════════════
     # TEXT AREA HELPERS
@@ -4743,6 +4906,9 @@ class AtlasWindow(QMainWindow):
             self.bridge.set_status.emit(status)
 
     def _on_transcript(self, text, source):
+        src = (source or "").lower()
+        if src == "mic" and self.audio and not self.audio.mic_active:
+            return
         routed = "forward"
         if self.state and getattr(self.state, "audio_watcher", None):
             routed = self.state.audio_watcher.route_transcript(text, source)
@@ -4752,31 +4918,26 @@ class AtlasWindow(QMainWindow):
             self.bridge.set_status.emit(
                 f"🎤 Heard ({source}) — ignored (you typed recently)")
             return
-        # Bug #4: emit a visible "Listening" status so the user knows the
-        # mic is active and Atlas received audio — previously silent.
+        clean = (text or "").strip()
+        if not clean:
+            return
         self.bridge.set_status.emit(f"🎤 Heard ({source}) — processing…")
-        self.bridge.append_text.emit(f"[{source.upper()}]: {text}")
+        msg = self.chat_view.add_message("user", clean)
+        self._chat_messages.append(msg)
         # Voice control commands ("stop", "guided mode", "run X routine"…) are
         # intercepted here before reaching the LLM, so spoken control works too.
         if self.state and self._try_route_command(text):
             return
         if self.state and routed != "consumed":
-            # Drive the processing UI (gold accent + thinking bar) for the
-            # voice path, mirroring the typed-query pipeline.
-            self._stop_gen.clear()
-            self._stream_start_ts = time.time()
-            self._is_streaming = True
-            self.bridge.start_thinking.emit()
+            self._begin_interaction(source)
+            self.bridge.set_status.emit(f"🎤 Heard ({source}) — processing…")
             threading.Thread(
                 target=self.state.handle_input,
                 args=(text, source),
                 daemon=True,
             ).start()
         elif self.state and routed == "consumed":
-            self._stop_gen.clear()
-            self._stream_start_ts = time.time()
-            self._is_streaming = True
-            self.bridge.start_thinking.emit()
+            self._begin_interaction(source)
 
     # ═════════════════════════════════════════════════════════════════════════
     # SCREEN CAPTURE + OCR
@@ -4784,12 +4945,13 @@ class AtlasWindow(QMainWindow):
 
     def _do_capture(self):
         self.hide()
-        self.bridge.set_status.emit("Processing capture…")
+        self.lock_mouse_capture(False)
+        self.bridge.set_status.emit("📷 Capturing screen…")
 
         worker = OCRWorker(hide_delay_s=0.15, parent=None)
-        worker.grab_done.connect(self.show)
+        worker.grab_done.connect(self._on_capture_grab_done)
         worker.ocr_completed.connect(self._on_ocr_ready)
-        worker.ocr_failed.connect(self.bridge.set_status)
+        worker.ocr_failed.connect(self._on_ocr_failed)
         worker.finished.connect(worker.deleteLater)
 
         if not hasattr(self, "_active_ocr_workers"):
@@ -4805,10 +4967,33 @@ class AtlasWindow(QMainWindow):
         worker.finished.connect(_remove)
         worker.start()
 
+    @Slot()
+    def _on_capture_grab_done(self) -> None:
+        self.show()
+        self.lock_mouse_capture(False)
+        self.unsetCursor()
+
+    @Slot(str)
+    def _on_ocr_failed(self, msg: str) -> None:
+        from atlas_interaction import friendly_error
+        self.show()
+        self._release_companion_mode(
+            error=f"⚠ {friendly_error('ocr', msg)}",
+            finalize_thinking=False,
+        )
+
     @Slot(str)
     def _on_ocr_ready(self, txt: str):
+        from atlas_interaction import gather_screen_frame
+
         if self.state:
-            self.bridge.append_text.emit("[SCREEN CAPTURE Sent]")
+            screen_b64, _summary = gather_screen_frame()
+            if screen_b64:
+                self.state.inject_screen_capture(screen_b64)
+            msg = self.chat_view.add_message("user", f"[Screen capture]\n{txt[:500]}")
+            self._chat_messages.append(msg)
+            self._begin_interaction("capture")
+            self.bridge.set_status.emit("Analyzing screen…")
             webcam_b64 = self._capture_webcam_frame()
             threading.Thread(
                 target=self.state.handle_input,
@@ -4816,7 +5001,8 @@ class AtlasWindow(QMainWindow):
                 kwargs={"source": "capture", "webcam_b64": webcam_b64},
                 daemon=True,
             ).start()
-        self.bridge.set_status.emit("Capture complete ✓")
+        else:
+            self._release_companion_mode(status="Capture complete ✓", finalize_thinking=False)
 
     # ═════════════════════════════════════════════════════════════════════════
     # CLIPBOARD WATCHER
