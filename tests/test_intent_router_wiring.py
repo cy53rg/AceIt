@@ -140,7 +140,7 @@ def test_ordinary_chat_reaches_groq(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        engine.local_memory,
+        engine.memory,
         "build_local_context_block",
         lambda *_a, **_k: "",
     )

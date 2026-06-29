@@ -70,7 +70,6 @@ from groq import Groq
 
 from atlas_data import DEFAULT_SAFETY_MODE
 from atlas_learning import LearningEngine
-from atlas_memory_manager import MemoryManager
 from atlas_memory import UserMemory
 from atlas_skills import SkillRegistry
 from atlas_logging import get_logger, setup_logging, task_scope, new_task_id, log_outcome_json
@@ -2579,8 +2578,8 @@ class StateEngine:
         # Persistent user memory, skills, learning, spatial co-pilot.
         self.memory = memory or UserMemory()
         self.user_id = self.memory.create_or_login(user_name)
-        self.local_memory = MemoryManager()
-        self.local_memory.ensure_session()
+        self.memory.migrate_legacy_json_store(self.user_id)
+        self.memory.ensure_local_session(self.user_id)
         self.skill_registry = SkillRegistry()
         self.learning = LearningEngine(self.memory, self.user_id)
         from atlas_playbooks import PlaybookManager
@@ -2681,6 +2680,8 @@ class StateEngine:
                     self.user_id, self.mode.name, hist)
             self.user_id = int(user_id)
             self.learning = LearningEngine(self.memory, self.user_id)
+            self.memory.migrate_legacy_json_store(self.user_id)
+            self.memory.ensure_local_session(self.user_id)
             self.session.start(self.get_system_prompt())
             self.load_user_prefs()
             try:
@@ -3033,7 +3034,9 @@ class StateEngine:
             memory_prompt  = self.memory.build_memory_prompt(self.user_id)
             if context_block:
                 memory_prompt = (context_block + "\n\n" + memory_prompt).strip()
-            local_block = self.local_memory.build_local_context_block(enriched_input, top_k=5)
+            local_block = self.memory.build_local_context_block(
+                self.user_id, enriched_input, top_k=5,
+            )
             if local_block:
                 memory_prompt = (
                     (memory_prompt + "\n\n" + local_block).strip()
@@ -3240,10 +3243,10 @@ class StateEngine:
                 voice_engine.speak(_strip_markdown(response.strip()))
             self._on_complete(response)
             self._schedule_learning_on_turn_complete(raw_user_text, response)
-            self.local_memory.on_turn_complete(
+            self.memory.record_takeaway_from_turn(
+                self.user_id,
                 raw_user_text,
                 response,
-                screen_context_summary=getattr(self, "_last_turn_screen_context", ""),
                 user_goal_hint=getattr(self, "_last_turn_goal_hint", ""),
             )
         except Exception as exc:
@@ -3270,10 +3273,10 @@ class StateEngine:
             self.memory.log_skill_outcome(self.user_id, skill_name, True, "")
             self._on_complete(response)
             self._schedule_learning_on_turn_complete(raw_user_text, response)
-            self.local_memory.on_turn_complete(
+            self.memory.record_takeaway_from_turn(
+                self.user_id,
                 raw_user_text,
                 response,
-                screen_context_summary=getattr(self, "_last_turn_screen_context", ""),
                 user_goal_hint=getattr(self, "_last_turn_goal_hint", ""),
             )
         except Exception as exc:
@@ -3543,12 +3546,10 @@ class StateEngine:
                 # facts (with reinforcement) AND drives persona-drift checks on
                 # one daemon thread — no duplicate extraction call.
                 self._schedule_learning_on_turn_complete(raw_user_text, full_response)
-                self.local_memory.on_turn_complete(
+                self.memory.record_takeaway_from_turn(
+                    self.user_id,
                     raw_user_text,
                     full_response,
-                    screen_context_summary=getattr(
-                        self, "_last_turn_screen_context", ""
-                    ),
                     user_goal_hint=getattr(self, "_last_turn_goal_hint", ""),
                 )
                 if self.active_skill:

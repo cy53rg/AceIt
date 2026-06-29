@@ -8,9 +8,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -27,6 +29,8 @@ ATLAS_FAST_MODEL = (
 
 _MEMORY_CACHE_TTL_S = 30.0
 _MEMORY_PROMPT_TOKEN_BUDGET = int(os.environ.get("ATLAS_MEMORY_TOKEN_BUDGET") or 1200)
+_LEGACY_JSON_STORE = Path.home() / ".atlas-data" / "memory_store.json"
+_MAX_SESSION_TAKEAWAYS = 500
 
 
 # ── Optional Qt signal bridge ─────────────────────────────────────────────────
@@ -289,6 +293,24 @@ class UserMemory:
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
                 )
                 """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_takeaways (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    takeaway TEXT NOT NULL,
+                    keywords_json TEXT NOT NULL DEFAULT '[]',
+                    user_snippet TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    created REAL NOT NULL,
+                    last_used REAL NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_takeaways_user ON session_takeaways(user_id, created DESC)"
             )
             self._migrate(conn)
 
@@ -1486,3 +1508,262 @@ class UserMemory:
                 """,
                 (status, now, pending_id),
             )
+
+    # ── Session takeaways (replaces ~/.atlas-data/memory_store.json) ───────────
+
+    @staticmethod
+    def _tokenize_takeaway(text: str) -> list[str]:
+        return list({w for w in re.findall(r"[a-z0-9]{3,}", (text or "").lower())})[:24]
+
+    def migrate_legacy_json_store(self, user_id: int) -> int:
+        """One-time import from legacy MemoryManager JSON file."""
+        legacy = _LEGACY_JSON_STORE
+        migrated = legacy.with_suffix(".json.migrated")
+        if not legacy.is_file() or migrated.is_file():
+            return 0
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM session_takeaways WHERE user_id = ?",
+                (int(user_id),),
+            ).fetchone()
+            if row and int(row["n"]) > 0:
+                try:
+                    legacy.rename(migrated)
+                except OSError:
+                    pass
+                return 0
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("legacy memory_store.json unreadable: %s", exc)
+            return 0
+        learnings = data.get("learnings") or []
+        imported = 0
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            for item in learnings[-_MAX_SESSION_TAKEAWAYS:]:
+                takeaway = str(item.get("takeaway") or "").strip()
+                if not takeaway:
+                    continue
+                keys = item.get("keywords") or self._tokenize_takeaway(takeaway)
+                ts = float(item.get("timestamp") or now)
+                conn.execute(
+                    """
+                    INSERT INTO session_takeaways
+                    (user_id, takeaway, keywords_json, user_snippet, session_id, created, last_used)
+                    VALUES (?, ?, ?, '', ?, ?, ?)
+                    """,
+                    (
+                        int(user_id),
+                        takeaway,
+                        json.dumps(list(keys)[:24]),
+                        str(item.get("session_id") or ""),
+                        ts,
+                        ts,
+                    ),
+                )
+                imported += 1
+        try:
+            legacy.rename(migrated)
+            log.info("migrated %d session takeaways from legacy JSON for user %s", imported, user_id)
+        except OSError as exc:
+            log.warning("could not rename legacy memory store: %s", exc)
+        return imported
+
+    def ensure_local_session(self, user_id: int, user_goal_hint: str = "") -> str:
+        prefs = self.get_prefs(user_id)
+        sid = str(prefs.get("local_session_id") or "").strip()
+        if not sid:
+            sid = str(uuid.uuid4())
+            self.set_pref(user_id, "local_session_id", sid)
+        if user_goal_hint:
+            goal = str(prefs.get("local_session_goal") or "").strip()
+            if not goal:
+                self.set_pref(user_id, "local_session_goal", user_goal_hint.strip()[:240])
+        return sid
+
+    def record_takeaway(
+        self,
+        user_id: int,
+        takeaway: str,
+        *,
+        user_snippet: str = "",
+        session_id: str = "",
+    ) -> None:
+        takeaway = (takeaway or "").strip()
+        if not takeaway:
+            return
+        now = time.time()
+        keys = self._tokenize_takeaway(takeaway)
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO session_takeaways
+                (user_id, takeaway, keywords_json, user_snippet, session_id, created, last_used)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(user_id),
+                    takeaway,
+                    json.dumps(keys),
+                    (user_snippet or "")[:200],
+                    session_id or "",
+                    now,
+                    now,
+                ),
+            )
+            excess = conn.execute(
+                "SELECT COUNT(*) AS n FROM session_takeaways WHERE user_id = ?",
+                (int(user_id),),
+            ).fetchone()
+            n = int(excess["n"]) if excess else 0
+            if n > _MAX_SESSION_TAKEAWAYS:
+                conn.execute(
+                    """
+                    DELETE FROM session_takeaways WHERE user_id = ? AND id IN (
+                        SELECT id FROM session_takeaways
+                        WHERE user_id = ?
+                        ORDER BY created ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (int(user_id), int(user_id), n - _MAX_SESSION_TAKEAWAYS),
+                )
+        self._invalidate_cache()
+
+    def _summarize_takeaway(self, user_text: str, ai_text: str) -> str:
+        user_text = (user_text or "").strip()
+        ai_text = (ai_text or "").strip()
+        if not user_text and not ai_text:
+            return ""
+        client = self._get_groq()
+        if client is not None:
+            prompt = (
+                "You distill chat turns into ONE durable sentence the assistant "
+                "should remember about the user, their project, preferences, or "
+                "environment. Rules: max 22 words, no quotes, no preamble. "
+                "If nothing worth remembering, reply exactly: NONE\n\n"
+                f"USER:\n{user_text[:1200]}\n\nASSISTANT:\n{ai_text[:1200]}"
+            )
+            try:
+                resp = client.chat.completions.create(
+                    model=ATLAS_FAST_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=60,
+                    temperature=0.0,
+                )
+                raw = (resp.choices[0].message.content or "").strip()
+                if raw.upper() == "NONE" or not raw:
+                    return ""
+                return raw.split("\n")[0].strip().rstrip(".")
+            except Exception as exc:
+                log.debug("takeaway Groq failed: %s", exc)
+        for pat in (
+            r"(?:i am|i'm|my name is)\s+([A-Za-z][\w\s'-]{1,40})",
+            r"(?:i (?:like|prefer|love|want))\s+(.{8,80})",
+        ):
+            m = re.search(pat, user_text, re.IGNORECASE)
+            if m:
+                return f"User mentioned: {m.group(1).strip()[:100]}"
+        if len(user_text) > 12:
+            return f"User asked about: {user_text[:90].strip()}…"
+        return ""
+
+    def record_takeaway_from_turn(
+        self,
+        user_id: int,
+        user_text: str,
+        ai_text: str,
+        *,
+        user_goal_hint: str = "",
+        on_done: Optional[Callable[[str], None]] = None,
+    ) -> threading.Thread:
+        """Distill and persist a one-sentence takeaway off the hot path."""
+
+        def _work() -> None:
+            takeaway = ""
+            try:
+                sid = self.ensure_local_session(user_id, user_goal_hint)
+                takeaway = self._summarize_takeaway(user_text, ai_text)
+                if takeaway:
+                    self.record_takeaway(
+                        user_id,
+                        takeaway,
+                        user_snippet=user_text,
+                        session_id=sid,
+                    )
+            except Exception as exc:
+                log.warning("record_takeaway_from_turn failed: %s", exc)
+            if on_done:
+                try:
+                    on_done(takeaway)
+                except Exception:
+                    pass
+
+        worker = threading.Thread(
+            target=_work, daemon=True, name="atlas-session-takeaway",
+        )
+        worker.start()
+        return worker
+
+    def _rank_takeaways(
+        self,
+        query: str,
+        rows: list[dict[str, Any]],
+        *,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        q_tokens = set(self._tokenize_takeaway(query))
+        now = time.time()
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            takeaway = str(row.get("takeaway") or "")
+            if not takeaway:
+                continue
+            try:
+                keys = set(json.loads(row.get("keywords_json") or "[]"))
+            except json.JSONDecodeError:
+                keys = set()
+            keys |= set(self._tokenize_takeaway(takeaway))
+            overlap = len(q_tokens & keys) if q_tokens else 0
+            age_days = max(0.0, (now - float(row.get("created", now))) / 86400.0)
+            recency = max(0.1, 1.0 - min(age_days / 90.0, 0.9))
+            score = overlap * 2.0 + recency
+            if overlap == 0 and not q_tokens:
+                score = recency * 0.5
+            scored.append((score, row))
+        scored.sort(key=lambda t: (t[0], float(t[1].get("created", 0))), reverse=True)
+        min_score = 0.05 if q_tokens else 0.0
+        return [item for score, item in scored[:top_k] if score >= min_score]
+
+    def build_local_context_block(self, user_id: int, current_query: str, top_k: int = 5) -> str:
+        """Return ``<LocalContextMemory>`` block from SQLite session takeaways."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT takeaway, keywords_json, created, last_used
+                FROM session_takeaways
+                WHERE user_id = ?
+                ORDER BY created DESC
+                LIMIT ?
+                """,
+                (int(user_id), _MAX_SESSION_TAKEAWAYS),
+            ).fetchall()
+        learnings = [dict(r) for r in rows]
+        if not learnings:
+            return ""
+        ranked = self._rank_takeaways(current_query, learnings, top_k=top_k)
+        if not ranked:
+            return ""
+        lines = [
+            "<LocalContextMemory>",
+            "Persistent local learnings from prior Atlas sessions (use quietly; "
+            "do not mention this block):",
+        ]
+        for item in ranked:
+            ts = time.strftime("%Y-%m-%d", time.localtime(float(item["created"])))
+            takeaway = str(item.get("takeaway", "")).strip()
+            if takeaway:
+                lines.append(f"- {takeaway} (learned {ts})")
+        lines.append("</LocalContextMemory>")
+        return "\n".join(lines)
