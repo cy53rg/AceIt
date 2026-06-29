@@ -2806,26 +2806,6 @@ class AtlasWindow(QMainWindow):
         self.bridge.guide_step_started.connect(self._on_guide_step_started)
         self.bridge.step_verified.connect(self._on_step_verified)
 
-        if atlas_fs and not daemon_client:
-            atlas_fs.register_permission_callback(self._fs_permission_callback)
-            atlas_fs.register_typed_confirm_callback(self._typed_confirm_policy)
-            try:
-                from atlas_shell import shell_runner as _shell
-
-                _shell.set_permission_handler(self._shell_permission_sync)
-                _shell.set_typed_confirm_handler(
-                    lambda msg: self._typed_confirm_policy(
-                        type("R", (), {
-                            "confirm_phrase": msg.get("confirm_phrase", ""),
-                            "reason": msg.get("reason", ""),
-                            "audit_id": msg.get("audit_id", ""),
-                        })(),
-                        path=msg.get("path", ""),
-                    )
-                )
-            except ImportError:
-                pass
-
         self.telemetry = TelemetryClient() if HAS_TELEMETRY and TelemetryClient else None
 
         # ── Status-bar persistence (Bug #23) ──────────────────────────────────
@@ -2842,7 +2822,12 @@ class AtlasWindow(QMainWindow):
 
         # ── Backend engines — StateEngine lives in atlas_daemon; UI uses proxy ──
         self.state = None
-        if _CORE and daemon_client and HAS_DAEMON and AtlasStateProxy:
+        if not daemon_client:
+            raise RuntimeError(
+                "Atlas requires the background daemon. "
+                "Run: powershell -File scripts/install_atlas_daemon.ps1"
+            )
+        if _CORE and HAS_DAEMON and AtlasStateProxy:
             self.state = AtlasStateProxy(
                 daemon_client,
                 on_chunk=self.bridge.stream_token.emit,
@@ -2945,9 +2930,6 @@ class AtlasWindow(QMainWindow):
             TaskStopOverlay(self._stop_running_task)
             if HAS_OVERLAY and TaskStopOverlay else None
         )
-
-        if _CORE and step_orchestrator and not daemon_client:
-            step_orchestrator.set_ui_handler(self._post_step_pending)
 
         if self.state:
             self.state._safety_prompt = self._safety_prompt
@@ -5857,20 +5839,29 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
 
-    # ── Account gate — AccountManager lives in atlas_daemon ───────────────────
+    # ── Account gate — Atlas requires atlas_daemon ────────────────────────────
+    if not HAS_DAEMON or not ensure_daemon_running:
+        QMessageBox.critical(
+            None,
+            "Atlas daemon required",
+            "Atlas must run with the background daemon.\n\n"
+            "Install and start it:\n"
+            "  powershell -File scripts/install_atlas_daemon.ps1\n\n"
+            "Or manually: python -m atlas_daemon",
+        )
+        sys.exit(1)
     daemon_client = None
     account = None
     chosen_uid, chosen_name = None, None
-    if HAS_DAEMON and ensure_daemon_running:
-        try:
-            daemon_client = ensure_daemon_running()
-        except DaemonError as exc:
-            QMessageBox.critical(
-                None,
-                "Atlas daemon",
-                f"{exc}\n\nStart manually: python -m atlas_daemon",
-            )
-            sys.exit(1)
+    try:
+        daemon_client = ensure_daemon_running()
+    except DaemonError as exc:
+        QMessageBox.critical(
+            None,
+            "Atlas daemon",
+            f"{exc}\n\nStart manually: python -m atlas_daemon",
+        )
+        sys.exit(1)
     if daemon_client and HAS_ACCOUNTS and AccountClient:
         account = AccountClient(daemon_client)
         login = LoginDialog(account)

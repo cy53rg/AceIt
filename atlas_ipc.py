@@ -251,13 +251,51 @@ class DaemonClient:
         steps: list[dict] | None = None,
     ) -> int:
         data = self._post(
-            "/api/scheduler/enqueue",
+            "/api/jobs/enqueue",
             {"user_id": user_id, "name": name, "steps": steps or []},
         )
         return int(data.get("job_id", 0))
 
     def get_job(self, job_id: int) -> dict:
-        return self._get(f"/api/scheduler/jobs/{job_id}")
+        return self._get(f"/api/jobs/{job_id}")
+
+    def list_scheduler_pending(self) -> list[dict]:
+        return list(self._get("/api/scheduler/pending").get("pending") or [])
+
+    def resolve_scheduler_pending(self, pending_id: int, *, approved: bool) -> None:
+        self._post(
+            f"/api/scheduler/pending/{int(pending_id)}/resolve",
+            {"approved": bool(approved)},
+        )
+
+    def list_scheduler_definitions(self) -> list[dict]:
+        return list(self._get("/api/scheduler/definitions").get("jobs") or [])
+
+    def configure_weekly_routine(
+        self,
+        *,
+        day_of_week: str = "mon",
+        hour: int = 8,
+        minute: int = 0,
+        checklist: list | None = None,
+    ) -> None:
+        self._post(
+            "/api/scheduler/weekly-routine",
+            {
+                "day_of_week": day_of_week,
+                "hour": hour,
+                "minute": minute,
+                "checklist": checklist,
+            },
+        )
+
+    def list_scheduler_activity(self, since_days: float = 7.0) -> list[dict]:
+        return list(
+            self._get("/api/scheduler/activity", params={"since_days": since_days}).get(
+                "activity"
+            )
+            or []
+        )
 
     # ── Account RPC ───────────────────────────────────────────────────────────
 

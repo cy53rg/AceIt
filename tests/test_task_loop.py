@@ -23,26 +23,7 @@ def _mock_capture(b64: str) -> ScreenCapture:
     return ScreenCapture(b64, 1.0, (100, 100), (1920, 1080))
 
 
-def _minimal_engine(**kwargs) -> StateEngine:
-    events: list[tuple[str, dict]] = []
-
-    with patch("threading.Thread") as mock_thread:
-        mock_thread.return_value.start = MagicMock()
-        engine = StateEngine(
-            on_chunk=lambda _c: None,
-            on_complete=lambda _t: None,
-            on_error=lambda _e: None,
-            on_coordinates=lambda _d: None,
-            on_token_usage=lambda _u: None,
-            user_name="test-task-loop",
-        )
-    engine.on_event(lambda t, p: events.append((t, p)))
-    engine._task_running = False
-    engine._task_stop = __import__("threading").Event()
-    engine.safety_mode = kwargs.get("safety_mode", "off")
-    engine._safety_prompt = kwargs.get("safety_prompt")
-    engine._events = events
-    return engine
+from tests.harness import make_state_engine as _minimal_engine
 
 
 @pytest.fixture(autouse=True)

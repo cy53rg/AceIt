@@ -450,6 +450,8 @@ def create_app():
     def set_user(body: dict):
         if _state:
             _state.set_user(int(body.get("user_id", 0)), body.get("user_name"))
+            if hasattr(_state, "_sync_fs_policy"):
+                _state._sync_fs_policy()
         return {"ok": True}
 
     @app.post("/api/set_focus_mode")
@@ -616,8 +618,29 @@ def create_app():
     def accounts_call(body: GenericBody):
         return _account_call(body.method, body.args, body.kwargs)
 
+    @app.post("/api/jobs/enqueue")
+    def jobs_enqueue(body: dict):
+        if not _scheduler:
+            raise HTTPException(503, "scheduler not ready")
+        job_id = _scheduler.enqueue_job(
+            user_id=int(body.get("user_id") or 0),
+            name=str(body.get("name") or ""),
+            steps=list(body.get("steps") or []),
+        )
+        return {"ok": True, "job_id": job_id}
+
+    @app.get("/api/jobs/{job_id}")
+    def jobs_get(job_id: int):
+        if not _scheduler:
+            raise HTTPException(503, "scheduler not ready")
+        job = _scheduler.get_job(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        return job
+
     @app.post("/api/scheduler/enqueue")
     def scheduler_enqueue(body: dict):
+        log.warning("deprecated API: POST /api/scheduler/enqueue — use /api/jobs/enqueue")
         if not _scheduler:
             raise HTTPException(503, "scheduler not ready")
         job_id = _scheduler.enqueue_job(
@@ -629,6 +652,7 @@ def create_app():
 
     @app.get("/api/scheduler/jobs/{job_id}")
     def scheduler_get(job_id: int):
+        log.warning("deprecated API: GET /api/scheduler/jobs/{id} — use /api/jobs/{id}")
         if not _scheduler:
             raise HTTPException(503, "scheduler not ready")
         job = _scheduler.get_job(job_id)
