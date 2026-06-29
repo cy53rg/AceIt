@@ -2888,7 +2888,7 @@ class AtlasWindow(QMainWindow):
                 def _policy_ctx() -> PolicyContext:
                     return PolicyContext(
                         safety_mode=str(
-                            getattr(self.state, "safety_mode", "always") or "always"
+                            getattr(self.state, "safety_mode", None) or "off"
                         ),
                         fs_access_active=bool(self.fs_access_active),
                         execution_blocked=bool(
@@ -3756,9 +3756,29 @@ class AtlasWindow(QMainWindow):
             dlg.exec()
             return approved["v"]
         if p.startswith("atlas-hands://"):
-            # TODO(co-pilot): Remove auto-approve bypass — policy layer already
-            # evaluated this path; UI must not skip CONFIRM_CLICK for hands.
-            return True
+            approved = {"v": False}
+
+            def _approve():
+                approved["v"] = True
+
+            def _deny():
+                approved["v"] = False
+
+            dlg = PermissionDialog(action, path, _approve, _deny, parent=self)
+            dlg.exec()
+            return approved["v"]
+        if p.startswith("atlas-routine://"):
+            approved = {"v": False}
+
+            def _approve():
+                approved["v"] = True
+
+            def _deny():
+                approved["v"] = False
+
+            dlg = PermissionDialog(action, path, _approve, _deny, parent=self)
+            dlg.exec()
+            return approved["v"]
         if not self.fs_access_active:
             self.bridge.set_status.emit(
                 "⛔ File system access is OFF — enable it in the control panel"
@@ -3857,9 +3877,12 @@ class AtlasWindow(QMainWindow):
             dlg.exec()
             return
         if p.startswith("atlas-hands://"):
-            # TODO(co-pilot): Remove auto-approve bypass — policy layer already
-            # evaluated this path; UI must not skip CONFIRM_CLICK for hands.
-            approve_fn()
+            dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
+            dlg.exec()
+            return
+        if p.startswith("atlas-routine://"):
+            dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
+            dlg.exec()
             return
         if not self.fs_access_active:
             deny_fn()

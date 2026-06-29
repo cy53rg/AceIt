@@ -8,6 +8,11 @@ from pathlib import Path
 
 _DEFAULT_PORT = 17847
 
+# Security tab semantics: off = act without per-step prompts; always = confirm each
+# action; trusted = confirm once per session then auto-approve allowlisted tasks.
+DEFAULT_SAFETY_MODE = "off"
+VALID_SAFETY_MODES = frozenset({"off", "always", "trusted"})
+
 
 def atlas_data_dir() -> Path:
     """Per-user Atlas data directory (SQLite, logs, daemon token)."""

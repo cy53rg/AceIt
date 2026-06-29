@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from atlas_data import DEFAULT_SAFETY_MODE
 from atlas_fs_paths import normalize_path
 from atlas_logging import get_logger
 from atlas_policy import PolicyEngine, PolicyOutcome, RiskClass
@@ -109,7 +110,7 @@ class ShellRunner:
         self._policy = PolicyEngine(self._db_path)
         self._permission_handler: Optional[PermissionHandler] = None
         self._typed_confirm_handler: Optional[TypedConfirmHandler] = None
-        self._safety_mode = "always"
+        self._safety_mode = DEFAULT_SAFETY_MODE
         self._fs_access_active = False
         self._execution_blocked = False
         self._write_scopes: tuple[str, ...] = ()

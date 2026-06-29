@@ -68,6 +68,7 @@ from typing import Callable, Optional
 from dotenv import load_dotenv
 from groq import Groq
 
+from atlas_data import DEFAULT_SAFETY_MODE
 from atlas_learning import LearningEngine
 from atlas_memory_manager import MemoryManager
 from atlas_memory import UserMemory
@@ -1028,7 +1029,7 @@ class StateEngine:
         result = reg.execute(
             service,
             method,
-            safety_mode=str(getattr(self, "safety_mode", "always") or "always"),
+            safety_mode=str(getattr(self, "safety_mode", None) or DEFAULT_SAFETY_MODE),
             fs_access_active=bool(getattr(self, "_fs_access_active", False)),
             execution_blocked=bool(getattr(self, "execution_blocked", False)),
             **params,
@@ -1296,6 +1297,9 @@ class StateEngine:
 
     def set_user_pref(self, key: str, value) -> None:
         self.memory.set_pref(self.user_id, key, value)
+        if key == "safety_mode":
+            self.safety_mode = str(value or DEFAULT_SAFETY_MODE)
+            self._sync_fs_policy()
 
     # ── "Do anything" intent router ────────────────────────────────────────────
     #
@@ -1561,7 +1565,7 @@ class StateEngine:
         """Push runtime safety/fs flags into atlas_fs and shell_runner."""
         scopes = tuple(s.get("path", "") for s in atlas_fs.list_write_scopes())
         atlas_fs.set_policy_context(
-            safety_mode=str(getattr(self, "safety_mode", "always") or "always"),
+            safety_mode=str(getattr(self, "safety_mode", None) or DEFAULT_SAFETY_MODE),
             fs_access_active=bool(getattr(self, "_fs_access_active", False)),
             execution_blocked=bool(getattr(self, "execution_blocked", False)),
         )
@@ -1569,7 +1573,7 @@ class StateEngine:
             from atlas_shell import shell_runner as _shell
 
             _shell.set_policy_context(
-                safety_mode=str(getattr(self, "safety_mode", "always") or "always"),
+                safety_mode=str(getattr(self, "safety_mode", None) or DEFAULT_SAFETY_MODE),
                 fs_access_active=bool(getattr(self, "_fs_access_active", False)),
                 execution_blocked=bool(getattr(self, "execution_blocked", False)),
                 write_scopes=scopes,
@@ -1616,7 +1620,7 @@ class StateEngine:
         try:
             from atlas_shell import shell_runner as _shell
 
-            result = _shell.run(command, safety_mode=str(self.safety_mode or "always"))
+            result = _shell.run(command, safety_mode=str(self.safety_mode or DEFAULT_SAFETY_MODE))
             if result.get("denied"):
                 self._announce(result.get("reason") or "Shell command denied by policy.")
             elif result.get("ok"):
@@ -1708,7 +1712,15 @@ class StateEngine:
         def _approved() -> None:
             self._task_running = True
             self._task_stop = threading.Event()
-            atlas_hands.auto_approve = True
+            mode = (getattr(self, "safety_mode", None) or DEFAULT_SAFETY_MODE).lower()
+            atlas_hands.auto_approve = mode != "always"
+            log.info(
+                "routine audit: safety_mode=%s auto_approve=%s name=%r",
+                mode,
+                atlas_hands.auto_approve,
+                name,
+            )
+            self._sync_fs_policy()
             self._emit("task_running", {
                 "active": True,
                 "task": str(routine.get("name", name)),
@@ -2598,7 +2610,7 @@ class StateEngine:
         self.execution_blocked = False
         self.connectors = None  # set by atlas_daemon — ConnectorRegistry
         # Safety mode: off = auto actions, always = confirm each action, trusted = confirm once per session
-        self.safety_mode = str(self.get_user_prefs().get("safety_mode", "off"))
+        self.safety_mode = str(self.get_user_prefs().get("safety_mode", DEFAULT_SAFETY_MODE))
         self._safety_session_ok = False
         self._task_trusted_ok = False
         self._task_confirm_cb: Optional[Callable[[str], bool]] = None
@@ -2646,9 +2658,11 @@ class StateEngine:
         """Restore per-user toggles saved in prefs."""
         prefs = self.get_user_prefs()
         self.focus_mode = bool(prefs.get("focus_mode", False))
+        self.safety_mode = str(prefs.get("safety_mode", DEFAULT_SAFETY_MODE))
         sec = prefs.get("security") or {}
         if isinstance(sec, dict):
             self._security_prefs = dict(sec)
+        self._sync_fs_policy()
 
     # ── Account switching ──────────────────────────────────────────────────────
 

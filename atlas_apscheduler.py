@@ -20,6 +20,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
+from atlas_data import DEFAULT_SAFETY_MODE
 from atlas_logging import get_logger
 from atlas_memory import UserMemory
 from atlas_policy import PolicyContext, PolicyEngine, PolicyOutcome, RiskClass
@@ -111,7 +112,7 @@ class JobDispatcher:
         playbooks: Any = None,
         is_attended: Callable[[], bool] | None = None,
         on_notify: Callable[[dict], None] | None = None,
-        safety_mode: str = "always",
+        safety_mode: str = DEFAULT_SAFETY_MODE,
         fs_access_active: bool = False,
         execution_blocked: bool = False,
     ) -> None:

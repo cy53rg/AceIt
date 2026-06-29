@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
+from atlas_data import DEFAULT_SAFETY_MODE
 from atlas_fs_paths import (
     deny_message,
     is_path_denied,
@@ -109,7 +110,7 @@ class AtlasFileSystemV2:
         self._permission_callback = permission_callback
         self._typed_confirm_callback: Optional[Callable] = None
         self._fs_access_active = False
-        self._safety_mode = "always"
+        self._safety_mode = DEFAULT_SAFETY_MODE
         self._execution_blocked = False
 
     def register_permission_callback(self, callback: Callable) -> None:

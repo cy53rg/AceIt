@@ -13,9 +13,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 from atlas_ipc import DaemonClient
+from atlas_data import DEFAULT_SAFETY_MODE
 from atlas_logging import get_logger
-
-log = get_logger("state_proxy")
 
 
 class _SessionProxy:
@@ -159,7 +158,7 @@ class AtlasStateProxy:
         self.learning = _LearningProxy(self)
         self.audio_watcher = _LocalAudioBridge()
         self.user_id = 0
-        self.safety_mode = "off"
+        self.safety_mode = DEFAULT_SAFETY_MODE
         self.focus_mode = False
         self.execution_blocked = False
         self.is_learning = False

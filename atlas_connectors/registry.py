@@ -11,6 +11,7 @@ from atlas_connectors.github import GitHubConnector
 from atlas_connectors.notion import NotionConnector
 from atlas_connectors.paystack import PaystackConnector
 from atlas_connectors.tokens import TokenStore
+from atlas_data import DEFAULT_SAFETY_MODE
 from atlas_logging import get_logger
 from atlas_policy import (
     AuthorizationResult,
@@ -98,7 +99,7 @@ class ConnectorRegistry:
         connector_id: str,
         method: str,
         *,
-        safety_mode: str = "always",
+        safety_mode: str = DEFAULT_SAFETY_MODE,
         fs_access_active: bool = True,
         execution_blocked: bool = False,
         **params: Any,
@@ -131,7 +132,7 @@ class ConnectorRegistry:
         connector_id: str,
         method: str,
         *,
-        safety_mode: str = "always",
+        safety_mode: str = DEFAULT_SAFETY_MODE,
         fs_access_active: bool = True,
         execution_blocked: bool = False,
         **params: Any,

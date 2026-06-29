@@ -800,6 +800,8 @@ class SettingsDialog(QDialog):
         lay.addWidget(btn_export)
 
         lay.addWidget(QLabel("<b>Computer Use — Safety Mode</b>"))
+        # Semantics: off = auto-approve physical actions; always = PermissionDialog per
+        # step; trusted = one task/routine confirm then auto for allowlisted goals.
         self.safety_combo = QComboBox()
         self.safety_combo.addItems([
             "Off — act without prompts",
@@ -835,6 +837,7 @@ class SettingsDialog(QDialog):
         mode = "off"
         if self.engine:
             mode = str(self.engine.get_user_prefs().get("safety_mode", "off"))
+            self.engine.safety_mode = mode
         self.safety_combo.setCurrentIndex(
             {"off": 0, "always": 1, "trusted": 2}.get(mode, 0))
 

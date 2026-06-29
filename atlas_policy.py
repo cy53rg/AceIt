@@ -7,6 +7,8 @@ Free-text descriptions from the model are never used to change rulings.
 """
 from __future__ import annotations
 
+from atlas_data import DEFAULT_SAFETY_MODE
+
 import re
 import sqlite3
 import time
@@ -171,7 +173,7 @@ class ActionRequest:
 
 @dataclass(frozen=True)
 class PolicyContext:
-    safety_mode: str = "always"
+    safety_mode: str = DEFAULT_SAFETY_MODE
     fs_access_active: bool = False
     execution_blocked: bool = False
     write_scopes: tuple[str, ...] = ()
@@ -404,7 +406,7 @@ class PolicyEngine:
                 execution_blocked=ctx.execution_blocked,
                 write_scopes=write_scopes,
             )
-        mode = (safety_mode if safety_mode is not None else ctx.safety_mode or "always").lower()
+        mode = (safety_mode if safety_mode is not None else ctx.safety_mode or DEFAULT_SAFETY_MODE).lower()
         fs_on = fs_access_active if fs_access_active is not None else ctx.fs_access_active
         blocked = (
             execution_blocked

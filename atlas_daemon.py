@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from atlas_data import atlas_db_path, daemon_host, daemon_port
+from atlas_data import atlas_db_path, daemon_host, daemon_port, DEFAULT_SAFETY_MODE
 from atlas_logging import get_logger
 
 log = get_logger("daemon")
@@ -156,7 +156,7 @@ def _init_services(user_name: str = "default") -> None:
             s.get("path", "") for s in atlas_fs.list_write_scopes()
         ) if hasattr(atlas_fs, "list_write_scopes") else ()
         return PolicyContext(
-            safety_mode=str(getattr(_state, "safety_mode", "always") or "always"),
+            safety_mode=str(getattr(_state, "safety_mode", None) or DEFAULT_SAFETY_MODE),
             fs_access_active=bool(getattr(_state, "_fs_access_active", False)),
             execution_blocked=bool(getattr(_state, "execution_blocked", False)),
             write_scopes=scopes,
@@ -312,7 +312,7 @@ def _init_services(user_name: str = "default") -> None:
         playbooks=_playbooks,
         is_attended=lambda: bool(_ui_bridge and _ui_bridge.has_clients()),
         on_notify=lambda msg: _ui_bridge.broadcast(msg) if _ui_bridge else None,
-        safety_mode=str(getattr(_state, "safety_mode", "always") or "always"),
+        safety_mode=str(getattr(_state, "safety_mode", None) or DEFAULT_SAFETY_MODE),
         fs_access_active=bool(getattr(_state, "_fs_access_active", False)),
         execution_blocked=bool(getattr(_state, "execution_blocked", False)),
     )
@@ -530,7 +530,7 @@ def create_app():
             _state._sync_fs_policy()
         return shell_runner.run(
             cmd,
-            safety_mode=str(_state.safety_mode if _state else "always"),
+            safety_mode=str(_state.safety_mode if _state else DEFAULT_SAFETY_MODE),
         )
 
     @app.get("/api/ssh/targets")
@@ -712,7 +712,7 @@ def create_app():
         return _connectors.execute(
             connector_id,
             method,
-            safety_mode=str(_state.safety_mode or "always"),
+            safety_mode=str(_state.safety_mode or DEFAULT_SAFETY_MODE),
             fs_access_active=bool(getattr(_state, "_fs_access_active", False)),
             execution_blocked=bool(_state.execution_blocked),
             **body,
