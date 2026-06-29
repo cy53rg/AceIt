@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional
 
 import requests
 
-from atlas_data import daemon_base_url
+from atlas_data import atlas_data_dir, daemon_base_url, daemon_host, daemon_port
 from atlas_logging import get_logger
 
 log = get_logger("ipc")
@@ -30,6 +30,73 @@ except ImportError:
 
 class DaemonError(RuntimeError):
     pass
+
+
+def _daemon_port_open() -> bool:
+    import socket
+    host = daemon_host()
+    port = daemon_port()
+    try:
+        with socket.create_connection((host, port), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
+def _spawn_daemon_log() -> Path:
+    return atlas_data_dir() / "daemon_spawn.log"
+
+
+def ensure_daemon_running(timeout: float = 30.0) -> DaemonClient:
+    """Connect to atlas_daemon, spawning it if necessary."""
+    import subprocess
+    import sys
+
+    client = DaemonClient(auto_connect=False)
+    if client.health():
+        client.start_event_stream()
+        return client
+
+    port_busy = _daemon_port_open()
+    log_path = _spawn_daemon_log()
+    if port_busy:
+        log.warning(
+            "Port %s:%s is in use but /health failed — stale process?",
+            daemon_host(), daemon_port(),
+        )
+
+    with log_path.open("a", encoding="utf-8") as log_f:
+        log_f.write(f"\n--- spawn {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        log_f.flush()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "atlas_daemon"],
+            cwd=str(Path(__file__).resolve().parent),
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+        )
+
+    if not client.wait_for_health(timeout):
+        # Spawn may have failed instantly if port was already taken.
+        exit_code = proc.poll()
+        if port_busy or exit_code is not None:
+            hint = (
+                f"Port {daemon_host()}:{daemon_port()} may be blocked by another process.\n"
+                "Close other Atlas instances, then in PowerShell:\n"
+                f"  netstat -ano | findstr :{daemon_port()}\n"
+                "  taskkill /PID <pid> /F\n"
+                f"Then: python -m atlas_daemon\n"
+                f"Details: {log_path}"
+            )
+            raise DaemonError(
+                "Atlas daemon did not start — port conflict or crash.\n" + hint
+            )
+        raise DaemonError(
+            f"Atlas daemon did not start within {timeout:.0f}s.\n"
+            f"Start manually: python -m atlas_daemon\n"
+            f"Details: {log_path}"
+        )
+    client.start_event_stream()
+    return client
 
 
 class DaemonClient:
@@ -421,26 +488,3 @@ class _RemoteCloud:
     def send_email_otp(self, email: str) -> tuple[bool, str]:
         data = self._client.account_call("cloud_send_email_otp", email)
         return bool(data.get("ok")), str(data.get("message", ""))
-
-
-def ensure_daemon_running(timeout: float = 20.0) -> DaemonClient:
-    """Connect to atlas_daemon, spawning it if necessary."""
-    import subprocess
-    import sys
-
-    client = DaemonClient(auto_connect=False)
-    if client.health():
-        client.start_event_stream()
-        return client
-    subprocess.Popen(
-        [sys.executable, "-m", "atlas_daemon"],
-        cwd=str(Path(__file__).resolve().parent),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if not client.wait_for_health(timeout):
-        raise DaemonError(
-            "Atlas daemon did not start — run: python -m atlas_daemon"
-        )
-    client.start_event_stream()
-    return client
