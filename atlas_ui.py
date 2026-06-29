@@ -4126,6 +4126,14 @@ class AtlasWindow(QMainWindow):
             QTimer.singleShot(0, lambda: (
                 self._show_task_stop_ui() if active else self._hide_task_stop_ui()
             ))
+        elif event_type == "user_notice":
+            title = str(payload.get("title", "Atlas"))
+            message = str(payload.get("message", ""))
+            QTimer.singleShot(0, lambda: self.bridge.user_notice.emit(title, message))
+        elif event_type == "weekly_digest":
+            message = str(payload.get("message", ""))
+            if message:
+                QTimer.singleShot(0, lambda: self._append_response(message))
         elif event_type == "focus_changed":
             QTimer.singleShot(0, lambda: self._on_focus_mode_changed(
                 payload.get("enabled", False)))
@@ -5303,6 +5311,10 @@ class AtlasWindow(QMainWindow):
             self.audio.start_mic()
         else:
             self.audio.stop_mic()
+        if self.state and getattr(self.state, "audio_watcher", None):
+            watcher = self.state.audio_watcher
+            if hasattr(watcher, "bind_audio"):
+                watcher.bind_audio(self.audio)
         self._action_mic.blockSignals(True)
         self._action_mic.setChecked(self.audio.mic_active)
         self._action_mic.blockSignals(False)

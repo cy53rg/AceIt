@@ -437,7 +437,16 @@ class LearningEngine:
         client = self._get_groq()
         if client is None or not recent_responses:
             return None
-        sample = "\n---\n".join(recent_responses[-DRIFT_SAMPLE_SIZE:])
+        joined = "\n---\n".join(recent_responses[-DRIFT_SAMPLE_SIZE:])
+        if len(joined) > 4000:
+            third = max(1, len(joined) // 3)
+            sample = "\n---\n".join([
+                joined[:third],
+                joined[third: third * 2],
+                joined[third * 2: third * 2 + 1300],
+            ])
+        else:
+            sample = joined
         prompt = (
             "You evaluate whether an AI assistant's recent replies match a target persona.\n\n"
             f"TARGET PERSONA:\n{PERSONA_BASELINE}\n\n"

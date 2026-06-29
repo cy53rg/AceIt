@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QListWidget,
     QListWidgetItem,
+    QSpinBox,
     QFileDialog,
     QMessageBox,
     QTableWidget,
@@ -139,6 +140,7 @@ class SettingsDialog(QDialog):
         self._build_connectors_tab()
         self._build_filesystem_tab()
         self._build_ssh_tab()
+        self._build_scheduler_tab()
         self._build_security_tab()
         self._build_hotkeys_tab()
         self._build_teaching_tab()
@@ -491,10 +493,15 @@ class SettingsDialog(QDialog):
             cid = info.get("id", "")
             name = info.get("display_name", cid)
             connected = info.get("connected", False)
+            stub = cid in ("gmail", "notion") and not connected
             status = (
                 f"<span style='color:{PAL['success']}'>Connected</span>"
                 if connected else
-                f"<span style='color:{PAL['muted']}'>Not connected</span>"
+                (
+                    f"<span style='color:{PAL['gold']}'>Needs configuration</span>"
+                    if stub else
+                    f"<span style='color:{PAL['muted']}'>Not connected</span>"
+                )
             )
             title = QLabel(f"<b>{name}</b> — {status}")
             bl.addWidget(title)
@@ -503,7 +510,16 @@ class SettingsDialog(QDialog):
             boundary.setStyleSheet(f"color: {PAL['text']}; font-size: 11px;")
             bl.addWidget(boundary)
             btn_row = QHBoxLayout()
-            if connected:
+            if stub:
+                hint = QLabel(
+                    "Set GOOGLE_CLIENT_ID / NOTION_TOKEN in .env and connect when OAuth is wired."
+                    if cid == "gmail" else
+                    "Notion OAuth pending — connect when configured."
+                )
+                hint.setWordWrap(True)
+                hint.setStyleSheet(f"color: {PAL['muted']}; font-size: 10px;")
+                bl.addWidget(hint)
+            elif connected:
                 btn = QPushButton("Disconnect")
                 btn.clicked.connect(lambda _=False, c=cid: self._connector_toggle(c, False))
             else:
@@ -643,6 +659,146 @@ class SettingsDialog(QDialog):
         self._ssh_tab_index = self.tabs.count() - 1
         self.tabs.currentChanged.connect(
             lambda i: self._refresh_ssh_targets() if i == self._ssh_tab_index else None)
+
+    def _build_scheduler_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        hdr = QLabel(
+            "<b>Scheduler</b> — Pending policy approvals, cron jobs, weekly routine, "
+            "and recent activity (daemon-backed)."
+        )
+        hdr.setWordWrap(True)
+        lay.addWidget(hdr)
+
+        lay.addWidget(QLabel("<b>Pending approvals</b>"))
+        self.sched_pending_list = QListWidget()
+        lay.addWidget(self.sched_pending_list, 1)
+        prow = QHBoxLayout()
+        btn_approve = QPushButton("Approve selected")
+        btn_deny = QPushButton("Deny selected")
+        btn_approve.clicked.connect(lambda: self._resolve_scheduler_pending(True))
+        btn_deny.clicked.connect(lambda: self._resolve_scheduler_pending(False))
+        prow.addWidget(btn_approve)
+        prow.addWidget(btn_deny)
+        prow.addStretch()
+        lay.addLayout(prow)
+
+        lay.addWidget(QLabel("<b>Scheduled job definitions</b>"))
+        self.sched_defs_list = QListWidget()
+        lay.addWidget(self.sched_defs_list, 1)
+
+        lay.addWidget(QLabel("<b>Weekly routine</b>"))
+        wrow = QHBoxLayout()
+        self.sched_weekly_day = QComboBox()
+        self.sched_weekly_day.addItems(
+            ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+        )
+        self.sched_weekly_hour = QSpinBox()
+        self.sched_weekly_hour.setRange(0, 23)
+        self.sched_weekly_hour.setValue(8)
+        self.sched_weekly_min = QSpinBox()
+        self.sched_weekly_min.setRange(0, 59)
+        btn_weekly = QPushButton("Save weekly routine (Mon 8:00 UTC default)")
+        btn_weekly.clicked.connect(self._save_weekly_routine)
+        wrow.addWidget(QLabel("Day"))
+        wrow.addWidget(self.sched_weekly_day)
+        wrow.addWidget(QLabel("Hour UTC"))
+        wrow.addWidget(self.sched_weekly_hour)
+        wrow.addWidget(QLabel("Min"))
+        wrow.addWidget(self.sched_weekly_min)
+        wrow.addWidget(btn_weekly)
+        wrow.addStretch()
+        lay.addLayout(wrow)
+
+        lay.addWidget(QLabel("<b>Activity (last 7 days)</b>"))
+        self.sched_activity_list = QListWidget()
+        lay.addWidget(self.sched_activity_list, 2)
+
+        btn_refresh = QPushButton("Refresh scheduler data")
+        btn_refresh.clicked.connect(self._refresh_scheduler_tab)
+        lay.addWidget(btn_refresh)
+
+        self.tabs.addTab(w, "Scheduler")
+        self._scheduler_tab_index = self.tabs.count() - 1
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_scheduler_tab() if i == self._scheduler_tab_index else None)
+
+    def _daemon_client(self):
+        return getattr(self.ui, "_daemon_client", None)
+
+    def _refresh_scheduler_tab(self) -> None:
+        client = self._daemon_client()
+        self.sched_pending_list.clear()
+        self.sched_defs_list.clear()
+        self.sched_activity_list.clear()
+        if not client:
+            self.sched_pending_list.addItem("Daemon not connected.")
+            return
+        try:
+            for row in client.list_scheduler_pending():
+                pid = row.get("id")
+                self.sched_pending_list.addItem(
+                    QListWidgetItem(
+                        f"#{pid} [{row.get('risk_class')}] {row.get('action_type')}: "
+                        f"{str(row.get('reason') or row.get('detail', ''))[:80]}"
+                    )
+                )
+                item = self.sched_pending_list.item(self.sched_pending_list.count() - 1)
+                if item is not None:
+                    item.setData(Qt.UserRole, int(pid))
+            for job in client.list_scheduler_definitions():
+                self.sched_defs_list.addItem(
+                    f"{job.get('id', '?')} — {job.get('name', '')} "
+                    f"({job.get('job_type', '')}) next={job.get('next_run', '—')}"
+                )
+            for act in client.list_scheduler_activity(7.0):
+                self.sched_activity_list.addItem(
+                    f"[{act.get('category')}] {act.get('summary', '')} "
+                    f"({act.get('status', '')})"
+                )
+        except Exception as exc:
+            self.sched_pending_list.addItem(f"Error: {exc}")
+
+    def _resolve_scheduler_pending(self, approved: bool) -> None:
+        client = self._daemon_client()
+        item = self.sched_pending_list.currentItem()
+        if not client or not item:
+            return
+        pid = item.data(Qt.UserRole)
+        if pid is None:
+            return
+
+        def _work():
+            try:
+                client.resolve_scheduler_pending(int(pid), approved=approved)
+                self.ui.bridge.set_status.emit(
+                    "Scheduler action approved." if approved else "Scheduler action denied."
+                )
+                QTimer.singleShot(0, self._refresh_scheduler_tab)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _save_weekly_routine(self) -> None:
+        client = self._daemon_client()
+        if not client:
+            return
+
+        def _work():
+            try:
+                client.configure_weekly_routine(
+                    day_of_week=self.sched_weekly_day.currentText(),
+                    hour=int(self.sched_weekly_hour.value()),
+                    minute=int(self.sched_weekly_min.value()),
+                )
+                self.ui.bridge.set_status.emit("Weekly routine saved.")
+                QTimer.singleShot(0, self._refresh_scheduler_tab)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _refresh_ssh_targets(self) -> None:
         client = getattr(self.ui, "_daemon_client", None)
@@ -815,8 +971,9 @@ class SettingsDialog(QDialog):
 
         lay.addStretch()
         self.tabs.addTab(w, "Security")
+        self._security_tab_index = self.tabs.count() - 1
         self.tabs.currentChanged.connect(
-            lambda i: self._refresh_security() if i == 7 else None)
+            lambda i: self._refresh_security() if i == self._security_tab_index else None)
 
     def _refresh_security(self) -> None:
         acct = getattr(self.ui, "account", None)

@@ -53,6 +53,9 @@ class RoutineRecorder:
 
     _CROP_W, _CROP_H = 380, 240
     _DOUBLE_CLICK_S = 0.40
+    _DOUBLE_CLICK_RADIUS = 4
+    _MAX_CROP_EVENTS = 50
+    _MAX_CROP_BYTES = 4 * 1024 * 1024
     _MODS = {
         "ctrl", "ctrl_l", "ctrl_r", "alt", "alt_l", "alt_r", "alt_gr",
         "cmd", "cmd_l", "cmd_r", "shift", "shift_l", "shift_r",
@@ -67,6 +70,7 @@ class RoutineRecorder:
         self._lock = threading.Lock()
         self._mods: set[str] = set()
         self._last_click = (0.0, 0, 0)
+        self._crop_bytes = 0
 
     @property
     def active(self) -> bool:
@@ -84,6 +88,7 @@ class RoutineRecorder:
         self._text_buf.clear()
         self._mods.clear()
         self._last_click = (0.0, 0, 0)
+        self._crop_bytes = 0
         self._mouse = mouse.Listener(on_click=self._on_click)
         self._kbd = keyboard.Listener(
             on_press=self._on_press, on_release=self._on_release)
@@ -125,12 +130,18 @@ class RoutineRecorder:
         now = time.time()
         lt, lx, ly = self._last_click
         double = (now - lt < self._DOUBLE_CLICK_S
-                  and abs(x - lx) < 6 and abs(y - ly) < 6)
+                  and abs(x - lx) < self._DOUBLE_CLICK_RADIUS
+                  and abs(y - ly) < self._DOUBLE_CLICK_RADIUS)
+        crop_b64 = None
+        if len(self.events) < self._MAX_CROP_EVENTS and self._crop_bytes < self._MAX_CROP_BYTES:
+            crop_b64 = self._grab_crop(x, y)
+            if crop_b64:
+                self._crop_bytes += len(crop_b64)
         self._last_click = (now, x, y)
         self.events.append({
             "type": "click", "x": int(x), "y": int(y),
             "button": getattr(button, "name", "left"),
-            "double": bool(double), "crop_b64": self._grab_crop(x, y),
+            "double": bool(double), "crop_b64": crop_b64,
         })
 
     def _grab_crop(self, x, y) -> Optional[str]:

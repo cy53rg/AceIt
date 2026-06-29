@@ -32,7 +32,31 @@ _scheduler = None
 _apscheduler = None
 _connectors = None
 _ssh_manager = None
+_dispatcher = None
+_playbooks = None
 _ui_bridge: Optional["UIBridge"] = None
+
+
+def _sync_daemon_user(user_id: int) -> None:
+    """Keep scheduler/connector subsystems aligned after account switch."""
+    if _connectors is not None:
+        _connectors._user_id = int(user_id)
+    if _dispatcher is not None:
+        _dispatcher.user_id = int(user_id)
+    if _apscheduler is not None:
+        _apscheduler.user_id = int(user_id)
+    if _playbooks is not None:
+        _playbooks.user_id = int(user_id)
+
+
+def _sync_dispatcher_policy() -> None:
+    if _dispatcher is None or _state is None:
+        return
+    _dispatcher.safety_mode = str(
+        getattr(_state, "safety_mode", None) or DEFAULT_SAFETY_MODE
+    )
+    _dispatcher.fs_access_active = bool(getattr(_state, "_fs_access_active", False))
+    _dispatcher.execution_blocked = bool(getattr(_state, "execution_blocked", False))
 
 
 class UIBridge:
@@ -108,7 +132,8 @@ class UIBridge:
 
 
 def _init_services(user_name: str = "default") -> None:
-    global _state, _account, _memory, _scheduler, _apscheduler, _connectors, _ui_bridge, _ssh_manager
+    global _state, _account, _memory, _scheduler, _apscheduler, _connectors
+    global _ui_bridge, _ssh_manager, _dispatcher, _playbooks
 
     from atlas_accounts import AccountManager
     from atlas_connectors.registry import ConnectorRegistry
@@ -242,6 +267,7 @@ def _init_services(user_name: str = "default") -> None:
     from atlas_connectors.ssh_targets import SSHTargetManager
 
     _ssh_manager = SSHTargetManager(atlas_db_path(), shell_runner)
+    _state.ssh_manager = _ssh_manager
 
     def _sync_runtime_policy() -> None:
         ctx = _policy_ctx()
@@ -256,6 +282,7 @@ def _init_services(user_name: str = "default") -> None:
             execution_blocked=ctx.execution_blocked,
             write_scopes=ctx.write_scopes,
         )
+        _sync_dispatcher_policy()
 
     _sync_runtime_policy()
     _state._sync_fs_policy = _sync_runtime_policy  # type: ignore[attr-defined]
@@ -380,6 +407,14 @@ def _state_invoke(method: str, args: list, kwargs: dict) -> Any:
     if method in _INVOKE_ALLOW:
         fn = getattr(_state, method)
         return fn(*args, **kwargs)
+    if method == "session.set_response_style":
+        _state.session.response_style = str(
+            args[0] if args else kwargs.get("style", "Balanced")
+        )
+        return True
+    if method.startswith("session."):
+        fn = getattr(_state.session, method.split(".", 1)[1])
+        return fn(*args, **kwargs)
     if method.startswith("memory."):
         fn = getattr(_state.memory, method.split(".", 1)[1])
         return fn(*args, **kwargs)
@@ -449,7 +484,9 @@ def create_app():
     @app.post("/api/set_user")
     def set_user(body: dict):
         if _state:
-            _state.set_user(int(body.get("user_id", 0)), body.get("user_name"))
+            uid = int(body.get("user_id", 0))
+            _state.set_user(uid, body.get("user_name"))
+            _sync_daemon_user(uid)
             if hasattr(_state, "_sync_fs_policy"):
                 _state._sync_fs_policy()
         return {"ok": True}
@@ -598,6 +635,7 @@ def create_app():
             "safety_mode": _state.safety_mode,
             "focus_mode": _state.focus_mode,
             "is_learning": _state.is_learning,
+            "mode": _state.mode.name,
         }
 
     @app.post("/api/invoke")
@@ -707,6 +745,14 @@ def create_app():
         return {
             "activity": _memory.list_scheduler_activity(_state.user_id, since=since),
         }
+
+    @app.post("/api/scheduler/pending/{pending_id}/resolve")
+    def scheduler_resolve_pending(pending_id: int, body: dict):
+        if not _memory:
+            raise HTTPException(503, "not ready")
+        approved = bool(body.get("approved", False))
+        _memory.resolve_scheduler_pending(int(pending_id), approved=approved)
+        return {"ok": True, "approved": approved}
 
     @app.get("/api/connectors")
     def list_connectors():

@@ -64,6 +64,13 @@ DISPATCH_RULES: tuple[tuple[re.Pattern[str], dict[str, Any]], ...] = (
         "method": "initiate_transfer",
         "params": {"amount": 0, "recipient": "scheduled-placeholder"},
     }),
+    (re.compile(r"\b(ssh|remote server|remote host)\b", re.I), {
+        "route": "connector",
+        "connector": "ssh",
+        "method": "run",
+        "target": "",
+        "command": "",
+    }),
     (re.compile(r"\b(playbook|procedure cleanup)\b", re.I), {
         "route": "maintenance",
         "kind": "playbook_maintenance",
@@ -352,7 +359,7 @@ class WeeklyRoutineRunner:
 
     def run(self, *, checklist: tuple[dict[str, Any], ...] | None = None) -> dict[str, Any]:
         week_ago = time.time() - (7 * 86400)
-        items = checklist or self.CHECKLIST
+        items = self._filter_checklist(checklist or self.CHECKLIST)
         checklist_results: list[dict[str, Any]] = []
 
         for item in items:
@@ -399,6 +406,25 @@ class WeeklyRoutineRunner:
             "pending": pending,
             "activity_count": len(activity),
         }
+
+    def _filter_checklist(
+        self, items: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
+        """Skip stub connectors (gmail/notion) when not connected."""
+        reg = getattr(self.dispatcher, "connectors", None)
+        out: list[dict[str, Any]] = []
+        for item in items:
+            if item.get("route") != "connector":
+                out.append(dict(item))
+                continue
+            cid = str(item.get("connector") or "")
+            if cid in ("gmail", "notion") and reg is not None:
+                conn = reg.get(cid)
+                if conn is None or not conn.is_connected():
+                    log.info("weekly routine: skipping unconfigured connector %s", cid)
+                    continue
+            out.append(dict(item))
+        return tuple(out)
 
     def _build_digest(
         self,

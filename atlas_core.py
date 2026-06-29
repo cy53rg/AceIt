@@ -63,7 +63,7 @@ import threading
 import time
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -689,6 +689,7 @@ class StateEngine:
     _BUFFER_MAX: int = 8
     # How many buffer entries to inject into a user query
     _BUFFER_INJECT: int = 3
+    _BUFFER_FRESH_S: float = 8.0
 
     # Sentence boundary pattern: punctuation followed by a space (or end of string)
     # Matches ". ", "! ", "? " — used by the TTS streaming buffer (FIX-1)
@@ -1021,6 +1022,8 @@ class StateEngine:
         method = str(decision.get("method") or "").strip()
         if not service or not method:
             return "error: connector action requires service and method"
+        if service == "ssh":
+            return self._run_ssh_connector_action(decision)
         params = {
             k: v for k, v in decision.items()
             if k not in ("action", "say", "thought", "service", "connector", "method", "expect", "expected_state")
@@ -1039,6 +1042,26 @@ class StateEngine:
         if result.get("denied"):
             return f"connector denied ({result.get('decision')}): {result.get('reason', 'denied')}"
         return f"connector error: {result.get('error') or result.get('reason', 'unknown')}"
+
+    def _run_ssh_connector_action(self, decision: dict) -> str:
+        mgr = getattr(self, "ssh_manager", None)
+        if mgr is None:
+            return "error: ssh manager not available"
+        target = str(
+            decision.get("target") or decision.get("host") or decision.get("name") or ""
+        ).strip()
+        command = str(
+            decision.get("command") or decision.get("text") or decision.get("cmd") or ""
+        ).strip()
+        if not target or not command:
+            return "error: ssh action requires target and command"
+        self._sync_fs_policy()
+        result = mgr.run_command(target, command)
+        if result.get("ok"):
+            return f"ssh {target}: {str(result.get('stdout') or result)[:500]}"
+        if result.get("denied"):
+            return f"ssh denied: {result.get('reason', 'denied')}"
+        return f"ssh error: {result.get('error') or result.get('reason', 'unknown')}"
 
     def _task_auto_approve_for_mode(self) -> bool:
         """
@@ -2568,7 +2591,7 @@ class StateEngine:
         # Silent ambient ring buffer ──────────────────────────────────────────
         # Screen-watcher pushes here via handle_input(source="watch").
         # Content is injected into the NEXT user query and then NOT auto-sent.
-        self._context_buffer: list[str] = []
+        self._context_buffer: list[dict[str, Any]] = []
         self._buffer_lock = threading.Lock()
 
         # Optional pending screen capture (set by inject_screen_capture)
@@ -2747,11 +2770,15 @@ class StateEngine:
     # ── Silent ambient buffer ─────────────────────────────────────────────────
 
     def _push_context(self, text: str) -> None:
-        """Add a screen-watcher snapshot to the ring buffer."""
+        """Add a screen-watcher snapshot to the ring buffer (timestamped)."""
+        now = time.time()
         with self._buffer_lock:
-            self._context_buffer.append(text)
-            if len(self._context_buffer) > self._BUFFER_MAX:
-                self._context_buffer.pop(0)
+            self._context_buffer.append({"text": text, "ts": now})
+            cutoff = now - self._BUFFER_FRESH_S * 4
+            self._context_buffer = [
+                e for e in self._context_buffer
+                if float(e.get("ts", 0)) >= cutoff
+            ][-self._BUFFER_MAX:]
 
     def _clear_context_buffer(self) -> None:
         with self._buffer_lock:
@@ -2759,11 +2786,20 @@ class StateEngine:
 
     def _get_context_snapshot(self) -> str:
         """
-        Return the N most-recent buffer entries joined for prompt injection.
-        Returns an empty string when the buffer is empty.
+        Return fresh buffer entries joined for prompt injection.
+        Drops entries older than ``_BUFFER_FRESH_S`` seconds.
         """
+        now = time.time()
         with self._buffer_lock:
-            entries = self._context_buffer[-self._BUFFER_INJECT:]
+            fresh = [
+                e for e in self._context_buffer
+                if (now - float(e.get("ts", 0))) <= self._BUFFER_FRESH_S
+            ]
+            entries = [str(e.get("text", "")) for e in fresh[-self._BUFFER_INJECT:]]
+            self._context_buffer = [
+                e for e in self._context_buffer
+                if (now - float(e.get("ts", 0))) <= self._BUFFER_FRESH_S
+            ]
         if not entries:
             return ""
         return "\n\n---\n".join(entries)
@@ -2777,7 +2813,10 @@ class StateEngine:
             entries = list(self._context_buffer)
         if not entries:
             return "(ambient buffer empty)"
-        lines = [f"  [{i+1}] {len(e)} chars" for i, e in enumerate(entries)]
+        lines = [
+            f"  [{i+1}] {len(str(e.get('text', '')))} chars"
+            for i, e in enumerate(entries)
+        ]
         return f"Ambient buffer — {len(entries)} entries:\n" + "\n".join(lines)
 
     # ── Screen capture injection ──────────────────────────────────────────────
@@ -3359,6 +3398,8 @@ class StateEngine:
         """
         full_response:  str  = ""
         sentence_buf:   str  = ""
+        emitted_len:    int  = 0
+        spoken_chars:   int  = 0
         first_chunk_received = False
         self._research_this_turn = False
         # Fresh token for this turn so a stale cancel can't abort us immediately.
@@ -3435,19 +3476,21 @@ class StateEngine:
                 except Exception as exc:
                     log.debug("on_chunk callback raised: %s", exc)
 
+                emitted_len += len(visible)
                 full_response += visible
                 sentence_buf  += visible
 
                 if word_mode:
-                    # Interview: sliding word window — flush ~5-word phrases as
-                    # soon as they're complete so speech tracks the live text
-                    # with no sentence-end stutter.
                     words = sentence_buf.split(" ")
                     while (len(words) - 1) >= self._VOICE_WORD_CHUNK:
                         phrase = " ".join(words[: self._VOICE_WORD_CHUNK])
+                        phrase_len = len(phrase) + (1 if spoken_chars else 0)
+                        if emitted_len < spoken_chars + phrase_len:
+                            break
                         spoken = _strip_markdown(phrase.strip())
                         if spoken:
                             voice_engine.speak(spoken)
+                        spoken_chars += phrase_len
                         words = words[self._VOICE_WORD_CHUNK:]
                     sentence_buf = " ".join(words)
                 else:

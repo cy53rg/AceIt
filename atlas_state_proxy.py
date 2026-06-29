@@ -12,18 +12,34 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
+from atlas_audio import AudioWatcher
+from atlas_core import ModeState
 from atlas_ipc import DaemonClient
 from atlas_data import DEFAULT_SAFETY_MODE
 from atlas_logging import get_logger
+
+log = get_logger("state_proxy")
 
 
 class _SessionProxy:
     def __init__(self, owner: "AtlasStateProxy") -> None:
         self._owner = owner
         self.is_active = True
-        self.response_style = "Balanced"
+        self._response_style = "Balanced"
         self._turn_count = 0
         self._start_time = time.time()
+
+    @property
+    def response_style(self) -> str:
+        return self._response_style
+
+    @response_style.setter
+    def response_style(self, value: str) -> None:
+        self._response_style = str(value)
+        try:
+            self._owner.invoke("session.set_response_style", self._response_style)
+        except Exception:
+            log.debug("session.set_response_style failed", exc_info=True)
 
     @property
     def summary(self) -> str:
@@ -31,16 +47,26 @@ class _SessionProxy:
         mins, secs = divmod(elapsed, 60)
         return f"Session {mins:02d}:{secs:02d} · {self._turn_count} turns"
 
+    def start(self, system_prompt: str) -> None:
+        self._owner.invoke("session.start", system_prompt)
+        self.is_active = True
+        self._start_time = time.time()
+        self._turn_count = 0
+
     def add_pinned_context(self, content: str, source: str = "context") -> None:
-        self._owner.invoke("add_global_context", content)
+        self._owner.invoke("session.add_pinned_context", content, source)
 
     def end(self) -> None:
+        try:
+            self._owner.invoke("session.end")
+        except Exception:
+            log.debug("session.end failed", exc_info=True)
         self.is_active = False
         self._turn_count = 0
 
     def refresh(self, snap: dict) -> None:
         self.is_active = bool(snap.get("is_active", self.is_active))
-        self.response_style = str(snap.get("response_style", self.response_style))
+        self._response_style = str(snap.get("response_style", self._response_style))
         self._turn_count = int(snap.get("turn_count", self._turn_count))
 
 
@@ -88,32 +114,9 @@ class _LearningProxy:
     def __init__(self, owner: "AtlasStateProxy") -> None:
         self._owner = owner
 
-    def get_learning_report(self) -> str:
-        return str(self._owner.invoke("learning.get_learning_report") or "")
-
-
-class _LocalAudioBridge:
-    """Mic routing stays in the UI process (AudioEngine is local)."""
-
-    _USER_TYPED_GRACE_S = 5.0
-
-    def __init__(self) -> None:
-        self.voice_listening = False
-        self._user_typed_at = 0.0
-
-    def bind_audio(self, audio) -> None:
-        pass
-
-    def note_user_typed(self) -> None:
-        self._user_typed_at = time.time()
-
-    def route_transcript(self, text: str, source: str) -> str:
-        src = (source or "").lower()
-        if src == "mic" and not self.voice_listening:
-            return "drop"
-        if time.time() - self._user_typed_at < self._USER_TYPED_GRACE_S:
-            return "drop"
-        return "forward"
+    def get_learning_report(self) -> dict:
+        result = self._owner.invoke("learning.get_learning_report")
+        return dict(result) if isinstance(result, dict) else {}
 
 
 @dataclass
@@ -156,8 +159,9 @@ class AtlasStateProxy:
         self.memory = _MemoryProxy(self)
         self.skill_registry = _SkillRegistryProxy(self)
         self.learning = _LearningProxy(self)
-        self.audio_watcher = _LocalAudioBridge()
+        self.audio_watcher = AudioWatcher(on_voice_input=self._on_copilot_voice)
         self.user_id = 0
+        self.mode = ModeState.ACTIVE
         self.safety_mode = DEFAULT_SAFETY_MODE
         self.focus_mode = False
         self.execution_blocked = False
@@ -170,6 +174,11 @@ class AtlasStateProxy:
         client.on_message(self._on_ws_message)
         self._refresh_session()
 
+    def _on_copilot_voice(self, text: str) -> None:
+        clean = (text or "").strip()
+        if clean:
+            self._client.handle_input(clean, "user")
+
     def _refresh_session(self) -> None:
         try:
             snap = self._client.get_session_snapshot()
@@ -178,6 +187,11 @@ class AtlasStateProxy:
             self.safety_mode = str(snap.get("safety_mode") or self.safety_mode)
             self.focus_mode = bool(snap.get("focus_mode"))
             self.is_learning = bool(snap.get("is_learning"))
+            mode_name = str(snap.get("mode") or "ACTIVE").upper()
+            try:
+                self.mode = ModeState[mode_name]
+            except KeyError:
+                self.mode = ModeState.ACTIVE
         except Exception:
             log.debug("session snapshot unavailable", exc_info=True)
 
@@ -207,7 +221,18 @@ class AtlasStateProxy:
         elif msg_type == "state_event":
             self._emit_local(str(msg.get("event_type", "")), dict(msg.get("payload") or {}))
             if msg.get("event_type") == "task_running":
-                self._task_running = bool((msg.get("payload") or {}).get("running"))
+                payload = dict(msg.get("payload") or {})
+                self._task_running = bool(payload.get("active", payload.get("running", False)))
+        elif msg_type == "weekly_digest":
+            self._emit_local("weekly_digest", {
+                "message": str(msg.get("message", "")),
+                "detail": dict(msg.get("detail") or {}),
+            })
+        elif msg_type == "user_notice":
+            self._emit_local("user_notice", {
+                "title": str(msg.get("title", "Atlas")),
+                "message": str(msg.get("message", "")),
+            })
         elif msg_type == "permission_request":
             self._handle_permission(msg)
         elif msg_type == "typed_confirm_request":
@@ -241,7 +266,7 @@ class AtlasStateProxy:
         })
 
     def _handle_safety_prompt(self, msg: dict) -> None:
-        approved = True
+        approved = False
         if self._safety_prompt:
             approved = bool(self._safety_prompt(str(msg.get("message", ""))))
         self._client.respond(str(msg["id"]), {
@@ -250,7 +275,7 @@ class AtlasStateProxy:
         })
 
     def _handle_task_confirm(self, msg: dict) -> None:
-        approved = True
+        approved = False
         if self._task_confirm_cb:
             approved = bool(self._task_confirm_cb(str(msg.get("message", ""))))
         self._client.respond(str(msg["id"]), {
@@ -279,6 +304,9 @@ class AtlasStateProxy:
         if self._step_ui_handler:
             try:
                 self._step_ui_handler(pending)
+                if not pending.done.wait(timeout=30.0):
+                    ok = False
+                    pending.result_ok = False
             except Exception:
                 log.exception("step ui handler failed")
                 ok = False
@@ -313,7 +341,7 @@ class AtlasStateProxy:
         *,
         webcam_b64: str | None = None,
     ) -> None:
-        self.audio_watcher.note_user_typed()
+        self.audio_watcher.mark_user_typed()
         self._client.handle_input(text, source, webcam_b64=webcam_b64)
 
     def cancel_current(self) -> None:
@@ -332,6 +360,7 @@ class AtlasStateProxy:
         self._client.set_focus_mode(enabled)
 
     def set_copilot_mode(self, enabled: bool) -> None:
+        self.audio_watcher.set_copilot(bool(enabled))
         self._client.set_copilot_mode(enabled)
 
     def inject_screen_capture(self, screen_b64: str) -> None:

@@ -27,15 +27,20 @@ installs the Python wrapper; you must install the Tesseract program once.
 
       python verify_env.py
 
-7) Launch Atlas:
+7) Launch Atlas (daemon required):
+
+      python -m atlas_daemon
+
+   In a second terminal:
 
       python atlas_ui.py
 
-   The UI connects to atlas_daemon (background process). If the daemon is not
-   running, atlas_ui.py will try to start it automatically. You can also run it
-   manually:
+   The UI connects only through atlas_daemon (127.0.0.1:17847). If the daemon
+   is not running, atlas_ui.py shows an error and exits — it does not embed
+   StateEngine in-process. You may install the daemon to start at logon (step 8).
 
-      python -m atlas_daemon
+   atlas_ui.py can attempt to auto-start the daemon once; if that fails, start
+   it manually with the command above.
 
 8) (Recommended) Install the daemon to start at Windows logon with auto-restart:
 

@@ -176,8 +176,12 @@ class DaemonClient:
             return {}
         return r.json()
 
-    def _get(self, path: str) -> Any:
-        r = self._session.get(self._url(path), timeout=30.0)
+    def _get(self, path: str, *, params: dict | None = None) -> Any:
+        url = self._url(path)
+        if params:
+            from urllib.parse import urlencode
+            url = f"{url}?{urlencode(params)}"
+        r = self._session.get(url, timeout=30.0)
         if r.status_code >= 400:
             raise DaemonError(r.text or f"HTTP {r.status_code}")
         return r.json()

@@ -23,8 +23,9 @@ from PySide6.QtCore import (
     QSequentialAnimationGroup,
     Qt,
     QTimer,
+    QPoint,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
 _log = logging.getLogger("atlas.overlay")
@@ -186,6 +187,24 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
     def _to_local(self, x: float, y: float) -> QPointF:
         return QPointF(x - self._origin_x, y - self._origin_y)
 
+    def _ui_scale(self) -> float:
+        """Physical-pixel scale for ring/cursor sizing on HiDPI displays."""
+        try:
+            pt = QPoint(int(self._ring_pos.x()), int(self._ring_pos.y()))
+            screen = QApplication.screenAt(self.mapToGlobal(pt))
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            return float(screen.devicePixelRatio()) if screen else 1.0
+        except Exception:
+            return 1.0
+
+    @staticmethod
+    def _caption_font() -> QFont:
+        for fam in ("Segoe UI", "Inter", "Roboto", "Arial", "Helvetica", "Sans Serif"):
+            if QFontDatabase.hasFamily(fam):
+                return QFont(fam, 11, QFont.Bold)
+        return QFont("Sans Serif", 11, QFont.Bold)
+
     def focus_on(self, x: int, y: int, w: int, h: int) -> None:
         """Animate ring to center of target rect, pulse, auto-hide after 3s."""
         self._cancel_anims()
@@ -290,7 +309,7 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
         cx, cy = self._ring_pos.x(), self._ring_pos.y()
-        scale = self._ring_scale
+        scale = self._ring_scale * self._ui_scale()
         alpha_outer = int(255 * self._ring_opacity * 0.35)
         alpha_inner = int(255 * self._ring_opacity)
 
@@ -298,15 +317,17 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
         inner = QColor(0, 212, 255, alpha_inner)
         gold = QColor(212, 175, 55, alpha_inner)
 
-        painter.setPen(QPen(outer, 3.0))
+        ring_outer = 40.0 * scale
+        ring_inner = 28.0 * scale
+        painter.setPen(QPen(outer, max(1.5, 3.0 * self._ui_scale())))
         painter.setBrush(Qt.NoBrush)
-        painter.drawEllipse(QPointF(cx, cy), scale * 40, scale * 40)
+        painter.drawEllipse(QPointF(cx, cy), ring_outer, ring_outer)
 
-        painter.setPen(QPen(inner, 1.5))
-        painter.drawEllipse(QPointF(cx, cy), scale * 28, scale * 28)
+        painter.setPen(QPen(inner, max(1.0, 1.5 * self._ui_scale())))
+        painter.drawEllipse(QPointF(cx, cy), ring_inner, ring_inner)
 
-        arm = 14
-        offset = scale * 36
+        arm = 14.0 * scale
+        offset = 36.0 * scale
         painter.setPen(QPen(gold, 2.0))
         for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
             ox, oy = cx + dx * offset, cy + dy * offset
@@ -325,15 +346,21 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(self._box, 6, 6)
 
-        # ── GUIDING caption ───────────────────────────────────────────────────
+        # ── GUIDING caption (WCAG: dark plate + near-white text) ─────────────
         if self._label:
-            painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
-            painter.setPen(QPen(QColor(212, 175, 55, alpha_inner)))
             anchor = self._box if self._box is not None else QRectF(cx - 100, cy - 60, 200, 20)
-            painter.drawText(
-                QRectF(anchor.left(), anchor.top() - 26, max(220.0, anchor.width()), 22),
-                Qt.AlignLeft | Qt.AlignVCenter, self._label,
-            )
+            cap_w = max(220.0, anchor.width())
+            cap_h = 24.0
+            cap_y = anchor.top() - cap_h - 4
+            if cap_y < 4:
+                cap_y = anchor.bottom() + 4
+            cap_rect = QRectF(anchor.left(), cap_y, cap_w, cap_h)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(12, 14, 18, int(220 * self._ring_opacity)))
+            painter.drawRoundedRect(cap_rect, 6, 6)
+            painter.setFont(self._caption_font())
+            painter.setPen(QPen(QColor(245, 248, 252, alpha_inner)))
+            painter.drawText(cap_rect.adjusted(8, 0, -8, 0), Qt.AlignLeft | Qt.AlignVCenter, self._label)
 
         # ── GUIDING trajectory path ───────────────────────────────────────────
         if len(self._path) >= 2:
@@ -501,13 +528,22 @@ class AgentCursorOverlay(_CaptureExclusionMixin, QWidget):
             self._pulse_anim.finished.connect(on_done)
         self._pulse_anim.start()
 
+    def _cursor_scale(self) -> float:
+        screen = QApplication.screenAt(QPoint(int(self._cursor_x), int(self._cursor_y)))
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        return float(screen.devicePixelRatio()) if screen else 1.0
+
     def paintEvent(self, _event) -> None:  # noqa: ANN001
         if self._opacity <= 0.01:
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        s = self._pulse
-        p.setPen(QPen(QColor(0, 212, 255, 230), 2.0))
+        s = self._pulse * self._cursor_scale()
+        cw, ch = self.CURSOR_W * self._cursor_scale(), self.CURSOR_H * self._cursor_scale()
+        if cw != self.CURSOR_W or ch != self.CURSOR_H:
+            self.setFixedSize(int(cw), int(ch))
+        p.setPen(QPen(QColor(0, 212, 255, 230), max(1.5, 2.0 * self._cursor_scale())))
         p.setBrush(QColor(0, 212, 255, 180))
         tip = QPointF(self.CURSOR_W / 2, 8 * s)
         p.drawPolygon([
