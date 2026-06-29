@@ -11,6 +11,14 @@ from atlas_core import StateEngine, _TASK_MAX_STEPS
 from atlas_vision import ScreenCapture
 
 
+def _patch_region_stable(monkeypatch):
+    monkeypatch.setattr(
+        atlas_core,
+        "region_changed_since_capture",
+        lambda *_a, **_k: (False, 0.0),
+    )
+
+
 def _mock_capture(b64: str) -> ScreenCapture:
     return ScreenCapture(b64, 1.0, (100, 100), (1920, 1080))
 
@@ -43,6 +51,7 @@ def _quiet_voice(monkeypatch):
 
 
 def test_task_loop_stuck_on_identical_screen_hashes(monkeypatch):
+    _patch_region_stable(monkeypatch)
     engine = _minimal_engine()
     same_frame = "identical-screen-bytes"
     hashes = []
@@ -65,6 +74,7 @@ def test_task_loop_stuck_on_identical_screen_hashes(monkeypatch):
 
 
 def test_task_loop_step_ceiling(monkeypatch):
+    _patch_region_stable(monkeypatch)
     limit = 3
     monkeypatch.setattr(StateEngine, "_TASK_MAX_STEPS", limit)
     engine = _minimal_engine()
@@ -89,6 +99,27 @@ def test_task_loop_step_ceiling(monkeypatch):
     assert decide_calls["n"] == limit
 
 
+def test_run_task_emits_task_running_events(monkeypatch):
+    engine = _minimal_engine()
+    events: list[tuple[str, dict]] = []
+    engine.on_event(lambda t, p: events.append((t, p)))
+    monkeypatch.setattr(engine, "_task_loop", lambda *_a: None)
+
+    engine.run_task("open notepad")
+
+    assert ("task_running", {"active": True, "task": "open notepad"}) in events
+
+
+def test_stop_task_sets_stop_event(monkeypatch):
+    engine = _minimal_engine()
+    engine._task_running = True
+    engine._task_stop = __import__("threading").Event()
+
+    engine.stop_task()
+
+    assert engine._task_stop.is_set()
+
+
 def test_safety_always_blocks_until_confirmed(monkeypatch):
     prompts: list[str] = []
     clicks: list[tuple[int, int]] = []
@@ -111,6 +142,11 @@ def test_safety_always_blocks_until_confirmed(monkeypatch):
         "run_step",
         lambda desc, x, y, w, h, **kw: kw["do_action"]() or True,
     )
+    monkeypatch.setattr(
+        atlas_core,
+        "region_changed_since_capture",
+        lambda *_a, **_k: (False, 0.0),
+    )
 
     first = engine._locate_and_click("Save", double=False)
     assert prompts == ["Clicking Save"]
@@ -123,7 +159,7 @@ def test_safety_always_blocks_until_confirmed(monkeypatch):
 
 
 def test_run_task_cancelled_when_confirm_denied(monkeypatch):
-    engine = _minimal_engine(safety_mode="always")
+    engine = _minimal_engine(safety_mode="trusted")
     engine._task_confirm_cb = lambda _task: False
     loop_started = {"n": 0}
     monkeypatch.setattr(engine, "_task_loop", lambda *_a: loop_started.__setitem__("n", 1))
@@ -137,8 +173,19 @@ def test_run_task_cancelled_when_confirm_denied(monkeypatch):
 
 
 def test_run_task_starts_when_confirm_allowed(monkeypatch):
-    engine = _minimal_engine(safety_mode="always")
+    engine = _minimal_engine(safety_mode="trusted")
     engine._task_confirm_cb = lambda _task: True
+    loop_started = {"n": 0}
+    monkeypatch.setattr(engine, "_task_loop", lambda *_a: loop_started.__setitem__("n", 1))
+
+    engine.run_task("type hello in notepad")
+
+    assert loop_started["n"] == 1
+
+
+def test_run_task_always_starts_without_task_confirm(monkeypatch):
+    engine = _minimal_engine(safety_mode="always")
+    engine._task_confirm_cb = lambda _task: False
     loop_started = {"n": 0}
     monkeypatch.setattr(engine, "_task_loop", lambda *_a: loop_started.__setitem__("n", 1))
 
@@ -192,6 +239,7 @@ def test_execute_step_type_allowed_when_safety_off(monkeypatch):
 
 
 def test_task_done_requires_verification(monkeypatch):
+    _patch_region_stable(monkeypatch)
     engine = _minimal_engine()
     decide_calls = {"n": 0}
 
@@ -219,6 +267,7 @@ def test_task_done_requires_verification(monkeypatch):
 
 
 def test_false_done_continues_with_verification_reason(monkeypatch):
+    _patch_region_stable(monkeypatch)
     engine = _minimal_engine()
     decide_calls = {"n": 0}
 
@@ -246,6 +295,16 @@ def test_false_done_continues_with_verification_reason(monkeypatch):
     monkeypatch.setattr(engine, "_decide_next_step", decide)
     monkeypatch.setattr(engine, "_verify_task_completion", verify)
     monkeypatch.setattr(engine, "_execute_step", lambda *_a, **_k: "clicked")
+    monkeypatch.setattr(
+        engine,
+        "_verify_action_outcome",
+        lambda *_a, **_k: {
+            "completed": True,
+            "confidence": 0.95,
+            "observed": "ok",
+            "discrepancy": None,
+        },
+    )
 
     engine._task_loop("save the document")
 
@@ -257,6 +316,7 @@ def test_false_done_continues_with_verification_reason(monkeypatch):
 
 
 def test_false_done_gives_up_after_one_retry(monkeypatch):
+    _patch_region_stable(monkeypatch)
     engine = _minimal_engine()
 
     monkeypatch.setattr(
@@ -284,3 +344,109 @@ def test_false_done_gives_up_after_one_retry(monkeypatch):
     assert any("not done yet" in text.lower() for text in status_texts)
     assert any("couldn't confirm" in text.lower() for text in status_texts)
     assert not any(text.startswith("✓ Done.") for text in status_texts)
+
+
+def test_task_always_blocks_hands_until_permission(monkeypatch):
+    _patch_region_stable(monkeypatch)
+    """With safety_mode=always, no hands action runs until permission approves."""
+    engine = _minimal_engine(safety_mode="always")
+    engine._task_running = True
+    atlas_core.atlas_hands.auto_approve = False
+
+    type_calls: list[str] = []
+    monkeypatch.setattr(
+        atlas_core.atlas_hands,
+        "type_text",
+        lambda text, interval=0.01: type_calls.append(str(text)),
+    )
+    pending: list[tuple] = []
+
+    def permission_cb(action, path, approve, deny):
+        pending.append((path, approve, deny))
+
+    monkeypatch.setattr(atlas_core.atlas_fs, "_permission_callback", permission_cb)
+    monkeypatch.setattr(
+        atlas_core,
+        "capture_screen_b64",
+        lambda *_a, **_k: _mock_capture("frame"),
+    )
+    decide_n = {"n": 0}
+
+    def decide(*_a, **_k):
+        decide_n["n"] += 1
+        if decide_n["n"] == 1:
+            return {"action": "type", "text": "hello"}
+        return {"action": "done", "summary": "done"}
+
+    monkeypatch.setattr(engine, "_decide_next_step", decide)
+    monkeypatch.setattr(
+        engine,
+        "_verify_task_completion",
+        lambda *_a, **_k: {"completed": True, "reason": "ok"},
+    )
+    monkeypatch.setattr(
+        engine,
+        "_verify_action_outcome",
+        lambda *_a, **_k: {
+            "completed": True,
+            "confidence": 0.95,
+            "observed": "ok",
+            "discrepancy": None,
+        },
+    )
+    monkeypatch.setattr(atlas_core.time, "sleep", lambda *_a: None)
+
+    import threading
+
+    thread = threading.Thread(target=engine._task_loop, args=("type hello",))
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert len(pending) == 1
+    assert pending[0][0].startswith("atlas-task://")
+    assert type_calls == []
+
+    pending[0][1]()
+    thread.join(timeout=5.0)
+    assert thread.is_alive() is False
+    assert type_calls == ["hello"]
+
+
+def test_locate_for_action_relocates_on_region_change(monkeypatch):
+    engine = _minimal_engine()
+    cap_a = _mock_capture("a")
+    cap_b = _mock_capture("b")
+    captures = iter([cap_b, cap_b])
+
+    monkeypatch.setattr(
+        atlas_core,
+        "capture_screen_b64",
+        lambda *_a, **_k: next(captures, cap_b),
+    )
+    locate_calls = {"n": 0}
+
+    def fake_locate(_target, *, screen=None, **_k):
+        locate_calls["n"] += 1
+        return {"found": True, "x": 100, "y": 200, "w": 40, "h": 20}
+
+    engine.spatial.locate = fake_locate
+    region_checks = iter([(True, 25.0), (False, 0.0)])
+    monkeypatch.setattr(
+        atlas_core,
+        "region_changed_since_capture",
+        lambda *_a, **_k: next(region_checks, (False, 0.0)),
+    )
+    logged: list[dict] = []
+    monkeypatch.setattr(
+        engine,
+        "_log_abort_and_relocate",
+        lambda **kw: logged.append(kw),
+    )
+
+    coords, cap = engine._locate_for_action("Save", screen=cap_a, context="test")
+
+    assert locate_calls["n"] == 2
+    assert coords.get("found") is True
+    assert cap is cap_b
+    assert len(logged) == 1
+    assert logged[0]["phase"] == "post_locate"

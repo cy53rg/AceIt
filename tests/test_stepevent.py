@@ -36,9 +36,18 @@ def test_step_orchestrator_ui_handler_sync():
 
 
 def test_step_event_fields():
-    evt = StepEvent(step_index=1, description="Click Save", x=100, y=200, action="click")
+    evt = StepEvent(
+        step_index=1,
+        description="Click Save",
+        x=100,
+        y=200,
+        action="click",
+        expected_state="Save dialog open",
+    )
     assert evt.status == "started"
     assert evt.action == "click"
+    assert evt.expected_state == "Save dialog open"
+    assert evt.verified is None
 
 
 def test_run_step_resets_timeout_counter_on_success():

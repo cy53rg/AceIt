@@ -699,49 +699,6 @@ class UserMemory:
         worker.start()
         return worker
 
-    def extract_and_store_facts_async(
-        self,
-        user_id: int,
-        user_message: str,
-        ai_response: str,
-        model: str = ATLAS_FAST_MODEL,
-        on_done: Optional[Callable[[list[dict[str, Any]]], None]] = None,
-    ) -> threading.Thread:
-        """
-        Extract durable facts via Groq, persist them, all on a daemon thread.
-
-        Network + DB work runs off the UI loop; extracted facts are marshalled
-        back through ``signals.facts_extracted`` (Qt) and/or ``on_done``.
-        Returns the worker thread.
-        """
-
-        def _work() -> None:
-            try:
-                facts = self.extract_facts_from_turn(user_message, ai_response, model)
-                for fact in facts:
-                    self.remember(
-                        user_id,
-                        str(fact.get("category", "general")),
-                        str(fact.get("key", "note")),
-                        str(fact.get("value", "")),
-                        float(fact.get("confidence", 0.75)),
-                        source="inferred",
-                    )
-                if self.signals is not None:
-                    self.signals.facts_extracted.emit(user_id, facts)
-                if on_done is not None:
-                    on_done(facts)
-            except Exception as exc:  # pragma: no cover - defensive
-                log.warning("extract_and_store_facts_async failed: %s", exc)
-                if self.signals is not None:
-                    self.signals.error.emit(f"facts: {exc}")
-
-        worker = threading.Thread(
-            target=_work, daemon=True, name="atlas-mem-facts"
-        )
-        worker.start()
-        return worker
-
     def extract_facts_from_turn(
         self,
         user_message: str,

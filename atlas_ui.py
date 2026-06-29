@@ -97,11 +97,12 @@ except ImportError:
     HAS_CV2 = False
 
 try:
-    from atlas_overlay import HoloOverlay, AgentCursorOverlay
+    from atlas_overlay import HoloOverlay, AgentCursorOverlay, TaskStopOverlay
     HAS_OVERLAY = True
 except ImportError:
     HoloOverlay = None  # type: ignore
     AgentCursorOverlay = None  # type: ignore
+    TaskStopOverlay = None  # type: ignore
     HAS_OVERLAY = False
 
 try:
@@ -283,6 +284,9 @@ class SignalBridge(QObject):
     user_notice        = Signal(str, str)   # title, message
     interaction_error  = Signal(str)
     safety_prompt_req  = Signal(str)
+    task_stop          = Signal()
+    guide_step_started = Signal(int)
+    step_verified      = Signal(int, bool, str)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -501,6 +505,7 @@ class ChatMessageCard(QFrame):
         self.role = role
         self.text = text
         self.ts = ts or time.time()
+        self._step_index: Optional[int] = None
         self.setFrameShape(QFrame.NoFrame)
 
         outer = QHBoxLayout(self)
@@ -593,6 +598,13 @@ class ChatMessageCard(QFrame):
             cl = QVBoxLayout(card)
             cl.setContentsMargins(0, 0, 0, 0)
             cl.addLayout(self._actions)
+            self._verify_lbl = QLabel("")
+            self._verify_lbl.hide()
+            self._verify_lbl.setStyleSheet(
+                f"color: {PAL['muted']}; font-size: 10px; font-weight: 600; "
+                f"background: transparent; border: none; padding: 0 0 4px 0;"
+            )
+            cl.addWidget(self._verify_lbl)
             cl.addWidget(self._body)
             outer.addWidget(self._avatar)
             outer.addWidget(card, 1)
@@ -647,6 +659,36 @@ class ChatMessageCard(QFrame):
     def _copy_self(self) -> None:
         pyperclip.copy(self.text)
 
+    def tag_guide_step(self, step_index: int) -> None:
+        if self.role != "assistant":
+            return
+        self._step_index = step_index
+        if hasattr(self, "_verify_lbl"):
+            self._verify_lbl.setText(f"Step {step_index}")
+            self._verify_lbl.setToolTip("")
+            self._verify_lbl.show()
+
+    def set_step_verification(self, step_index: int, passed: bool, discrepancy: str = "") -> None:
+        if self.role != "assistant" or self._step_index != step_index:
+            return
+        if not hasattr(self, "_verify_lbl"):
+            return
+        if passed:
+            self._verify_lbl.setText(f"Step {step_index} · ✓ verified")
+            self._verify_lbl.setStyleSheet(
+                f"color: {PAL['success']}; font-size: 10px; font-weight: 600; "
+                f"background: transparent; border: none; padding: 0 0 4px 0;"
+            )
+            self._verify_lbl.setToolTip("")
+        else:
+            self._verify_lbl.setText(f"Step {step_index} · ⚠ mismatch")
+            self._verify_lbl.setStyleSheet(
+                f"color: {PAL['danger']}; font-size: 10px; font-weight: 600; "
+                f"background: transparent; border: none; padding: 0 0 4px 0;"
+            )
+            self._verify_lbl.setToolTip((discrepancy or "Step did not match expected state")[:240])
+        self._verify_lbl.show()
+
 
 class ChatView(QWidget):
     """Scrollable message list with drag-drop and jump-to-latest."""
@@ -696,6 +738,7 @@ class ChatView(QWidget):
         self._pinned_bottom = True
         self._streaming_card: Optional[ChatMessageCard] = None
         self._cards: list[ChatMessageCard] = []
+        self._step_cards: dict[int, ChatMessageCard] = {}
 
     def _on_scroll(self, value: int) -> None:
         sb = self._scroll.verticalScrollBar()
@@ -719,6 +762,21 @@ class ChatView(QWidget):
     def _scroll_to_bottom_if_pinned(self) -> None:
         if self._pinned_bottom:
             self._scroll_to_bottom()
+
+    def tag_guide_step(self, step_index: int) -> None:
+        card = self._streaming_card
+        if card is None and self._cards:
+            card = self._cards[-1]
+        if card is not None:
+            card.tag_guide_step(step_index)
+            self._step_cards[step_index] = card
+
+    def apply_step_verification(
+        self, step_index: int, passed: bool, discrepancy: str = "",
+    ) -> None:
+        card = self._step_cards.get(step_index)
+        if card is not None:
+            card.set_step_verification(step_index, passed, discrepancy)
 
     def add_message(self, role: str, text: str, *, ts: Optional[float] = None) -> dict:
         card = ChatMessageCard(role, text, ts=ts, parent=self._container)
@@ -755,6 +813,7 @@ class ChatView(QWidget):
                 item.widget().deleteLater()
         self._cards.clear()
         self._streaming_card = None
+        self._step_cards.clear()
 
     def rebuild_from_messages(self, messages: list[dict]) -> None:
         self.clear()
@@ -2654,6 +2713,9 @@ class AtlasWindow(QMainWindow):
         self.bridge.user_notice.connect(self._on_user_notice)
         self.bridge.interaction_error.connect(self._on_interaction_error)
         self.bridge.safety_prompt_req.connect(self._on_safety_prompt_req)
+        self.bridge.task_stop.connect(self._stop_running_task)
+        self.bridge.guide_step_started.connect(self._on_guide_step_started)
+        self.bridge.step_verified.connect(self._on_step_verified)
 
         if atlas_fs:
             atlas_fs.register_permission_callback(self._fs_permission_callback)
@@ -2750,6 +2812,11 @@ class AtlasWindow(QMainWindow):
             AgentCursorOverlay() if HAS_OVERLAY and AgentCursorOverlay else None
         )
         # Agent cursor stays hidden until a DO-mode step animates it.
+
+        self.task_stop_overlay = (
+            TaskStopOverlay(self._stop_running_task)
+            if HAS_OVERLAY and TaskStopOverlay else None
+        )
 
         if _CORE and step_orchestrator:
             step_orchestrator.set_ui_handler(self._post_step_pending)
@@ -2855,6 +2922,31 @@ class AtlasWindow(QMainWindow):
             f"padding: 2px 7px;"
         )
         hdr_lay.addWidget(self.mode_pill)
+
+        self.btn_task_stop = QPushButton("■ STOP")
+        self.btn_task_stop.setVisible(False)
+        self.btn_task_stop.setFixedHeight(28)
+        self.btn_task_stop.setCursor(Qt.PointingHandCursor)
+        self.btn_task_stop.setToolTip(
+            "Stop the autonomous task (Ctrl+Shift+Esc works even when Atlas is in the background)"
+        )
+        self.btn_task_stop.setStyleSheet(
+            "QPushButton {"
+            "  background: #DC2626;"
+            "  color: #FFFFFF;"
+            "  border: 2px solid #FFFFFF;"
+            "  border-radius: 7px;"
+            "  font-size: 11px;"
+            "  font-weight: bold;"
+            "  letter-spacing: 1px;"
+            "  padding: 2px 10px;"
+            "}"
+            "QPushButton:hover { background: #B91C1C; }"
+            "QPushButton:pressed { background: #991B1B; }"
+        )
+        self.btn_task_stop.clicked.connect(self._stop_running_task)
+        hdr_lay.addWidget(self.btn_task_stop)
+
         hdr_lay.addStretch()
 
         self.btn_copilot = QPushButton("👁 Copilot")
@@ -3516,9 +3608,13 @@ class AtlasWindow(QMainWindow):
     @Slot(str, str, object, object)
     def _on_permission_request(self, action: str, path: str,
                                approve_fn, deny_fn) -> None:
-        """Auto-approve agent hands/task; gate file writes on fs_access toggle."""
+        """Gate file writes on fs_access; show PermissionDialog for task steps."""
         p = str(path)
-        if p.startswith("atlas-hands://") or p.startswith("atlas-task://"):
+        if p.startswith("atlas-task://"):
+            dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
+            dlg.exec()
+            return
+        if p.startswith("atlas-hands://"):
             approve_fn()
             return
         if not self.fs_access_active:
@@ -3765,6 +3861,11 @@ class AtlasWindow(QMainWindow):
                 self.bridge.set_status.emit(text)
             if event_type == "learn_status":
                 QTimer.singleShot(0, self._sync_learn_btn)
+        elif event_type == "task_running":
+            active = bool(payload.get("active", False))
+            QTimer.singleShot(0, lambda: (
+                self._show_task_stop_ui() if active else self._hide_task_stop_ui()
+            ))
         elif event_type == "focus_changed":
             QTimer.singleShot(0, lambda: self._on_focus_mode_changed(
                 payload.get("enabled", False)))
@@ -3819,6 +3920,37 @@ class AtlasWindow(QMainWindow):
             QTimer.singleShot(0, lambda e=err: self._release_companion_mode(
                 error=f"⚠ {friendly_error('generic', e)}",
             ))
+        elif event_type == "guide_step_started":
+            idx = int(payload.get("step_index", 0))
+            if idx:
+                QTimer.singleShot(0, lambda i=idx: self.bridge.guide_step_started.emit(i))
+        elif event_type == "step_verified":
+            idx = int(payload.get("step_index", 0))
+            passed = bool(payload.get("passed", False))
+            disc = str(payload.get("discrepancy") or "")
+            QTimer.singleShot(
+                0,
+                lambda i=idx, p=passed, d=disc: self.bridge.step_verified.emit(i, p, d),
+            )
+
+    @Slot(int)
+    def _on_guide_step_started(self, step_index: int) -> None:
+        if hasattr(self, "chat_view"):
+            self.chat_view.tag_guide_step(step_index)
+        for msg in reversed(getattr(self, "_chat_messages", [])):
+            if msg.get("role") == "assistant" and not msg.get("step_index"):
+                msg["step_index"] = step_index
+                break
+
+    @Slot(int, bool, str)
+    def _on_step_verified(self, step_index: int, passed: bool, discrepancy: str) -> None:
+        if hasattr(self, "chat_view"):
+            self.chat_view.apply_step_verification(step_index, passed, discrepancy)
+        for msg in reversed(getattr(self, "_chat_messages", [])):
+            if msg.get("step_index") == step_index:
+                msg["verified"] = passed
+                msg["verification_note"] = discrepancy
+                break
 
     def _on_copilot_toggled(self, checked: bool) -> None:
         self.copilot_active = checked
@@ -3945,6 +4077,8 @@ class AtlasWindow(QMainWindow):
             self._pill_win.hide()
             if self.overlay:
                 self.overlay.hide()
+            if getattr(self, "task_stop_overlay", None):
+                self.task_stop_overlay.hide_stop()
         finally:
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -3966,6 +4100,13 @@ class AtlasWindow(QMainWindow):
         keyboard.add_hotkey("ctrl+comma", lambda: self._open_settings())
         keyboard.add_hotkey("ctrl+l", lambda: self._clear_text())
         keyboard.add_hotkey("ctrl+e", lambda: self._export_session())
+
+        # Emergency stop for autonomous TASK / routine loops — works globally,
+        # even when another app has keyboard focus.
+        keyboard.add_hotkey(
+            "ctrl+shift+escape",
+            lambda: self.bridge.task_stop.emit(),
+        )
 
         # ── Talk hotkey: dedicated global shortcut (Ctrl+Space / Alt+Space) ───
         # TAP to start a listening session; Atlas auto-responds after a ~1.5s pause.
@@ -4058,11 +4199,16 @@ class AtlasWindow(QMainWindow):
     @Slot(str)
     def _on_stream_complete_slot(self, full_text: str) -> None:
         elapsed = time.time() - self._stream_start_ts if self._stream_start_ts else 0.0
+        step_idx = None
+        stream_card = getattr(self.chat_view, "_streaming_card", None)
+        if stream_card is not None and getattr(stream_card, "_step_index", None):
+            step_idx = stream_card._step_index
         if full_text:
             self.chat_view.finish_stream(full_text, elapsed)
-            self._chat_messages.append(
-                {"role": "assistant", "text": full_text, "ts": time.time()}
-            )
+            msg = {"role": "assistant", "text": full_text, "ts": time.time()}
+            if step_idx:
+                msg["step_index"] = step_idx
+            self._chat_messages.append(msg)
         self._md_ai_streaming = False
         self._md_ai_buffer = ""
         self._streaming_html = ""
@@ -4714,6 +4860,25 @@ class AtlasWindow(QMainWindow):
             voice_engine.skip()
         self.chat_composer.set_streaming(False)
         self._release_companion_mode(status="Stopped ⏹", finalize_thinking=True)
+
+    def _stop_running_task(self) -> None:
+        """Stop an in-flight TASK / routine loop and hide emergency-stop UI."""
+        if self.state and getattr(self.state, "_task_running", False):
+            self.state.stop_task()
+        else:
+            self._hide_task_stop_ui()
+
+    def _show_task_stop_ui(self) -> None:
+        if hasattr(self, "btn_task_stop"):
+            self.btn_task_stop.setVisible(True)
+        if getattr(self, "task_stop_overlay", None):
+            self.task_stop_overlay.show_stop()
+
+    def _hide_task_stop_ui(self) -> None:
+        if hasattr(self, "btn_task_stop"):
+            self.btn_task_stop.setVisible(False)
+        if getattr(self, "task_stop_overlay", None):
+            self.task_stop_overlay.hide_stop()
 
     # ═════════════════════════════════════════════════════════════════════════
     # TEXT AREA HELPERS

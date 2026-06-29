@@ -25,7 +25,7 @@ from PySide6.QtCore import (
     QTimer,
 )
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
 _log = logging.getLogger("atlas.overlay")
 
@@ -519,3 +519,77 @@ class AgentCursorOverlay(_CaptureExclusionMixin, QWidget):
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(212, 175, 55, 220))
         p.drawEllipse(QPointF(tip.x(), tip.y() + 6 * s), 3 * s, 3 * s)
+
+
+class TaskStopOverlay(QWidget):
+    """
+    Always-on-top emergency stop control for autonomous TASK / routine loops.
+
+    Shown the instant a task starts; hidden when the task ends.  Stays clickable
+    even when the user's focus is on another application.
+    """
+
+    WIDTH = 156
+    HEIGHT = 56
+    MARGIN = 20
+
+    def __init__(self, on_stop: Callable[[], None], parent=None) -> None:
+        super().__init__(
+            parent,
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool,
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._on_stop = on_stop
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._btn = QPushButton("■ STOP TASK")
+        self._btn.setCursor(Qt.PointingHandCursor)
+        self._btn.setToolTip(
+            "Stop the autonomous task immediately (Ctrl+Shift+Esc anywhere)"
+        )
+        self._btn.setStyleSheet(
+            "QPushButton {"
+            "  background: #DC2626;"
+            "  color: #FFFFFF;"
+            "  border: 3px solid #FFFFFF;"
+            "  border-radius: 10px;"
+            "  font-family: 'Segoe UI';"
+            "  font-size: 15px;"
+            "  font-weight: bold;"
+            "  letter-spacing: 1px;"
+            "  padding: 10px 14px;"
+            "}"
+            "QPushButton:hover { background: #B91C1C; }"
+            "QPushButton:pressed { background: #991B1B; }"
+        )
+        self._btn.clicked.connect(self._handle_stop)
+        lay.addWidget(self._btn)
+
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self.hide()
+
+    def _handle_stop(self) -> None:
+        try:
+            self._on_stop()
+        except Exception as exc:
+            _log.warning("TaskStopOverlay stop handler failed: %s", exc)
+
+    def _reposition(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        g = screen.availableGeometry()
+        self.move(
+            g.right() - self.WIDTH - self.MARGIN,
+            g.top() + self.MARGIN,
+        )
+
+    def show_stop(self) -> None:
+        self._reposition()
+        self.show()
+        self.raise_()
+
+    def hide_stop(self) -> None:
+        self.hide()

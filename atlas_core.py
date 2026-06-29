@@ -73,7 +73,7 @@ from atlas_memory_manager import MemoryManager
 from atlas_memory import UserMemory
 from atlas_skills import SkillRegistry
 from atlas_logging import get_logger, setup_logging, task_scope, new_task_id, log_outcome_json
-from atlas_stepevent import StepOrchestrator, StepOrchestratorStalled
+from atlas_stepevent import StepEvent, StepOrchestrator, StepOrchestratorStalled
 
 setup_logging()
 log = get_logger("core")
@@ -102,6 +102,23 @@ GROQ_MODEL = (os.environ.get("ATLAS_CHAT_MODEL") or _default_chat).strip() or _d
 
 _TASK_MAX_STEPS_DEFAULT = 40
 _TASK_MAX_STEPS = max(1, int(os.environ.get("ATLAS_MAX_STEPS") or _TASK_MAX_STEPS_DEFAULT))
+_TASK_PHYSICAL_ACTIONS = frozenset({
+    "click", "left_click", "tap",
+    "double_click", "doubleclick", "double",
+    "type", "type_text", "write", "input",
+    "press", "key", "keypress",
+    "hotkey", "combo", "shortcut",
+    "scroll",
+})
+_TASK_VERIFY_ACTIONS = frozenset({
+    "click", "left_click", "tap",
+    "double_click", "doubleclick", "double",
+    "type", "type_text", "write", "input",
+    "press", "key", "keypress",
+    "hotkey", "combo", "shortcut",
+    "scroll",
+})
+_TASK_ACTION_MAX_RETRIES = 2
 
 _default_fast_model = "llama-3.1-8b-instant"
 ATLAS_FAST_MODEL = (
@@ -136,6 +153,7 @@ from atlas_vision import (
     ScreenCapture,
     capture_screen_b64,
     capture_screen_b64_str,
+    region_changed_since_capture,
     base64_encode,
     base64_decode,
     extract_target_coordinate,
@@ -172,6 +190,32 @@ _TINY_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAD0lEQVQImWP4"
     "DwABBAEAAP//AAAAAH0CQQAAAABJRU5ErkJggg=="
 )
+
+_GUIDE_ADVANCE_RE = re.compile(
+    r"^(?:"
+    r"done|ok(?:ay)?|next|continue|finished|got it|did it|yep|yes|ready|k"
+    r"|i(?:['']ve| am|'m)?\s+(?:done|finished|ready)"
+    r"|move on|step (?:done|complete)|that(?:'s| is)? (?:done|it)"
+    r")\s*[.!?]*$",
+    re.IGNORECASE,
+)
+
+_GUIDE_VERIFY_CONF_PASS = 0.65
+_GUIDE_VERIFY_CONF_LOW = 0.55
+
+
+def verify_step_completion(
+    expected_state: str,
+    screen_b64: str,
+    spatial: SpatialBrain,
+) -> dict:
+    """
+    Generic screenshot-vs-expected-state check (guided user steps and future
+    autonomous self-steps).
+
+    Returns ``{"completed", "confidence", "observed", "discrepancy"}``.
+    """
+    return spatial.verify(expected_state, screen_b64=screen_b64 or None)
 
 
 def _groq_model_retired(exc: BaseException) -> bool:
@@ -282,17 +326,22 @@ implementation.
 ADAPTIVE BEHAVIOUR (pick the right tool per message — no mode switch needed):
 - Normal questions → answer directly in natural dialogue.
 - "Guide me", "walk me through", "show me where", "how do I…" → TEACH: one step \
-at a time, emit [[GUIDE: target | instruction]] to highlight on the overlay; \
-the user clicks — you never move their mouse during a guide.
+at a time, emit [[GUIDE: target | instruction | expected_state]] to highlight on \
+the overlay; the user clicks — you never move their mouse during a guide. \
+Always include the third segment ``expected_state``: a short description of \
+what the screen should look like after the step succeeds.
 - "Click this", "press that button", "do this one thing" → single action: \
 emit [[DO: target | click]] (permission asked first).
 - "Open X and do Y", "do it for me", multi-step goals → emit \
 [[TASK: plain-language goal]] for autonomous execution (one approval for the task).
+- Unsure of exact steps for a specific app/version → emit \
+[[RESEARCH: concise search query]] before step 1 so the engine can fetch current docs.
 
 ON-SCREEN ACTION TOKENS (emit these EXACT schemas when relevant):
-      [[GUIDE: target_name | short instruction to speak]]
+      [[GUIDE: target_name | short instruction to speak | what success looks like]]
       [[DO: target_name | click]]
       [[TASK: open Spotify and play <song> by <artist>]]
+      [[RESEARCH: how to export a PDF in Word 365]]
 - ``target_name`` is a concise visual description of the on-screen element \
 (e.g. "the blue Export button"). Emit at most one token per step, and only when \
 the user genuinely requested screen guidance or task delegation — never in \
@@ -324,7 +373,23 @@ for the element they should interact with next. Only emit [[DO:…]] or [[TASK:�
 when the user has clearly asked you to act on their behalf in THIS message or the \
 immediately preceding one — never infer permission to take control from ambiguous \
 phrasing. If you're unsure whether they want you to just talk them through it \
-versus do it yourself, ask which they'd prefer before emitting either token.\
+versus do it yourself, ask which they'd prefer before emitting either token.
+
+VERIFICATION CONTRACT (this adds behaviour rules — it does not change your voice):
+- You can look up current documentation with [[RESEARCH: query]] when you're not \
+certain of exact current steps — prefer this over a confident guess for anything \
+software-version-specific.
+- After each step you ask the user to perform, you will receive a verification \
+result from their screen. If it doesn't match what was expected, explain the \
+specific discrepancy you observed and correct course — don't just ask "did that \
+work?" again.
+- When you act yourself (DO/TASK), you will also see verification of your own \
+result. If your action didn't produce the expected effect, say so plainly, retry \
+once with fresh information, and tell the user if you can't resolve it — don't \
+claim success you haven't confirmed.
+Keep your Atlas voice throughout: lead with the answer, stay concise and plain-spoken, \
+no filler affirmations, no apologizing for brevity; one sharp clarifying question \
+when genuinely needed.\
 """
 
 # Legacy alias — default runtime mode maps here.
@@ -360,7 +425,29 @@ CONTROL DISCIPLINE: In this mode you are TEACHING, so you NEVER take physical \
 control of the mouse or keyboard. You point — you do not press. Highlight the \
 target on the heads-up overlay (focus ring / bounding box / path) and narrate \
 the action for the user to perform themselves. Only the separate autonomous \
-"DOING" path may move the cursor, and only after explicit permission.\
+"DOING" path may move the cursor, and only after explicit permission.
+
+RESEARCH BEFORE GUESSING: You can look up current documentation with \
+[[RESEARCH: query]] when you're not certain of exact current steps — prefer this \
+over a confident guess for anything software-version-specific. Emit \
+[[RESEARCH: concise search query]] BEFORE step 1 when needed. The engine fetches \
+documentation, pins it for this session, and you continue this walkthrough without \
+the user re-asking. Summarize what you learned in your own words — never paste long \
+verbatim excerpts.
+
+USER-STEP VERIFICATION: After each step you ask the user to perform, you will \
+receive a verification result from their screen (via ``expected_state`` on each \
+[[GUIDE:…]] token). If it doesn't match what was expected, explain the specific \
+discrepancy you observed and correct course for the SAME step — don't just ask \
+"did that work?" again. When genuinely uncertain, one sharp clarifying question is \
+fine; no hollow affirmations and no apologizing for brevity.
+
+SELF-ACTION VERIFICATION: When you act on the user's behalf (DO/TASK), you will \
+also see verification of your own result. If your action didn't produce the \
+expected effect, say so plainly, retry once with fresh information, and tell the \
+user if you can't resolve it — don't claim success you haven't confirmed.
+
+Emit: [[GUIDE: target | instruction | expected_state after step]]\
 """
 
 _ATLAS_INTERVIEW = f"""\
@@ -392,18 +479,21 @@ Respond with STRICT JSON ONLY — a single object, no prose, no markdown fences:
 
 Available actions:
   {"action":"launch","app":"<app name, e.g. Spotify>"}      open an app via Start menu
-  {"action":"click","target":"<what to click, described visually>"}
-  {"action":"double_click","target":"<...>"}
-  {"action":"type","text":"<text to type into the focused field>"}
-  {"action":"press","key":"<enter|tab|esc|down|up|space|...>"}
-  {"action":"hotkey","keys":["ctrl","l"]}
-  {"action":"scroll","amount":<negative=down, positive=up>}
+  {"action":"click","target":"<what to click, described visually>","expect":"<what should change on screen>"}
+  {"action":"double_click","target":"<...>","expect":"<...>"}
+  {"action":"type","text":"<text to type into the focused field>","expect":"<...>"}
+  {"action":"press","key":"<enter|tab|esc|down|up|space|...>","expect":"<...>"}
+  {"action":"hotkey","keys":["ctrl","l"],"expect":"<...>"}
+  {"action":"scroll","amount":<negative=down, positive=up>,"expect":"<...>"}
   {"action":"wait","seconds":<number>}                       let the UI load
   {"action":"done","summary":"<what was accomplished>"}
   {"action":"fail","reason":"<why you cannot continue>"}
 
 Rules:
   - Pick the SINGLE best next action for what is ACTUALLY visible right now.
+  - For every click/type/key/scroll action, include "expect": one short sentence \
+describing what the screen should look like AFTER the action succeeds. The engine \
+verifies this before continuing.
   - After launch/Enter/clicks that open new views, the UI may lag — use "wait".
   - "target" must describe something visible in the current screenshot.
   - Prefer the keyboard when reliable (type a query, then press enter).
@@ -449,6 +539,11 @@ class SessionManager:
         self.is_active   = True
         self._start_time = time.time()
         self._turn_count = 0
+        try:
+            from atlas_research import clear_research_cache
+            clear_research_cache()
+        except ImportError:
+            pass
 
     def end(self) -> None:
         """Tear down the current session; history and pins are wiped."""
@@ -601,10 +696,26 @@ class StateEngine:
     #   [[DO:    target_name | action_type]]
     _ACTION_TOKEN_RE = ActionTokenPatterns._ACTION_TOKEN_RE
     _TASK_TOKEN_RE = ActionTokenPatterns._TASK_TOKEN_RE
+    _RESEARCH_TOKEN_RE = ActionTokenPatterns._RESEARCH_TOKEN_RE
 
-    def _dispatch_action_token(self, raw: str) -> None:
-        """Parse one captured ``[[GUIDE/DO/TASK:…]]`` token and run it off-thread."""
+    def _dispatch_action_token(self, raw: str, *, sync_research: bool = False) -> None:
+        """Parse one captured action token and run it (research runs inline when streaming)."""
         raw = raw.strip()
+        rm = self._RESEARCH_TOKEN_RE.match(raw)
+        if rm:
+            query = rm.group(1).strip()
+            if not query:
+                return
+            if sync_research:
+                self._run_research_token(query)
+            else:
+                threading.Thread(
+                    target=self._run_research_token,
+                    args=(query,),
+                    daemon=True,
+                    name="atlas-research",
+                ).start()
+            return
         tm = self._TASK_TOKEN_RE.match(raw)
         if tm:
             self.run_task(tm.group(1).strip())
@@ -615,16 +726,71 @@ class StateEngine:
         kind    = m.group(1).upper()
         target  = m.group(2).strip()
         payload = m.group(3).strip()
+        expected_state = ""
+        if m.lastindex and m.lastindex >= 4 and m.group(4) is not None:
+            expected_state = m.group(4).strip()
+        if kind == "GUIDE" and not expected_state and payload:
+            expected_state = f"After this step: {payload}"
+        if kind == "DO" and not expected_state:
+            act = (payload or "click").lower()
+            expected_state = self._action_expect({"target": target, "action": act}, act)
         if not target:
             return
         threading.Thread(
             target=self._run_action_token,
-            args=(kind, target, payload),
+            args=(kind, target, payload, expected_state),
             daemon=True,
             name="atlas-action",
         ).start()
 
-    def _run_action_token(self, kind: str, target: str, payload: str) -> None:
+    def _run_research_token(self, query: str) -> None:
+        """Search + fetch docs, pin grounding, flag turn for continuation if needed."""
+        self._research_this_turn = True
+        self._emit("task_status", {"text": f"🔍 Researching: {query}"})
+        try:
+            from atlas_research import ground_query
+            grounding = ground_query(query)
+            if grounding and "No usable documentation" not in grounding:
+                self.session.add_pinned_context(grounding, source="research")
+                self.learning.teaching.record_research()
+                self._emit("task_status", {"text": "✓ Research loaded — continuing walkthrough"})
+            else:
+                self._emit("task_status", {"text": "Research returned nothing useful"})
+        except Exception as exc:
+            log.warning("research token failed: %s", exc)
+            self._emit("task_status", {"text": f"Research failed: {exc}"})
+
+    def _continue_after_research(self, raw_user_text: str) -> str:
+        """Second model pass after [[RESEARCH:]] pins docs — same guided sequence."""
+        messages = self.session.build_messages(raw_user_text, memory_prompt="")
+        messages.append({
+            "role": "user",
+            "content": (
+                "The [[RESEARCH:]] lookup is complete and pinned above. "
+                "Continue the same guided walkthrough now — give step 1 if you have "
+                "not started, otherwise the next step. Do not emit another RESEARCH "
+                "token for the same query."
+            ),
+        })
+        try:
+            resp = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=800,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as exc:
+            log.warning("_continue_after_research failed: %s", exc)
+            return ""
+
+    def _run_action_token(
+        self,
+        kind: str,
+        target: str,
+        payload: str,
+        expected_state: str = "",
+    ) -> None:
         """
         Execute a parsed action token.
 
@@ -642,22 +808,17 @@ class StateEngine:
                     target,
                     payload,
                     screen=screen,
+                    expected_state=expected_state,
                 )
                 if not coords.get("found"):
+                    self.learning.teaching.record_target_not_found()
                     self._announce(
                         f"I couldn't find \"{target}\" on your screen. "
                         "Make sure it's visible and try describing it differently."
                     )
             elif kind == "DO":
-                coords = self.act_on_target(
-                    target,
-                    action=(payload or "click").lower(),
-                    screen=screen,
-                )
-                if not coords.get("found"):
-                    self._announce(
-                        f"I couldn't find \"{target}\" on your screen."
-                    )
+                act = (payload or "click").lower()
+                self._run_do_with_verify(target, act, expected_state)
         except Exception as exc:
             log.warning("action token %s(%r) failed: %s", kind, target, exc)
             self._announce(f"That action failed: {exc}")
@@ -670,13 +831,180 @@ class StateEngine:
     # a single JSON action, which is executed via atlas_hands until "done".
 
     _TASK_MAX_STEPS = _TASK_MAX_STEPS  # env ATLAS_MAX_STEPS (module-level)
+    _TASK_PHYSICAL_ACTIONS = _TASK_PHYSICAL_ACTIONS
+    _TASK_VERIFY_ACTIONS = _TASK_VERIFY_ACTIONS
+    _TASK_ACTION_MAX_RETRIES = _TASK_ACTION_MAX_RETRIES
     _TASK_SETTLE_S  = 0.8    # pause after each action for the UI to react
+    _PREACTION_RELOCATE_MAX = 1
+
+    def _action_expect(self, decision: dict, action: str) -> str:
+        """Expected on-screen outcome for a planner/DO action (with fallbacks)."""
+        exp = str(
+            (decision or {}).get("expect")
+            or (decision or {}).get("expected_state")
+            or ""
+        ).strip()
+        if exp:
+            return exp
+        d = decision or {}
+        act = (action or "").lower()
+        if act in ("click", "left_click", "tap", "double_click", "doubleclick", "double"):
+            target = str(d.get("target") or "").strip()
+            verb = "double-clicking" if "double" in act else "clicking"
+            return f"After {verb} '{target}', the UI shows the expected change."
+        if act in ("type", "type_text", "write", "input"):
+            text = str(d.get("text") or "")[:48]
+            return f"After typing, '{text}' appears in the focused field."
+        if act in ("press", "key", "keypress"):
+            key = str(d.get("key") or d.get("text") or "").strip()
+            return f"After pressing {key}, the screen reflects the expected change."
+        if act in ("hotkey", "combo", "shortcut"):
+            keys = d.get("keys") or d.get("key") or []
+            if isinstance(keys, str):
+                keys = [k for k in re.split(r"[+,\s]+", keys) if k]
+            combo = "+".join(str(k) for k in keys)
+            return f"After {combo}, the expected UI change is visible."
+        if act == "scroll":
+            return "After scrolling, new content is visible in the scrolled area."
+        return "The expected UI change from this action is visible."
+
+    def _verification_passed(self, verification: dict) -> bool:
+        return (
+            bool(verification.get("completed"))
+            and float(verification.get("confidence", 0.0) or 0.0)
+            >= _GUIDE_VERIFY_CONF_PASS
+        )
+
+    def _verify_action_outcome(self, expected_state: str) -> dict:
+        frame = capture_screen_b64()
+        return verify_step_completion(
+            expected_state,
+            frame.b64 if frame else "",
+            self.spatial,
+        )
+
+    def _attempt_undo(self) -> str:
+        try:
+            atlas_hands.hotkey("ctrl", "z")
+            time.sleep(0.4)
+            return (
+                "Atlas attempted Ctrl+Z as a best-effort undo — please confirm "
+                "your app's actual state."
+            )
+        except Exception as exc:
+            log.debug("undo attempt failed: %s", exc)
+            return "Please check whether the application is in the state you expect."
+
+    def _report_action_failure(
+        self,
+        expect: str,
+        verification: dict,
+        *,
+        context: str = "task",
+    ) -> str:
+        observed = str(verification.get("observed") or "").strip()
+        discrepancy = verification.get("discrepancy")
+        disc = "" if discrepancy in (None, "null") else str(discrepancy).strip()
+        undo_msg = self._attempt_undo()
+        parts = [f"Action failed after {_TASK_ACTION_MAX_RETRIES} retries."]
+        if expect:
+            parts.append(f"Expected: {expect}.")
+        if observed:
+            parts.append(f"Last observed: {observed}.")
+        if disc:
+            parts.append(disc)
+        parts.append(undo_msg)
+        msg = " ".join(parts)
+        self.learning.teaching.record_self_action_failed(disc, observed)
+        self._emit("task_status", {"text": f"✗ {msg}"})
+        try:
+            voice_engine.speak(msg[:500])
+        except Exception:
+            pass
+        if context == "do":
+            self._announce(msg)
+        return msg
+
+    def _run_do_with_verify(self, target: str, action: str, expect: str) -> None:
+        """Execute a [[DO:]] click with post-action verification and retries."""
+        act = (action or "click").lower()
+        expect = (expect or "").strip() or self._action_expect(
+            {"target": target, "action": act}, act,
+        )
+        last_verification: dict = {}
+        for attempt in range(_TASK_ACTION_MAX_RETRIES + 1):
+            screen = capture_screen_b64()
+            coords = self.act_on_target(target, action=act, screen=screen)
+            if not coords.get("found"):
+                self.learning.teaching.record_target_not_found()
+                self._announce(
+                    f"I couldn't find \"{target}\" on your screen. "
+                    "Make sure it's visible and try describing it differently."
+                )
+                return
+            last_verification = self._verify_action_outcome(expect)
+            if self._verification_passed(last_verification):
+                return
+            if attempt < _TASK_ACTION_MAX_RETRIES:
+                self._emit("task_status", {
+                    "text": (
+                        f"   verify mismatch — retry "
+                        f"{attempt + 1}/{_TASK_ACTION_MAX_RETRIES}…"
+                    ),
+                })
+                time.sleep(0.3)
+                continue
+            self._report_action_failure(expect, last_verification, context="do")
+            return
+
+    def _execute_task_action_with_verify(
+        self,
+        action: str,
+        decision: dict,
+    ) -> tuple[str, bool]:
+        """
+        Run one task-loop action with post-action verification.
+
+        Returns ``(result, should_continue)``.  ``should_continue`` is False when
+        verification fails after max retries (task must halt).
+        """
+        action = str(action or "").lower()
+        if action not in _TASK_VERIFY_ACTIONS:
+            return self._execute_step(action, decision), True
+
+        expect = self._action_expect(decision, action)
+        last_result = ""
+        last_verification: dict = {}
+        for attempt in range(_TASK_ACTION_MAX_RETRIES + 1):
+            last_result = self._execute_step(action, decision)
+            low = last_result.lower()
+            if "denied" in low or low.startswith("error"):
+                return last_result, True
+            if "not visible" in low or "failed" in low or "aborted" in low:
+                return last_result, True
+            last_verification = self._verify_action_outcome(expect)
+            if self._verification_passed(last_verification):
+                return f"{last_result} (verified)", True
+            if attempt < _TASK_ACTION_MAX_RETRIES:
+                self._emit("task_status", {
+                    "text": (
+                        f"   verify mismatch — retry "
+                        f"{attempt + 1}/{_TASK_ACTION_MAX_RETRIES}…"
+                    ),
+                })
+                time.sleep(0.3)
+                continue
+            self._report_action_failure(expect, last_verification, context="task")
+            return last_result, False
+        return last_result, True
 
     def run_task(self, task: str) -> None:
         """Run the autonomous task loop off-thread after optional safety confirmation."""
         task = (task or "").strip()
         if not task:
             return
+        self._session_task_goal = task
+        self.learning.teaching.set_task_context(task)
         if getattr(self, "_task_running", False):
             self._emit("task_status", {"text": "A task is already running."})
             return
@@ -684,14 +1012,18 @@ class StateEngine:
             self._announce("Agent actions are paused — check your account status.")
             return
 
-        if self.safety_mode != "off" and self._task_confirm_cb is not None:
+        mode = (getattr(self, "safety_mode", "off") or "off").lower()
+        self._task_trusted_ok = False
+        if mode == "trusted" and self._task_confirm_cb is not None:
             if not self._task_confirm_cb(task):
                 self._emit("task_status", {"text": "Task cancelled — not confirmed."})
                 return
+            self._task_trusted_ok = True
 
         self._task_running = True
         self._task_stop = threading.Event()
-        atlas_hands.auto_approve = True
+        atlas_hands.auto_approve = mode in ("off", "trusted")
+        self._emit("task_running", {"active": True, "task": task})
         threading.Thread(
             target=self._task_loop, args=(task,), daemon=True, name="atlas-task"
         ).start()
@@ -700,6 +1032,8 @@ class StateEngine:
         ev = getattr(self, "_task_stop", None)
         if ev is not None:
             ev.set()
+        if getattr(self, "_task_running", False):
+            self._emit("task_status", {"text": "■ Stopping task…"})
 
     # ── Global context + per-user prefs (used by UI and the intent router) ─────
 
@@ -752,6 +1086,14 @@ class StateEngine:
             return {"intent": "learn_start"}
         if t in ("stop", "cancel", "halt", "stop it", "stop that", "quiet", "enough"):
             return {"intent": "stop"}
+        if t.startswith("/diagnose") or t in (
+            "how am i doing",
+            "how am i doing?",
+            "/teaching-stats",
+            "teaching stats",
+            "diagnostics",
+        ):
+            return {"intent": "diagnose"}
         if any(w in t for w in ("turn off focus", "exit focus", "leave focus",
                                 "normal mode", "exit interview")):
             return {"intent": "toggle_focus", "enabled": False}
@@ -920,6 +1262,12 @@ class StateEngine:
             if kind == "run_task":
                 self.run_task(intent.get("task", ""))
                 return True
+            if kind == "diagnose":
+                summary = self.learning.format_teaching_summary_for_user()
+                diag = self.learning.get_self_diagnosis()
+                self._emit("teaching_diagnosis", {"summary": summary, "diagnosis": diag})
+                self._announce(summary)
+                return True
         except Exception as exc:
             log.warning("execute_command(%s) failed: %s", kind, exc)
         return False
@@ -943,6 +1291,7 @@ class StateEngine:
                 f"I couldn't find \"{target}\" on your screen. "
                 "Make sure it's visible and try describing it differently."
             )
+            self.learning.teaching.record_target_not_found()
 
     def _execute_do(self, target: str, action: str = "click") -> None:
         target = (target or "").strip()
@@ -956,6 +1305,7 @@ class StateEngine:
             screen=screen,
         )
         if not coords.get("found"):
+            self.learning.teaching.record_target_not_found()
             self._announce(f"I couldn't find \"{target}\" on your screen.")
 
     def _apply_setting(self, setting: str, value) -> bool:
@@ -1003,6 +1353,10 @@ class StateEngine:
             self._task_running = True
             self._task_stop = threading.Event()
             atlas_hands.auto_approve = True
+            self._emit("task_running", {
+                "active": True,
+                "task": str(routine.get("name", name)),
+            })
             threading.Thread(
                 target=self._replay_routine, args=(routine,),
                 daemon=True, name="atlas-routine",
@@ -1055,6 +1409,7 @@ class StateEngine:
         finally:
             atlas_hands.auto_approve = False
             self._task_running = False
+            self._emit("task_running", {"active": False})
 
     # ── Learn-and-Execute: record a demonstration → generalise → save ──────────
 
@@ -1240,9 +1595,12 @@ class StateEngine:
                         voice_engine.speak(summary)
                         self._log_task_step(step_no, action, "success", screen_hash)
                         break
+                    observed = str(verification.get("observed") or "").strip()
                     reason = str(
                         verification.get("reason") or "Task does not appear complete on screen."
                     ).strip()
+                    if observed and observed not in reason:
+                        reason = f"{reason} Observed: {observed}"
                     log.warning(
                         "Task planner claimed done but verification failed for %r: %s",
                         task,
@@ -1271,14 +1629,43 @@ class StateEngine:
                     continue
                 if action in ("fail", "abort", "stuck", "error"):
                     reason = decision.get("reason") or "I couldn't complete that."
+                    frame = capture_screen_b64()
+                    if frame and frame.b64:
+                        snap = self._verify_action_outcome(task)
+                        observed = str(snap.get("observed") or "").strip()
+                        if observed:
+                            reason = f"{reason} Last observed: {observed}"
                     self._emit("task_status", {"text": f"✗ {reason}"})
                     voice_engine.speak(reason)
                     self._log_task_step(step_no, action, "error", screen_hash)
                     break
-                result = self._execute_step(action, decision)
+                if action in self._TASK_PHYSICAL_ACTIONS:
+                    if not self._task_action_allows(action, decision):
+                        result = "action denied by safety mode"
+                        steps.append({
+                            "step": step_no,
+                            "action": action,
+                            "detail": decision,
+                            "result": result,
+                        })
+                        self._log_task_step(step_no, action, result, screen_hash)
+                        continue
+                mode = (getattr(self, "safety_mode", "off") or "off").lower()
+                prev_auto = atlas_hands.auto_approve
+                if mode == "always":
+                    atlas_hands.auto_approve = True
+                try:
+                    result, continue_loop = self._execute_task_action_with_verify(
+                        action, decision,
+                    )
+                finally:
+                    if mode == "always":
+                        atlas_hands.auto_approve = prev_auto
                 steps.append({"step": step_no, "action": action,
                               "detail": decision, "result": result})
                 self._log_task_step(step_no, action, result, screen_hash)
+                if not continue_loop:
+                    break
             else:
                 self._emit("task_status", {"text": "Reached step limit; stopping."})
                 voice_engine.speak("I've reached my step limit, so I'll stop here.")
@@ -1301,7 +1688,85 @@ class StateEngine:
             self._emit("task_status", {"text": f"Task error: {exc}"})
         finally:
             atlas_hands.auto_approve = False
+            self._task_trusted_ok = False
             self._task_running = False
+            self.learning.persist_teaching_rollup()
+            self._emit("task_running", {"active": False})
+
+    def _describe_task_action(self, action: str, detail: dict) -> str:
+        """Human-readable label for a task-loop permission prompt."""
+        action = (action or "").strip().lower()
+        d = detail or {}
+        if action in ("click", "left_click", "tap", "double_click", "doubleclick", "double"):
+            target = str(d.get("target") or d.get("text") or "target").strip()
+            verb = "Double-click" if "double" in action else "Click"
+            return f"{verb}: {target or 'on-screen target'}"
+        if action in ("type", "type_text", "write", "input"):
+            text = str(d.get("text", ""))
+            if len(text) > 60:
+                text = text[:57] + "…"
+            return f"Type: {text!r}"
+        if action in ("press", "key", "keypress"):
+            key = str(d.get("key") or d.get("text") or "").strip()
+            return f"Press key: {key or '?'}"
+        if action in ("hotkey", "combo", "shortcut"):
+            keys = d.get("keys") or d.get("key") or []
+            if isinstance(keys, str):
+                keys = [k for k in re.split(r"[+,\s]+", keys) if k]
+            return f"Hotkey: {'+'.join(keys) if keys else '?'}"
+        if action == "scroll":
+            return f"Scroll: {int(d.get('amount', -3))}"
+        return f"{action}: {d}"
+
+    def _task_action_allows(self, action: str, detail: dict) -> bool:
+        """
+        Per-step safety gate for the autonomous task loop.
+
+        off     — execute immediately
+        always  — block until PermissionDialog approves this action
+        trusted — allowed after one task-start confirmation (``_task_trusted_ok``)
+        """
+        action = (action or "").strip().lower()
+        if action not in self._TASK_PHYSICAL_ACTIONS:
+            return True
+        mode = (getattr(self, "safety_mode", "off") or "off").lower()
+        if mode == "off":
+            return True
+        if mode == "trusted" and getattr(self, "_task_trusted_ok", False):
+            return True
+
+        desc = self._describe_task_action(action, detail)
+        cb = getattr(atlas_fs, "_permission_callback", None)
+        if cb is None:
+            log.warning("Task action blocked — no permission callback: %s", desc)
+            return False
+
+        result = {"ok": False}
+        done = threading.Event()
+
+        def approve() -> None:
+            result["ok"] = True
+            done.set()
+
+        def deny() -> None:
+            result["ok"] = False
+            done.set()
+
+        try:
+            cb(
+                FSPermission.EXECUTE.value,
+                f"atlas-task://{desc}",
+                approve,
+                deny,
+            )
+        except Exception as exc:
+            log.warning("Task permission request failed: %s", exc)
+            return False
+
+        if not done.wait(timeout=120.0):
+            log.warning("Task permission timed out: %s", desc)
+            return False
+        return bool(result["ok"])
 
     def _decide_next_step(self, task: str, steps: list[dict],
                           frame_b64: Optional[str]) -> Optional[dict]:
@@ -1349,58 +1814,37 @@ class StateEngine:
         frame_b64: Optional[str],
     ) -> dict:
         """
-        Vision check after the planner claims ``done``.
+        Final vision check: does the screen satisfy the original task goal?
 
-        Returns ``{"completed": bool, "reason": str}``.
+        Uses the same ``verify_step_completion`` path as per-step checks.
         """
         if not frame_b64:
             return {
                 "completed": False,
                 "reason": "No screenshot available for completion check.",
+                "observed": "",
+                "discrepancy": "",
             }
-        prompt = (
-            f"Given this screenshot and the original task '{task}', has the task actually "
-            'been completed? Answer with strict JSON '
-            '{"completed": true|false, "reason": "<short>"}'
-        )
-        content: list[dict] = [
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{frame_b64}"},
-            },
-            {"type": "text", "text": prompt},
-        ]
-        try:
-            resp = groq_client.chat.completions.create(
-                model=GROQ_VISION_MODEL,
-                messages=[{"role": "user", "content": content}],
-                temperature=0,
-                max_tokens=120,
-            )
-            raw = resp.choices[0].message.content or "{}"
-            match = re.search(r"\{[\s\S]*\}", raw)
-            data = json.loads(match.group(0) if match else raw)
-            if not isinstance(data, dict):
-                return {"completed": False, "reason": "Invalid verification response."}
-            completed = data.get("completed", False)
-            if isinstance(completed, str):
-                completed = completed.strip().lower() in ("true", "yes", "1")
-            return {
-                "completed": bool(completed),
-                "reason": str(data.get("reason") or "").strip(),
-            }
-        except Exception as exc:
-            log.warning("_verify_task_completion failed: %s", exc)
-            return {
-                "completed": False,
-                "reason": "Completion check failed.",
-            }
+        result = verify_step_completion(task, frame_b64, self.spatial)
+        completed = self._verification_passed(result)
+        observed = str(result.get("observed") or "").strip()
+        discrepancy = result.get("discrepancy")
+        disc = "" if discrepancy in (None, "null") else str(discrepancy).strip()
+        reason = disc or observed or "Task does not appear complete on screen."
+        return {
+            "completed": completed,
+            "reason": reason,
+            "observed": observed,
+            "discrepancy": disc,
+            "confidence": float(result.get("confidence", 0.0) or 0.0),
+        }
 
     def _execute_step(self, action: str, d: dict) -> str:
         """Carry out one planner action via atlas_hands; return a short result."""
         action = str(action or "").strip().lower()
         d = d or {}
-        if action not in ("wait", "sleep", "pause"):
+        in_task = getattr(self, "_task_running", False)
+        if not in_task and action not in ("wait", "sleep", "pause"):
             if not self._safety_allows(f"{action}: {d}"):
                 return "action denied by safety mode"
         try:
@@ -1409,11 +1853,11 @@ class StateEngine:
                                         or d.get("text") or "")
             if action in ("click", "left_click", "tap"):
                 return self._locate_and_click(
-                    d.get("target", ""), double=False, skip_safety=True,
+                    d.get("target", ""), double=False, skip_safety=in_task,
                 )
             if action in ("double_click", "doubleclick", "double"):
                 return self._locate_and_click(
-                    d.get("target", ""), double=True, skip_safety=True,
+                    d.get("target", ""), double=True, skip_safety=in_task,
                 )
             if action in ("type", "type_text", "write", "input"):
                 text = str(d.get("text", ""))
@@ -1444,23 +1888,133 @@ class StateEngine:
         finally:
             time.sleep(self._TASK_SETTLE_S)
 
+    def _log_abort_and_relocate(
+        self,
+        *,
+        target: str,
+        context: str,
+        cx: int,
+        cy: int,
+        distance: float,
+        attempt: int,
+        phase: str = "post_locate",
+    ) -> None:
+        """Structured log for Phase 4 self-diagnosis of unstable target regions."""
+        log_outcome_json({
+            "event": "abort_and_relocate",
+            "target": target,
+            "context": context,
+            "phase": phase,
+            "cx": cx,
+            "cy": cy,
+            "region_distance": round(float(distance), 2),
+            "attempt": attempt,
+        })
+        log.warning(
+            "abort_and_relocate target=%r context=%s phase=%s dist=%.1f attempt=%d",
+            target, context, phase, distance, attempt,
+        )
+
+    def _locate_for_action(
+        self,
+        target: str,
+        screen: ScreenCapture | None = None,
+        *,
+        context: str = "action",
+    ) -> tuple[dict, ScreenCapture | None]:
+        """
+        Locate a target and verify the region is stable before any physical action.
+
+        On significant viewport change, log ``abort_and_relocate``, grab a fresh
+        frame, and re-locate (at most ``_PREACTION_RELOCATE_MAX`` times).
+        """
+        target = (target or "").strip()
+        if not target:
+            return {"found": False, "x": 0, "y": 0, "w": 0, "h": 0}, None
+
+        cap = screen or capture_screen_b64()
+        for attempt in range(self._PREACTION_RELOCATE_MAX + 1):
+            if cap is None:
+                return {"found": False, "x": 0, "y": 0, "w": 0, "h": 0}, None
+            coords = self.spatial.locate(target, screen=cap)
+            if not coords.get("found"):
+                return coords, cap
+            cx = int(coords["x"] + coords.get("w", 0) / 2)
+            cy = int(coords["y"] + coords.get("h", 0) / 2)
+            w = int(coords.get("w", 0))
+            h = int(coords.get("h", 0))
+            changed, dist = region_changed_since_capture(cap, cx, cy, w, h)
+            if not changed:
+                return coords, cap
+            self._log_abort_and_relocate(
+                target=target,
+                context=context,
+                cx=cx,
+                cy=cy,
+                distance=dist,
+                attempt=attempt + 1,
+                phase="post_locate",
+            )
+            if attempt >= self._PREACTION_RELOCATE_MAX:
+                failed = dict(coords)
+                failed["found"] = False
+                failed["abort_reason"] = "region_unstable"
+                return failed, cap
+            cap = capture_screen_b64()
+        return {"found": False, "x": 0, "y": 0, "w": 0, "h": 0}, cap
+
+    def _guard_click_region(
+        self,
+        locate_cap: ScreenCapture | None,
+        cx: int,
+        cy: int,
+        w: int,
+        h: int,
+        target: str,
+        *,
+        context: str,
+    ) -> bool:
+        """Final lightweight check immediately before a physical click."""
+        if locate_cap is None:
+            return True
+        changed, dist = region_changed_since_capture(locate_cap, cx, cy, w, h)
+        if not changed:
+            return True
+        self._log_abort_and_relocate(
+            target=target,
+            context=context,
+            cx=cx,
+            cy=cy,
+            distance=dist,
+            attempt=1,
+            phase="pre_click",
+        )
+        return False
+
     def _locate_and_click(
         self, target: str, double: bool = False, *, skip_safety: bool = False,
     ) -> str:
         target = (target or "").strip()
         if not target:
             return "no target given"
-        cap = capture_screen_b64()
-        if not cap:
-            return "screen capture failed"
-        coords = self.spatial.locate(target, screen=cap)
+        coords, locate_cap = self._locate_for_action(
+            target, context="task_click",
+        )
         if not coords.get("found"):
+            if coords.get("abort_reason") == "region_unstable":
+                return f"region unstable for '{target}' — click aborted"
             return f"'{target}' not visible on screen"
         cx = int(coords["x"] + coords.get("w", 0) / 2)
         cy = int(coords["y"] + coords.get("h", 0) / 2)
+        w = int(coords.get("w", 0))
+        h = int(coords.get("h", 0))
         desc = f"Clicking {target}"
 
         def _do() -> None:
+            if not self._guard_click_region(
+                locate_cap, cx, cy, w, h, target, context="task_click",
+            ):
+                raise RuntimeError(f"region changed before click on '{target}'")
             atlas_hands.click(cx, cy)
             if double:
                 atlas_hands.click(cx, cy)
@@ -1469,8 +2023,7 @@ class StateEngine:
             return "action denied by safety mode"
         ok = step_orchestrator.run_step(
             desc, cx, cy,
-            int(coords.get("w", 0)),
-            int(coords.get("h", 0)),
+            w, h,
             action="double" if double else "click",
             target=target,
             do_action=_do,
@@ -1554,6 +2107,9 @@ class StateEngine:
         # Cancellation token — set by cancel_current() to break the live Groq
         # stream so a user can interrupt Atlas mid-reply (conversational break-in).
         self._cancel = threading.Event()
+        self._research_this_turn = False
+        self._pending_guide: Optional[dict] = None
+        self._session_task_goal: str = ""
 
         # Operating mode + session
         self.mode    = ModeState.ACTIVE
@@ -1602,6 +2158,7 @@ class StateEngine:
         # Safety mode: off = auto actions, always = confirm each action, trusted = confirm once per session
         self.safety_mode = str(self.get_user_prefs().get("safety_mode", "off"))
         self._safety_session_ok = False
+        self._task_trusted_ok = False
         self._task_confirm_cb: Optional[Callable[[str], bool]] = None
         threading.Thread(
             target=self._model_health_check,
@@ -1693,6 +2250,8 @@ class StateEngine:
             self.mode = mode
             self.session.start(self.get_system_prompt())
             self._clear_context_buffer()
+            self._pending_guide = None
+            self.learning.reset_teaching_session()
         self._emit("mode_changed", {"from": prev.name, "to": mode.name})
 
     def cancel_current(self) -> None:
@@ -1707,6 +2266,8 @@ class StateEngine:
         with self._lock:
             self.session.start(self.get_system_prompt())
             self._clear_context_buffer()
+            self._pending_guide = None
+            self.learning.reset_teaching_session()
         self._emit("session_reset", {"mode": self.mode.name})
 
     # ── Event bus ─────────────────────────────────────────────────────────────
@@ -1914,9 +2475,28 @@ class StateEngine:
             if not self.session.is_active:
                 self.session.start(self.get_system_prompt())
 
+            verify_mode, verify_prefix = self._try_verify_guide_step(text)
+            if verify_mode == "handled":
+                return
+
+            if (
+                self._pending_guide
+                and self.mode == ModeState.GUIDED
+                and not self._is_guide_advance(text)
+                and self.learning.teaching.is_user_confused(text)
+            ):
+                self.learning.teaching.record_user_confused()
+
+            if self.mode == ModeState.GUIDED and (text or "").strip():
+                if not self._session_task_goal:
+                    self._session_task_goal = text.strip()
+                self.learning.teaching.set_task_context(self._session_task_goal)
+
             # ── Enrich the user input with ambient screen context ─────────────────
             context_snap   = self._get_context_snapshot()
             enriched_input = text
+            if verify_prefix:
+                enriched_input = verify_prefix + enriched_input
             if context_snap:
                 enriched_input = (
                     "[AMBIENT SCREEN CONTEXT — background awareness only; "
@@ -2017,6 +2597,15 @@ class StateEngine:
                 if warn:
                     skill_context = warn
 
+            teach_hint = self.learning.get_teaching_hint(
+                self._session_task_goal or text,
+            )
+            if teach_hint:
+                skill_context = (
+                    (skill_context + "\n\n" + teach_hint).strip()
+                    if skill_context else teach_hint
+                )
+
             screen_ctx_summary = ""
             if screen_b64:
                 screen_ctx_summary = "Live desktop screenshot attached to this turn."
@@ -2062,6 +2651,131 @@ class StateEngine:
             if token and self.skill_registry.get(token):
                 return token
         return self.skill_registry.match_triggers(stripped)
+
+    @staticmethod
+    def _is_guide_advance(text: str) -> bool:
+        t = (text or "").strip()
+        if not t or len(t) > 80:
+            return False
+        return bool(_GUIDE_ADVANCE_RE.match(t))
+
+    def _try_verify_guide_step(self, text: str) -> tuple[str, str]:
+        """
+        Guided-mode step verification before advancing.
+
+        Returns ``(mode, prefix)`` where mode is ``skip``, ``handled``, or
+        ``passed``.  ``prefix`` is injected into the next user message when
+        mode is ``passed``.
+        """
+        if self.mode != ModeState.GUIDED:
+            return "skip", ""
+        pending = getattr(self, "_pending_guide", None)
+        if not pending or pending.get("verified"):
+            return "skip", ""
+
+        if not self._is_guide_advance(text):
+            return "skip", ""
+
+        step_index = int(pending.get("step_index") or 0)
+        expected = (pending.get("expected_state") or pending.get("instruction") or "").strip()
+        frame = capture_screen_b64()
+        frame_b64 = frame.b64 if frame else ""
+        result = verify_step_completion(expected, frame_b64, self.spatial)
+        confidence = float(result.get("confidence", 0.0) or 0.0)
+        completed = bool(result.get("completed", False))
+        observed = str(result.get("observed") or "").strip()
+        discrepancy = result.get("discrepancy")
+        disc_text = "" if discrepancy in (None, "null") else str(discrepancy).strip()
+
+        evt = pending.get("event")
+        if isinstance(evt, StepEvent):
+            evt.verified = completed and confidence >= _GUIDE_VERIFY_CONF_PASS
+
+        if confidence < _GUIDE_VERIFY_CONF_LOW:
+            msg = (
+                "I'm not fully sure that landed — can you tell me what you see "
+                "on screen right now?"
+            )
+            self.learning.teaching.record_correction(disc_text, observed)
+            self._emit("step_verified", {
+                "step_index": step_index,
+                "passed": False,
+                "discrepancy": disc_text or "low confidence",
+                "observed": observed,
+            })
+            self._finish_direct_response(text, msg)
+            return "handled", ""
+
+        if completed and confidence >= _GUIDE_VERIFY_CONF_PASS:
+            if isinstance(evt, StepEvent):
+                evt.verified = True
+            self.learning.teaching.record_verified_first_try()
+            self._emit("step_verified", {
+                "step_index": step_index,
+                "passed": True,
+                "discrepancy": "",
+                "observed": observed,
+            })
+            self._pending_guide = None
+            prefix = (
+                "[STEP VERIFIED — the user completed the previous guided step. "
+                "Continue with the next step of the walkthrough.]\n\n"
+            )
+            return "passed", prefix
+
+        msg = self._build_guide_correction(pending, observed, disc_text)
+        if isinstance(evt, StepEvent):
+            evt.verified = False
+        self.learning.teaching.record_correction(disc_text, observed)
+        self._emit("step_verified", {
+            "step_index": step_index,
+            "passed": False,
+            "discrepancy": disc_text or observed or "step not complete",
+            "observed": observed,
+        })
+        self._finish_direct_response(text, msg)
+        return "handled", ""
+
+    @staticmethod
+    def _build_guide_correction(
+        pending: dict,
+        observed: str,
+        discrepancy: str,
+    ) -> str:
+        expected = (pending.get("expected_state") or "").strip()
+        instruction = (pending.get("instruction") or "").strip()
+        parts = ["That doesn't look quite right yet — let's stay on this step."]
+        if expected:
+            parts.append(f"I expected: {expected}.")
+        if observed:
+            parts.append(f"What I see now: {observed}")
+        if discrepancy:
+            parts.append(discrepancy)
+        elif not observed:
+            parts.append("The screen doesn't match what we need yet.")
+        if instruction:
+            parts.append(f"Try again: {instruction}")
+        return " ".join(parts)
+
+    def _finish_direct_response(self, raw_user_text: str, response: str) -> None:
+        """Push a non-streaming assistant reply (verification / clarify paths)."""
+        try:
+            self.session.push_user(raw_user_text)
+            self.session.push_assistant(response)
+            if response.strip():
+                voice_engine.speak(_strip_markdown(response.strip()))
+            self._on_complete(response)
+            self._schedule_learning_on_turn_complete(raw_user_text, response)
+            self.local_memory.on_turn_complete(
+                raw_user_text,
+                response,
+                screen_context_summary=getattr(self, "_last_turn_screen_context", ""),
+                user_goal_hint=getattr(self, "_last_turn_goal_hint", ""),
+            )
+        except Exception as exc:
+            self._on_error(str(exc))
+        finally:
+            self._query_semaphore.release()
 
     def _finish_skill_response(self, raw_user_text: str, skill_name: str, result: dict) -> None:
         """Complete a skill-only turn without LLM streaming."""
@@ -2169,6 +2883,7 @@ class StateEngine:
         full_response:  str  = ""
         sentence_buf:   str  = ""
         first_chunk_received = False
+        self._research_this_turn = False
         # Fresh token for this turn so a stale cancel can't abort us immediately.
         self._cancel.clear()
 
@@ -2227,7 +2942,7 @@ class StateEngine:
                 visible = harmony.feed(visible)
                 visible = coord_filt.feed(visible)
                 for tok in action_tokens:
-                    self._dispatch_action_token(tok)
+                    self._dispatch_action_token(tok, sync_research=True)
 
                 if not visible:
                     continue
@@ -2275,7 +2990,7 @@ class StateEngine:
             tail = harmony.feed(tail) + harmony.flush()
             tail = coord_filt.feed(tail)
             for tok in tail_tokens:
-                self._dispatch_action_token(tok)
+                self._dispatch_action_token(tok, sync_research=True)
             tail_remainder, coord_tag = coord_filt.flush()
             tail = (tail + tail_remainder).strip()
             if tail:
@@ -2290,6 +3005,35 @@ class StateEngine:
             residual = _strip_markdown(sentence_buf.strip())
             if residual:
                 voice_engine.speak(residual)
+
+            # After inline research, continue the guided walkthrough if the model
+            # stopped after emitting [[RESEARCH:]] with little visible prose.
+            if getattr(self, "_research_this_turn", False) and len(full_response.strip()) < 150:
+                cont_raw = self._continue_after_research(raw_user_text)
+                if cont_raw:
+                    cont_bracket = _StreamBracketFilter()
+                    cont_harmony = HarmonyStreamFilter()
+                    cont_visible, cont_tokens = cont_bracket.feed(cont_raw)
+                    cont_tail, cont_tail_tokens = cont_bracket.flush()
+                    cont_visible = (
+                        cont_harmony.feed(cont_visible)
+                        + cont_harmony.feed(cont_tail)
+                        + cont_harmony.flush()
+                    )
+                    for tok in cont_tokens + cont_tail_tokens:
+                        self._dispatch_action_token(tok, sync_research=True)
+                    if cont_visible.strip():
+                        if not first_chunk_received:
+                            self.session.push_user(raw_user_text)
+                            first_chunk_received = True
+                        try:
+                            self._on_chunk(cont_visible)
+                        except Exception:
+                            pass
+                        full_response += cont_visible
+                        spoken = _strip_markdown(cont_visible.strip())
+                        if spoken:
+                            voice_engine.speak(spoken)
 
             # Commit the assistant turn to history only if we have a response.
             if full_response:
@@ -2488,6 +3232,8 @@ class StateEngine:
         screen: ScreenCapture | None = None,
         screen_b64: Optional[str] = None,
         scale: Optional[float] = None,
+        *,
+        expected_state: str = "",
     ) -> dict:
         """
         GUIDING — point at a UI target on the HUD and narrate; never touch input.
@@ -2507,6 +3253,9 @@ class StateEngine:
         if coords.get("found") and instruction:
             cx = int(coords["x"] + coords.get("w", 0) / 2)
             cy = int(coords["y"] + coords.get("h", 0) / 2)
+            exp = (expected_state or "").strip()
+            if not exp and instruction:
+                exp = f"After this step: {instruction}"
             step_orchestrator.run_step(
                 instruction or f"Look at {target}",
                 cx, cy,
@@ -2514,8 +3263,26 @@ class StateEngine:
                 int(coords.get("h", 0)),
                 action="guide",
                 target=target,
+                expected_state=exp,
                 do_action=None,
             )
+            self.learning.teaching.record_guide_step()
+            evt = step_orchestrator._last_event
+            if evt:
+                self._pending_guide = {
+                    "step_index": evt.step_index,
+                    "target": target,
+                    "instruction": instruction,
+                    "expected_state": exp,
+                    "verified": None,
+                    "event": evt,
+                }
+                self._emit("guide_step_started", {
+                    "step_index": evt.step_index,
+                    "instruction": instruction,
+                    "expected_state": exp,
+                    "target": target,
+                })
         return coords
 
     def act_on_target(
@@ -2532,17 +3299,34 @@ class StateEngine:
         if self.execution_blocked:
             self._announce("Agent actions are paused — check your account status.")
             return {"target": target, "found": False, "x": 0, "y": 0, "w": 0, "h": 0}
-        coords = self.locate_ui_element(
-            target, screen=screen, screen_b64=screen_b64, scale=scale,
+        coords, locate_cap = self._locate_for_action(
+            target, screen=screen, context="do",
         )
+        payload = {
+            "target": target,
+            "guide": False,
+            "label": "",
+            **coords,
+        }
+        self._emit("spatial_coordinates", payload)
+        try:
+            self._on_coordinates(payload)
+        except Exception as exc:
+            log.debug("on_coordinates callback raised: %s", exc)
         if not coords.get("found"):
-            return coords
+            return payload
         cx = int(coords["x"] + coords.get("w", 0) / 2)
         cy = int(coords["y"] + coords.get("h", 0) / 2)
+        w = int(coords.get("w", 0))
+        h = int(coords.get("h", 0))
         act = (action or "click").lower()
         desc = f"Clicking {target}"
 
         def _do() -> None:
+            if not self._guard_click_region(
+                locate_cap, cx, cy, w, h, target, context="do",
+            ):
+                raise RuntimeError(f"region changed before click on '{target}'")
             if act == "click":
                 atlas_hands.click(cx, cy)
             elif act == "double":
@@ -2553,8 +3337,7 @@ class StateEngine:
             return coords
         ok = step_orchestrator.run_step(
             desc, cx, cy,
-            int(coords.get("w", 0)),
-            int(coords.get("h", 0)),
+            w, h,
             action=act,
             target=target,
             do_action=_do,
@@ -3097,7 +3880,6 @@ class AtlasHands:
 # blocked with a logged warning rather than crashing.
 atlas_fs = AtlasFileSystem()
 atlas_hands = AtlasHands(atlas_fs)
-atlas_hands.auto_approve = True
 step_orchestrator = StepOrchestrator()
 
 # FIX-6: Run the .env gitignore safety check at module import time so developers

@@ -33,3 +33,7 @@ pynput>=1.7.6
 reportlab>=4.0.0
 # TOTP authenticator app 2FA.
 pyotp>=2.9.0
+# Guided-mode doc lookup ([[RESEARCH:]] grounding).
+trafilatura>=1.6.0
+requests>=2.31.0
+duckduckgo-search>=6.0.0

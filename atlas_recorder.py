@@ -18,17 +18,23 @@ log = get_logger("recorder")
 
 
 class ActionTokenPatterns:
-    """Regex patterns for inline [[GUIDE/DO/TASK:…]] action tokens."""
+    """Regex patterns for inline [[GUIDE/DO/TASK/RESEARCH:…]] action tokens."""
 
-    #   [[GUIDE: target_name | instruction text]]
+    #   [[GUIDE: target_name | instruction text | expected_state (optional)]]
     #   [[DO:    target_name | action_type]]
     _ACTION_TOKEN_RE = re.compile(
-        r"\[\[\s*(GUIDE|DO)\s*:\s*([^|\]]+?)\s*\|\s*([^\]]*?)\s*\]\]",
+        r"\[\[\s*(GUIDE|DO)\s*:\s*([^|\]]+?)\s*\|\s*([^|\]]*?)"
+        r"(?:\s*\|\s*([^\]]*?))?\s*\]\]",
         re.IGNORECASE,
     )
     #   [[TASK: full multi-step goal in plain language]]
     _TASK_TOKEN_RE = re.compile(
         r"\[\[\s*TASK\s*:\s*(.+?)\s*\]\]",
+        re.IGNORECASE | re.DOTALL,
+    )
+    #   [[RESEARCH: search query in plain language]]
+    _RESEARCH_TOKEN_RE = re.compile(
+        r"\[\[\s*RESEARCH\s*:\s*(.+?)\s*\]\]",
         re.IGNORECASE | re.DOTALL,
     )
 
@@ -193,12 +199,12 @@ class RoutineRecorder:
 
 class StreamBracketFilter:
     """
-    Incrementally strips ``[[GUIDE:…]]`` / ``[[DO:…]]`` action tokens out of a
+    Incrementally strips ``[[GUIDE/DO/TASK/RESEARCH:…]]`` action tokens out of a
     streaming LLM response so they never reach the chat view or the TTS engine,
     while surfacing each completed token exactly once for the action dispatcher.
 
-    Plain double-brackets that are NOT a GUIDE/DO schema (e.g. ``list[[0]]`` in a
-    code answer) are passed through untouched.
+    Plain double-brackets that are NOT a known action schema (e.g. ``list[[0]]``
+    in a code answer) are passed through untouched.
 
     Usage
     -----
@@ -206,7 +212,9 @@ class StreamBracketFilter:
         tail            = filt.flush()       # at stream end
     """
 
-    _PREFIX_RE = re.compile(r"\[\[\s*(?:GUIDE|DO|TASK)\s*:", re.IGNORECASE)
+    _PREFIX_RE = re.compile(
+        r"\[\[\s*(?:GUIDE|DO|TASK|RESEARCH)\s*:", re.IGNORECASE,
+    )
 
     def __init__(self) -> None:
         self._buf = ""
@@ -218,7 +226,10 @@ class StreamBracketFilter:
         s = buf[2:].lstrip().lower()
         if s == "":
             return True
-        return any(kw.startswith(s) for kw in ("guide:", "do:", "task:"))
+        return any(
+            kw.startswith(s)
+            for kw in ("guide:", "do:", "task:", "research:")
+        )
 
     def feed(self, delta: str) -> tuple[str, list[str]]:
         self._buf += delta

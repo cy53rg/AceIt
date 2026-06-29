@@ -28,6 +28,7 @@ Supabase setup (one-time, when you're ready to turn on sync)
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import os
 import time
@@ -509,7 +510,7 @@ class AccountManager:
         pin = (pin or "").strip()
         if len(pin) < 4 or not pin.isdigit():
             return (False, "PIN must be at least 4 digits.")
-        h = hashlib.pbkdf2_hmac("sha256", pin.encode(), b"atlas-lock", 120_000).hex()
+        h = UserMemory._hash_password(pin)
         sec = self._sec(user_id, self.memory)
         sec["app_lock_hash"] = h
         self._save_sec(user_id, self.memory, sec)
@@ -520,13 +521,35 @@ class AccountManager:
         stored = sec.get("app_lock_hash")
         if not stored:
             return True
-        h = hashlib.pbkdf2_hmac("sha256", (pin or "").encode(),
-                                b"atlas-lock", 120_000).hex()
-        return h == stored
+        stored = str(stored)
+        if "$" in stored:
+            return UserMemory._verify_password(pin or "", stored)
+        # Legacy installs: constant salt + bare hex digest.
+        legacy = hashlib.pbkdf2_hmac(
+            "sha256", (pin or "").encode(), b"atlas-lock", 120_000,
+        ).hex()
+        return hmac.compare_digest(legacy, stored)
 
     def change_password_local(self, user_id: int, old: str, new: str) -> tuple[bool, str]:
         prof = self.memory.get_profile(user_id)
-        ok, msg, _ = self.memory.authenticate(prof.get("name", ""), old)
+        if not prof:
+            return (False, "User not found.")
+        with self.memory._connect() as conn:
+            row = conn.execute(
+                "SELECT password_hash FROM users WHERE id = ?",
+                (int(user_id),),
+            ).fetchone()
+        has_local_password = bool(row and row["password_hash"])
+        cloud_id = str(self.memory.get_prefs(user_id).get("cloud_id") or "").strip()
+        if not has_local_password and cloud_id:
+            return (
+                False,
+                "This account uses cloud sign-in — change your password at your "
+                "account provider.",
+            )
+        if not has_local_password:
+            return (False, "This profile has no local password set.")
+        ok, _msg, _ = self.memory.authenticate(prof.get("name", ""), old)
         if not ok:
             return (False, "Current password is incorrect.")
         self.memory.update_profile(user_id, password=new)

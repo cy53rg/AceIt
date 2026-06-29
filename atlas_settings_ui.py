@@ -136,6 +136,7 @@ class SettingsDialog(QDialog):
         self._build_account_tab()
         self._build_security_tab()
         self._build_hotkeys_tab()
+        self._build_teaching_tab()
 
         done = QPushButton("Close")
         done.setObjectName("done_btn")
@@ -700,6 +701,54 @@ class SettingsDialog(QDialog):
             lay.addWidget(row)
         lay.addStretch()
         self.tabs.addTab(w, "Hotkeys")
+
+    def _build_teaching_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        hdr = QLabel("TEACHING PERFORMANCE")
+        hdr.setObjectName("section_hdr")
+        lay.addWidget(hdr)
+        hint = QLabel(
+            "Session stats from guided walkthroughs and step verification. "
+            "Type /diagnose in chat for a quick summary."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {_get_pal()['muted']}; font-size: 11px;")
+        lay.addWidget(hint)
+        self._teaching_summary = QLabel("Open this tab to refresh session stats.")
+        self._teaching_summary.setWordWrap(True)
+        self._teaching_summary.setAlignment(Qt.AlignTop)
+        self._teaching_summary.setStyleSheet(
+            f"color: {_get_pal()['text']}; font-size: 12px; line-height: 1.5;"
+        )
+        lay.addWidget(self._teaching_summary, 1)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self._refresh_teaching)
+        lay.addWidget(refresh, 0, Qt.AlignRight)
+        self.tabs.addTab(w, "Teaching")
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_teaching() if self.tabs.tabText(i) == "Teaching" else None
+        )
+
+    def _refresh_teaching(self) -> None:
+        if not hasattr(self, "_teaching_summary"):
+            return
+        eng = getattr(self, "engine", None)
+        if eng is None or not getattr(eng, "learning", None):
+            self._teaching_summary.setText("Teaching stats unavailable.")
+            return
+        summary = eng.learning.format_teaching_summary_for_user()
+        diag = eng.learning.get_self_diagnosis()
+        extra = (
+            f"\n\nCorrection rate: {float(diag.get('correction_rate', 0)):.0%} · "
+            f"Confusion rate: {float(diag.get('confusion_rate', 0)):.0%} · "
+            f"Research lookups: {int(diag.get('research_lookups_performed', 0))}"
+        )
+        key = diag.get("task_key") or ""
+        if key:
+            extra += f"\nTask type key: {key}"
+        self._teaching_summary.setText(summary + extra)
 
     def _on_model_changed(self, index: int) -> None:
         if not _CORE:

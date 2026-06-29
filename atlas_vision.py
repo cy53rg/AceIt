@@ -267,6 +267,85 @@ def capture_screen_b64_str(max_width: int = 1280) -> Optional[str]:
     return cap.b64 if cap else None
 
 
+_REGION_PAD = 48
+_REGION_HASH_SIZE = 16
+REGION_CHANGE_THRESHOLD = 14.0
+
+
+def _desktop_to_capture_xy(cap: ScreenCapture, desktop_x: int, desktop_y: int) -> tuple[int, int]:
+    scale = cap.scale if cap.scale > 0 else 1.0
+    return int(desktop_x / scale), int(desktop_y / scale)
+
+
+def region_fingerprint(
+    cap: ScreenCapture,
+    desktop_cx: int,
+    desktop_cy: int,
+    desktop_w: int = 0,
+    desktop_h: int = 0,
+    *,
+    pad: int = _REGION_PAD,
+) -> tuple[int, ...] | None:
+    """16×16 grayscale fingerprint of the UI region around a desktop coordinate."""
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(base64_decode(cap.b64))).convert("RGB")
+        ix, iy = _desktop_to_capture_xy(cap, desktop_cx, desktop_cy)
+        half_desktop = max(pad, (desktop_w or 0) // 2, (desktop_h or 0) // 2, 24)
+        half = max(8, int(half_desktop / cap.scale)) if cap.scale > 0 else half_desktop
+        left = max(0, ix - half)
+        top = max(0, iy - half)
+        right = min(img.width, ix + half)
+        bottom = min(img.height, iy + half)
+        if right - left < 4 or bottom - top < 4:
+            return None
+        crop = img.crop((left, top, right, bottom))
+        small = crop.resize((_REGION_HASH_SIZE, _REGION_HASH_SIZE)).convert("L")
+        return tuple(small.getdata())
+    except Exception as exc:
+        log.debug("region_fingerprint failed: %s", exc)
+        return None
+
+
+def region_mean_distance(
+    fp1: tuple[int, ...] | None,
+    fp2: tuple[int, ...] | None,
+) -> float:
+    if not fp1 or not fp2 or len(fp1) != len(fp2):
+        return 999.0
+    diffs = [abs(int(a) - int(b)) for a, b in zip(fp1, fp2)]
+    return sum(diffs) / max(len(diffs), 1)
+
+
+def region_changed_since_capture(
+    locate_cap: ScreenCapture,
+    desktop_cx: int,
+    desktop_cy: int,
+    desktop_w: int = 0,
+    desktop_h: int = 0,
+    *,
+    fresh_cap: ScreenCapture | None = None,
+    threshold: float = REGION_CHANGE_THRESHOLD,
+) -> tuple[bool, float]:
+    """
+    Compare the target region in *locate_cap* to a fresh screenshot.
+
+    Returns ``(changed_significantly, mean_pixel_distance)``.
+    """
+    fp_locate = region_fingerprint(
+        locate_cap, desktop_cx, desktop_cy, desktop_w, desktop_h,
+    )
+    fresh = fresh_cap or capture_screen_b64()
+    if fresh is None:
+        return False, 0.0
+    fp_fresh = region_fingerprint(
+        fresh, desktop_cx, desktop_cy, desktop_w, desktop_h,
+    )
+    dist = region_mean_distance(fp_locate, fp_fresh)
+    return dist >= threshold, dist
+
+
 class SpatialBrain:
     """
     Vision-based locator that resolves textual UI targets to absolute pixels.
@@ -353,6 +432,127 @@ class SpatialBrain:
         final = refined if refined.get("found") else result
         self._log_locate_outcome(clean_target, final)
         return final
+
+    @classmethod
+    def _parse_verify_json(cls, raw: str) -> dict:
+        text = (raw or "").strip()
+        if not text:
+            return {
+                "completed": False,
+                "confidence": 0.0,
+                "observed": "",
+                "discrepancy": "Empty verification response.",
+            }
+        fence = cls._FENCE_RE.search(text)
+        if fence:
+            text = fence.group(1).strip()
+        match = cls._JSON_RE.search(text)
+        blob = match.group(0) if match else text
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError:
+            log.warning("SpatialBrain: could not parse verify JSON: %r", raw[:240])
+            return {
+                "completed": False,
+                "confidence": 0.0,
+                "observed": "",
+                "discrepancy": "Could not parse verification response.",
+            }
+        if not isinstance(data, dict):
+            return {
+                "completed": False,
+                "confidence": 0.0,
+                "observed": "",
+                "discrepancy": "Invalid verification response.",
+            }
+        completed = data.get("completed", False)
+        if isinstance(completed, str):
+            completed = completed.strip().lower() in ("true", "yes", "1")
+        disc = data.get("discrepancy")
+        return {
+            "completed": bool(completed),
+            "confidence": float(data.get("confidence", 0.0) or 0.0),
+            "observed": str(data.get("observed") or "").strip(),
+            "discrepancy": None if disc in (None, "null", "") else str(disc).strip(),
+        }
+
+    def verify(
+        self,
+        expected_state: str,
+        screen: ScreenCapture | None = None,
+        screen_b64: Optional[str] = None,
+    ) -> dict:
+        """
+        Vision check: does the screenshot match *expected_state*?
+
+        Returns ``{"completed", "confidence", "observed", "discrepancy"}``.
+        """
+        expected = (expected_state or "").strip()
+        if not expected:
+            return {
+                "completed": False,
+                "confidence": 0.0,
+                "observed": "",
+                "discrepancy": "No expected state provided.",
+            }
+        frame_b64, _scale = self._resolve_frame_and_scale(screen, screen_b64, None)
+        if not frame_b64:
+            try:
+                frame_b64 = self.capture_screen_png_b64()
+            except Exception as exc:
+                log.warning("SpatialBrain.verify capture failed: %s", exc)
+                return {
+                    "completed": False,
+                    "confidence": 0.0,
+                    "observed": "",
+                    "discrepancy": "No screenshot available for verification.",
+                }
+        instruction = (
+            "You verify whether a UI step succeeded. Compare the screenshot to the "
+            "expected outcome. Return strict JSON only: "
+            '{"completed": true|false, "confidence": 0.0-1.0, '
+            '"observed": "<what is actually visible now, 1 sentence>", '
+            '"discrepancy": "<null or what is wrong, 1 sentence>"}. '
+            f"Expected outcome after the step: {expected}"
+        )
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{frame_b64}"},
+                            },
+                            {"type": "text", "text": instruction},
+                        ],
+                    }
+                ],
+                temperature=0,
+                max_tokens=220,
+            )
+            raw = resp.choices[0].message.content or "{}"
+            result = self._parse_verify_json(raw)
+            try:
+                log_outcome_json({
+                    "verify_expected": expected[:120],
+                    "completed": bool(result.get("completed")),
+                    "confidence": float(result.get("confidence", 0.0) or 0.0),
+                    "model": self.model,
+                })
+            except Exception:
+                pass
+            return result
+        except Exception as exc:
+            log.warning("SpatialBrain.verify failed: %s", exc)
+            return {
+                "completed": False,
+                "confidence": 0.0,
+                "observed": "",
+                "discrepancy": "Verification check failed.",
+            }
 
     @staticmethod
     def _resolve_frame_and_scale(
@@ -730,6 +930,9 @@ __all__ = [
     "base64_encode",
     "capture_screen_b64",
     "capture_screen_b64_str",
+    "region_changed_since_capture",
+    "region_fingerprint",
+    "REGION_CHANGE_THRESHOLD",
     "last_capture_scale",
     "last_screen_size",
 ]

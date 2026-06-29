@@ -38,6 +38,8 @@ class StepEvent:
     status: str = "started"    # started | animating | executing | completed | failed
     target: str = ""
     error: str = ""
+    expected_state: str = ""
+    verified: Optional[bool] = None
 
 
 @dataclass
@@ -63,6 +65,7 @@ class StepOrchestrator:
         self.narration_enabled = True
         self.min_step_ms = 400   # minimum pacing even when TTS is off
         self._consecutive_timeouts = 0
+        self._last_event: Optional[StepEvent] = None
 
     def set_ui_handler(self, handler: Callable[[_PendingStep], None]) -> None:
         self._ui_handler = handler
@@ -86,6 +89,7 @@ class StepOrchestrator:
         h: int = 0,
         action: str = "click",
         target: str = "",
+        expected_state: str = "",
         do_action: Optional[Callable[[], None]] = None,
         timeout_s: float | None = None,
     ) -> bool:
@@ -108,8 +112,10 @@ class StepOrchestrator:
             action=action,
             status="started",
             target=target,
+            expected_state=(expected_state or "").strip(),
         )
         pending = _PendingStep(event=evt, do_action=do_action)
+        self._last_event = evt
         handler = self._ui_handler
         if handler is None:
             log.warning("No UI handler — running action without sync")
@@ -145,6 +151,17 @@ class StepOrchestrator:
         log.debug("Step %d finished in %.0fms ok=%s", idx, (time.monotonic() - t0) * 1000, pending.result_ok)
         return pending.result_ok
 
-    def emit_only(self, description: str, x: int = 0, y: int = 0, action: str = "guide") -> None:
+    def emit_only(
+        self,
+        description: str,
+        x: int = 0,
+        y: int = 0,
+        action: str = "guide",
+        *,
+        expected_state: str = "",
+    ) -> None:
         """Fire a guide-only step (no physical action)."""
-        self.run_step(description, x, y, action=action, do_action=None)
+        self.run_step(
+            description, x, y, action=action,
+            expected_state=expected_state, do_action=None,
+        )

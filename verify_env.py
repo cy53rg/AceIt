@@ -43,6 +43,7 @@ def main() -> None:
         ("atlas_interaction", "atlas_interaction"),
         ("atlas_skills", "atlas_skills"),
         ("atlas_learning", "atlas_learning"),
+        ("atlas_research", "atlas_research"),
         ("atlas_core", "atlas_core"),
         ("atlas_overlay", "atlas_overlay"),
         ("atlas_ui", "atlas_ui"),
