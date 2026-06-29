@@ -8,11 +8,13 @@ import os
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QFrame,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -134,6 +136,9 @@ class SettingsDialog(QDialog):
         self._build_memory_tab()
         self._build_context_tab()
         self._build_account_tab()
+        self._build_connectors_tab()
+        self._build_filesystem_tab()
+        self._build_ssh_tab()
         self._build_security_tab()
         self._build_hotkeys_tab()
         self._build_teaching_tab()
@@ -435,8 +440,268 @@ class SettingsDialog(QDialog):
         lay.addWidget(btn_switch)
         lay.addStretch()
         self.tabs.addTab(w, "Account")
+        self._account_tab_index = self.tabs.count() - 1
         self.tabs.currentChanged.connect(
-            lambda i: self._refresh_account() if i == 6 else None)
+            lambda i: self._refresh_account() if i == self._account_tab_index else None)
+
+    def _build_connectors_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        hdr = QLabel(
+            "<b>Connected Accounts</b> — OAuth and API integrations. "
+            "Each service shows exactly what Atlas can do.")
+        hdr.setWordWrap(True)
+        lay.addWidget(hdr)
+        self.connectors_list = QVBoxLayout()
+        self.connectors_container = QWidget()
+        self.connectors_container.setLayout(self.connectors_list)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.connectors_container)
+        lay.addWidget(scroll, 1)
+        self.tabs.addTab(w, "Connected Accounts")
+        self._connectors_tab_index = self.tabs.count() - 1
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_connectors() if i == self._connectors_tab_index else None)
+
+    def _refresh_connectors(self) -> None:
+        PAL = _get_pal()
+        client = getattr(self.ui, "_daemon_client", None)
+        while self.connectors_list.count():
+            item = self.connectors_list.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if not client:
+            self.connectors_list.addWidget(QLabel("Daemon not connected."))
+            return
+        try:
+            data = client._get("/api/connectors")
+            connectors = data.get("connectors") or []
+        except Exception as exc:
+            self.connectors_list.addWidget(QLabel(f"Could not load connectors: {exc}"))
+            return
+        if not connectors:
+            self.connectors_list.addWidget(QLabel("No connectors registered."))
+            return
+        for info in connectors:
+            box = QFrame()
+            box.setObjectName("ctrl_chrome")
+            bl = QVBoxLayout(box)
+            cid = info.get("id", "")
+            name = info.get("display_name", cid)
+            connected = info.get("connected", False)
+            status = (
+                f"<span style='color:{PAL['success']}'>Connected</span>"
+                if connected else
+                f"<span style='color:{PAL['muted']}'>Not connected</span>"
+            )
+            title = QLabel(f"<b>{name}</b> — {status}")
+            bl.addWidget(title)
+            boundary = QLabel(info.get("boundary_text") or "")
+            boundary.setWordWrap(True)
+            boundary.setStyleSheet(f"color: {PAL['text']}; font-size: 11px;")
+            bl.addWidget(boundary)
+            btn_row = QHBoxLayout()
+            if connected:
+                btn = QPushButton("Disconnect")
+                btn.clicked.connect(lambda _=False, c=cid: self._connector_toggle(c, False))
+            else:
+                btn = QPushButton("Connect")
+                btn.clicked.connect(lambda _=False, c=cid: self._connector_toggle(c, True))
+            btn_row.addWidget(btn)
+            btn_row.addStretch()
+            bl.addLayout(btn_row)
+            self.connectors_list.addWidget(box)
+
+    def _connector_toggle(self, connector_id: str, connect: bool) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        if not client:
+            return
+        path = f"/api/connectors/{connector_id}/{'connect' if connect else 'disconnect'}"
+        self.ui.bridge.set_status.emit(f"{'Connecting' if connect else 'Disconnecting'} {connector_id}…")
+
+        def _work():
+            try:
+                data = client._post(path, {})
+                msg = data.get("message", "Done")
+                self.ui.bridge.set_status.emit(msg)
+                QTimer.singleShot(0, self._refresh_connectors)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(f"Connector error: {exc}")
+
+        threading.Thread(target=_work, daemon=True, name="atlas-connector").start()
+
+    def _build_filesystem_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        hdr = QLabel(
+            "<b>Filesystem write scopes</b> — Atlas can read your home directory except "
+            "credential paths (SSH keys, .env, browser profiles). Writes are denied unless "
+            "you add a directory here. Deletes always require confirmation.")
+        hdr.setWordWrap(True)
+        lay.addWidget(hdr)
+        self.fs_scope_list = QListWidget()
+        lay.addWidget(self.fs_scope_list, 1)
+        row = QHBoxLayout()
+        self.fs_scope_path = QLineEdit()
+        self.fs_scope_path.setPlaceholderText("C:\\Users\\you\\Projects\\AtlasWorkspace")
+        row.addWidget(self.fs_scope_path, 1)
+        btn_add = QPushButton("Add scope")
+        btn_add.clicked.connect(self._fs_add_scope)
+        row.addWidget(btn_add)
+        lay.addLayout(row)
+        btn_rem = QPushButton("Remove selected scope")
+        btn_rem.clicked.connect(self._fs_remove_scope)
+        lay.addWidget(btn_rem)
+        self.tabs.addTab(w, "Filesystem")
+        self._filesystem_tab_index = self.tabs.count() - 1
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_fs_scopes() if i == self._filesystem_tab_index else None)
+
+    def _refresh_fs_scopes(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        self.fs_scope_list.clear()
+        if not client:
+            self.fs_scope_list.addItem("Daemon not connected.")
+            return
+        try:
+            data = client._get("/api/fs/write_scopes")
+            for item in data.get("scopes") or []:
+                self.fs_scope_list.addItem(f"{item.get('path')}  ({item.get('label', '')})")
+        except Exception as exc:
+            self.fs_scope_list.addItem(f"Error: {exc}")
+
+    def _fs_add_scope(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        path = self.fs_scope_path.text().strip()
+        if not (client and path):
+            return
+
+        def _work():
+            try:
+                data = client._post("/api/fs/write_scopes", {"path": path})
+                self.ui.bridge.set_status.emit(data.get("message", "Done"))
+                QTimer.singleShot(0, self._refresh_fs_scopes)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _fs_remove_scope(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        item = self.fs_scope_list.currentItem()
+        if not (client and item):
+            return
+        path = item.text().split("  (")[0].strip()
+
+        def _work():
+            try:
+                client._post("/api/fs/write_scopes/remove", {"path": path})
+                self.ui.bridge.set_status.emit("Scope removed")
+                QTimer.singleShot(0, self._refresh_fs_scopes)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _build_ssh_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        hdr = QLabel(
+            "<b>SSH targets</b> — Register remote hosts explicitly (key-based auth only). "
+            "Atlas applies the same shell allow/deny rules to remote commands.")
+        hdr.setWordWrap(True)
+        lay.addWidget(hdr)
+        self.ssh_target_list = QListWidget()
+        lay.addWidget(self.ssh_target_list, 1)
+        form = QFormLayout()
+        self.ssh_name = QLineEdit()
+        self.ssh_host = QLineEdit()
+        self.ssh_user = QLineEdit()
+        self.ssh_key = QLineEdit()
+        self.ssh_services = QLineEdit()
+        self.ssh_services.setPlaceholderText("nginx, postgresql (comma-separated, optional)")
+        form.addRow("Name", self.ssh_name)
+        form.addRow("Host", self.ssh_host)
+        form.addRow("User", self.ssh_user)
+        form.addRow("Key path", self.ssh_key)
+        form.addRow("Manageable services", self.ssh_services)
+        lay.addLayout(form)
+        row = QHBoxLayout()
+        btn_add = QPushButton("Register host")
+        btn_add.clicked.connect(self._ssh_add_target)
+        btn_rem = QPushButton("Remove selected")
+        btn_rem.clicked.connect(self._ssh_remove_target)
+        row.addWidget(btn_add)
+        row.addWidget(btn_rem)
+        row.addStretch()
+        lay.addLayout(row)
+        self.tabs.addTab(w, "SSH Targets")
+        self._ssh_tab_index = self.tabs.count() - 1
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_ssh_targets() if i == self._ssh_tab_index else None)
+
+    def _refresh_ssh_targets(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        self.ssh_target_list.clear()
+        if not client:
+            self.ssh_target_list.addItem("Daemon not connected.")
+            return
+        try:
+            data = client._get("/api/ssh/targets")
+            for item in data.get("targets") or []:
+                svc = ", ".join(item.get("manageable_services") or [])
+                self.ssh_target_list.addItem(
+                    f"{item.get('name')} — {item.get('user')}@{item.get('host')}  [{svc}]")
+        except Exception as exc:
+            self.ssh_target_list.addItem(f"Error: {exc}")
+
+    def _ssh_add_target(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        if not client:
+            return
+        body = {
+            "name": self.ssh_name.text().strip(),
+            "host": self.ssh_host.text().strip(),
+            "user": self.ssh_user.text().strip(),
+            "key_path": self.ssh_key.text().strip(),
+            "manageable_services": [
+                s.strip() for s in self.ssh_services.text().split(",") if s.strip()
+            ],
+        }
+        if not all(body[k] for k in ("name", "host", "user", "key_path")):
+            self.ui.bridge.set_status.emit("Fill in name, host, user, and key path.")
+            return
+
+        def _work():
+            try:
+                data = client._post("/api/ssh/targets", body)
+                self.ui.bridge.set_status.emit(data.get("message", "Done"))
+                QTimer.singleShot(0, self._refresh_ssh_targets)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _ssh_remove_target(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        item = self.ssh_target_list.currentItem()
+        if not (client and item):
+            return
+        name = item.text().split(" — ")[0].strip()
+
+        def _work():
+            try:
+                client._post("/api/ssh/targets/remove", {"name": name})
+                self.ui.bridge.set_status.emit("SSH target removed")
+                QTimer.singleShot(0, self._refresh_ssh_targets)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _refresh_account(self) -> None:
         PAL = _get_pal()

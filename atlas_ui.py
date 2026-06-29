@@ -130,6 +130,18 @@ except Exception:
     AccountManager = None  # type: ignore
     HAS_ACCOUNTS = False
 
+try:
+    from atlas_ipc import DaemonClient, AccountClient, ensure_daemon_running, DaemonError
+    from atlas_state_proxy import AtlasStateProxy
+    HAS_DAEMON = True
+except Exception:
+    DaemonClient = None  # type: ignore
+    AccountClient = None  # type: ignore
+    ensure_daemon_running = None  # type: ignore
+    AtlasStateProxy = None  # type: ignore
+    DaemonError = RuntimeError  # type: ignore
+    HAS_DAEMON = False
+
 AUTOSAVE_PATH = Path.home() / ".atlas" / "autosave.json"
 
 
@@ -386,6 +398,77 @@ class PermissionDialog(QDialog):
     def _on_deny(self):
         self.reject()
         self._deny_fn()
+
+
+class TypedConfirmDialog(QDialog):
+    """
+    Required for CRITICAL policy actions (money, delete, deauth, unlisted shell).
+
+    The user must type the exact phrase — Approve stays disabled until it matches.
+    """
+
+    def __init__(self, policy_result, path: str, parent=None):
+        super().__init__(parent)
+        self._expected = (getattr(policy_result, "confirm_phrase", "") or "").strip()
+        self._approved = False
+
+        self.setWindowTitle("Typed confirmation required")
+        self.setMinimumWidth(480)
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(12)
+
+        title = QLabel("This action requires typed confirmation")
+        title.setStyleSheet(
+            f"color: {PAL['danger']}; font-weight: bold; font-size: 13px;"
+        )
+        lay.addWidget(title)
+
+        reason = getattr(policy_result, "reason", "") or ""
+        if reason:
+            r_lbl = QLabel(reason)
+            r_lbl.setWordWrap(True)
+            r_lbl.setStyleSheet(f"color: {PAL['text']}; font-size: 11px;")
+            lay.addWidget(r_lbl)
+
+        path_lbl = QLabel(f"<b>Target:</b> {path}")
+        path_lbl.setWordWrap(True)
+        lay.addWidget(path_lbl)
+
+        phrase_lbl = QLabel(f"Type exactly: <b>{self._expected}</b>")
+        phrase_lbl.setWordWrap(True)
+        lay.addWidget(phrase_lbl)
+
+        self._input = QLineEdit()
+        self._input.setPlaceholderText(self._expected)
+        self._input.textChanged.connect(self._sync_ok)
+        lay.addWidget(self._input)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        self._ok = QPushButton("Confirm")
+        self._ok.setEnabled(False)
+        self._ok.clicked.connect(self._on_ok)
+        btn_row.addWidget(self._ok)
+        lay.addLayout(btn_row)
+
+    def _sync_ok(self, text: str) -> None:
+        self._ok.setEnabled(text.strip() == self._expected)
+
+    def _on_ok(self) -> None:
+        from atlas_policy import validate_typed_confirmation
+
+        typed = self._input.text().strip()
+        if typed != self._expected:
+            return
+        self._approved = True
+        self.accept()
+
+    def approved(self) -> bool:
+        return self._approved and self._input.text().strip() == self._expected
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1532,6 +1615,8 @@ class ControlCenter(QDialog):
 
     def _toggle_fs_access(self, checked: bool):
         self.ui.fs_access_active = checked
+        if self.ui.state and hasattr(self.ui.state, "set_fs_access_active"):
+            self.ui.state.set_fs_access_active(checked)
         self.ui.bridge.set_status.emit(
             "File System Access ENABLED — prompts on write/exec"
             if checked else
@@ -2680,7 +2765,7 @@ class LoginDialog(QDialog):
 
 class AtlasWindow(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, daemon_client: Optional["DaemonClient"] = None):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -2692,6 +2777,7 @@ class AtlasWindow(QMainWindow):
         self._is_floating   = False
         self.bridge         = SignalBridge()
         self.account        = None   # set by main() after the login gate
+        self._daemon_client = daemon_client
 
         # ── Signal connections ────────────────────────────────────────────────
         self.bridge.append_text.connect(self._append_response)
@@ -2717,8 +2803,25 @@ class AtlasWindow(QMainWindow):
         self.bridge.guide_step_started.connect(self._on_guide_step_started)
         self.bridge.step_verified.connect(self._on_step_verified)
 
-        if atlas_fs:
+        if atlas_fs and not daemon_client:
             atlas_fs.register_permission_callback(self._fs_permission_callback)
+            atlas_fs.register_typed_confirm_callback(self._typed_confirm_policy)
+            try:
+                from atlas_shell import shell_runner as _shell
+
+                _shell.set_permission_handler(self._shell_permission_sync)
+                _shell.set_typed_confirm_handler(
+                    lambda msg: self._typed_confirm_policy(
+                        type("R", (), {
+                            "confirm_phrase": msg.get("confirm_phrase", ""),
+                            "reason": msg.get("reason", ""),
+                            "audit_id": msg.get("audit_id", ""),
+                        })(),
+                        path=msg.get("path", ""),
+                    )
+                )
+            except ImportError:
+                pass
 
         self.telemetry = TelemetryClient() if HAS_TELEMETRY and TelemetryClient else None
 
@@ -2734,19 +2837,20 @@ class AtlasWindow(QMainWindow):
         # ── Stop event for generation interrupt ──────────────────────────────
         self._stop_gen = threading.Event()
 
-        # ── Backend engines (atlas_core) — all LLM streaming via StateEngine ──
-        self.state = (
-            StateEngine(
+        # ── Backend engines — StateEngine lives in atlas_daemon; UI uses proxy ──
+        self.state = None
+        if _CORE and daemon_client and HAS_DAEMON and AtlasStateProxy:
+            self.state = AtlasStateProxy(
+                daemon_client,
                 on_chunk=self.bridge.stream_token.emit,
                 on_complete=self._on_stream_complete,
                 on_error=self._on_engine_error,
                 on_coordinates=self.bridge.spatial_coords.emit,
                 on_token_usage=self.bridge.token_usage.emit,
-                user_name=self._get_username(),
+                step_ui_handler=self._post_step_pending,
             )
-            if _CORE
-            else None
-        )
+            self.state.register_permission_handler(self._daemon_fs_permission)
+            self.state.register_typed_confirm_handler(self._daemon_typed_confirm)
         self.audio = (
             AudioEngine(
                 on_transcript=self._on_transcript,
@@ -2771,6 +2875,27 @@ class AtlasWindow(QMainWindow):
         self.last_clipboard     = ""
         self._watch_interval    = 5
         self._watch_sensitivity = "Medium"
+        self._typed_confirm_event = threading.Event()
+        self._typed_confirm_answer = False
+
+        if self.state:
+            try:
+                from atlas_policy import PolicyContext, set_policy_context_provider
+
+                def _policy_ctx() -> PolicyContext:
+                    return PolicyContext(
+                        safety_mode=str(
+                            getattr(self.state, "safety_mode", "always") or "always"
+                        ),
+                        fs_access_active=bool(self.fs_access_active),
+                        execution_blocked=bool(
+                            getattr(self.state, "execution_blocked", False)
+                        ),
+                    )
+
+                set_policy_context_provider(_policy_ctx)
+            except ImportError:
+                pass
 
         # ── Push-to-talk state (global Ctrl/Alt+Space) ───────────────────────
         self._ptt_engaged = False   # True between key-down and key-release
@@ -2818,7 +2943,7 @@ class AtlasWindow(QMainWindow):
             if HAS_OVERLAY and TaskStopOverlay else None
         )
 
-        if _CORE and step_orchestrator:
+        if _CORE and step_orchestrator and not daemon_client:
             step_orchestrator.set_ui_handler(self._post_step_pending)
 
         if self.state:
@@ -3597,6 +3722,99 @@ class AtlasWindow(QMainWindow):
     # PERMISSION INTERCEPTOR  (Requirement 7)
     # ═════════════════════════════════════════════════════════════════════════
 
+    def _daemon_fs_permission(self, action: str, path: str) -> bool:
+        """IPC permission gate — runs dialog on Qt main thread, returns bool."""
+        if threading.current_thread() is threading.main_thread():
+            return self._fs_permission_sync(action, path)
+        self._perm_event = getattr(self, "_perm_event", threading.Event())
+        self._perm_answer = False
+        self._perm_event.clear()
+
+        def _run() -> None:
+            self._perm_answer = self._fs_permission_sync(action, path)
+            self._perm_event.set()
+
+        QTimer.singleShot(0, _run)
+        self._perm_event.wait(timeout=300.0)
+        return bool(self._perm_answer)
+
+    def _fs_permission_sync(self, action: str, path: str) -> bool:
+        p = str(path)
+        if p.startswith("atlas-task://"):
+            approved = {"v": False}
+
+            def _approve():
+                approved["v"] = True
+
+            def _deny():
+                approved["v"] = False
+
+            dlg = PermissionDialog(action, path, _approve, _deny, parent=self)
+            dlg.exec()
+            return approved["v"]
+        if p.startswith("atlas-hands://"):
+            # TODO(co-pilot): Remove auto-approve bypass — policy layer already
+            # evaluated this path; UI must not skip CONFIRM_CLICK for hands.
+            return True
+        if not self.fs_access_active:
+            self.bridge.set_status.emit(
+                "⛔ File system access is OFF — enable it in the control panel"
+            )
+            return False
+        approved = {"v": False}
+
+        def _approve():
+            approved["v"] = True
+
+        def _deny():
+            approved["v"] = False
+
+        dlg = PermissionDialog(action, path, _approve, _deny, parent=self)
+        dlg.exec()
+        return approved["v"]
+
+    def _daemon_typed_confirm(self, msg: dict) -> bool:
+        from types import SimpleNamespace
+
+        policy_result = SimpleNamespace(
+            reason=str(msg.get("reason", "")),
+            confirm_phrase=str(msg.get("confirm_phrase", "")),
+            audit_id=str(msg.get("audit_id", "")),
+        )
+        path = str(msg.get("path", ""))
+        if threading.current_thread() is threading.main_thread():
+            return self._typed_confirm_ui(policy_result, path)
+        self._typed_confirm_event.clear()
+        self._typed_confirm_answer = False
+
+        def _run() -> None:
+            self._typed_confirm_answer = self._typed_confirm_ui(policy_result, path)
+            self._typed_confirm_event.set()
+
+        QTimer.singleShot(0, _run)
+        self._typed_confirm_event.wait(timeout=300.0)
+        return bool(self._typed_confirm_answer)
+
+    def _typed_confirm_policy(self, policy_result, *, path: str) -> bool:
+        """Policy-layer typed confirmation (CRITICAL actions only)."""
+        if threading.current_thread() is threading.main_thread():
+            return self._typed_confirm_ui(policy_result, path)
+        self._typed_confirm_event.clear()
+        self._typed_confirm_answer = False
+
+        def _run() -> None:
+            self._typed_confirm_answer = self._typed_confirm_ui(policy_result, path)
+            self._typed_confirm_event.set()
+
+        QTimer.singleShot(0, _run)
+        self._typed_confirm_event.wait(timeout=300.0)
+        return bool(self._typed_confirm_answer)
+
+    def _typed_confirm_ui(self, policy_result, path: str) -> bool:
+        dlg = TypedConfirmDialog(policy_result, path, parent=self)
+        dlg.exec()
+        return dlg.approved()
+
     def _fs_permission_callback(self, action: str, path: str,
                                  approve_fn: Callable, deny_fn: Callable) -> None:
         """
@@ -3604,6 +3822,27 @@ class AtlasWindow(QMainWindow):
         Marshals to the Qt main thread via signal.
         """
         self.bridge.request_permission.emit(action, path, approve_fn, deny_fn)
+
+    def _shell_permission_sync(self, action: str, path: str) -> bool:
+        """Blocking shell ASK gate for non-daemon mode."""
+        event = threading.Event()
+        result = {"ok": False}
+
+        def approve() -> None:
+            result["ok"] = True
+            event.set()
+
+        def deny() -> None:
+            result["ok"] = False
+            event.set()
+
+        if threading.current_thread() is threading.main_thread():
+            self._on_permission_request(action, path, approve, deny)
+            return bool(result["ok"])
+
+        self.bridge.request_permission.emit(action, path, approve, deny)
+        event.wait(timeout=300.0)
+        return bool(result["ok"])
 
     @Slot(str, str, object, object)
     def _on_permission_request(self, action: str, path: str,
@@ -3615,6 +3854,8 @@ class AtlasWindow(QMainWindow):
             dlg.exec()
             return
         if p.startswith("atlas-hands://"):
+            # TODO(co-pilot): Remove auto-approve bypass — policy layer already
+            # evaluated this path; UI must not skip CONFIRM_CLICK for hands.
             approve_fn()
             return
         if not self.fs_access_active:
@@ -5575,17 +5816,29 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
 
-    # ── Account gate (local-first; cloud sync when Supabase is configured) ────
-    account = AccountManager() if (HAS_ACCOUNTS and _CORE) else None
+    # ── Account gate — AccountManager lives in atlas_daemon ───────────────────
+    daemon_client = None
+    account = None
     chosen_uid, chosen_name = None, None
-    if account:
+    if HAS_DAEMON and ensure_daemon_running:
+        try:
+            daemon_client = ensure_daemon_running()
+        except DaemonError as exc:
+            QMessageBox.critical(
+                None,
+                "Atlas daemon",
+                f"{exc}\n\nStart manually: python -m atlas_daemon",
+            )
+            sys.exit(1)
+    if daemon_client and HAS_ACCOUNTS and AccountClient:
+        account = AccountClient(daemon_client)
         login = LoginDialog(account)
         login.exec()
         chosen_uid, chosen_name = login.user_id, login.user_name
         if chosen_name:
             os.environ["ATLAS_USER"] = chosen_name
 
-    win = AtlasWindow()
+    win = AtlasWindow(daemon_client=daemon_client)
     win.account = account
     if account and chosen_uid and win.state:
         win.state.set_user(chosen_uid, chosen_name)

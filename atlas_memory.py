@@ -181,6 +181,114 @@ class UserMemory:
                 )
                 """
             )
+            # Daemon scheduler: crash-safe job state persisted after every step.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    name TEXT NOT NULL DEFAULT '',
+                    job_type TEXT NOT NULL DEFAULT 'generic',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    steps_json TEXT NOT NULL DEFAULT '[]',
+                    current_step INTEGER NOT NULL DEFAULT 0,
+                    step_state_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    started_at REAL,
+                    completed_at REAL
+                )
+                """
+            )
+            # Reusable distilled procedures learned from repeated TASK/GUIDE runs.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS playbooks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    task_signature TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    steps_json TEXT NOT NULL DEFAULT '[]',
+                    success_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    last_used REAL,
+                    avg_duration_s REAL NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0.75,
+                    created REAL NOT NULL,
+                    UNIQUE(user_id, task_signature),
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            # Individual successful runs — used to trigger playbook synthesis on 2nd+ run.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS playbook_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    task_signature TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    steps_json TEXT NOT NULL DEFAULT '[]',
+                    success INTEGER NOT NULL DEFAULT 0,
+                    had_corrections INTEGER NOT NULL DEFAULT 0,
+                    duration_s REAL NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'task',
+                    created REAL NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_job_defs (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    job_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    trigger_json TEXT NOT NULL DEFAULT '{}',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_pending (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    action_type TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    risk_class TEXT NOT NULL,
+                    confirm_phrase TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    audit_id TEXT NOT NULL DEFAULT '',
+                    job_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created REAL NOT NULL,
+                    resolved REAL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'scheduled',
+                    category TEXT NOT NULL DEFAULT 'general',
+                    summary TEXT NOT NULL,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    created REAL NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
             self._migrate(conn)
 
     # Additive, idempotent column migrations on the users table — keeps existing
@@ -830,3 +938,510 @@ class UserMemory:
             "uses": uses,
             "last_used": last,
         }
+
+    # ── Scheduled jobs (daemon scheduler, crash-safe) ─────────────────────────
+
+    def create_scheduled_job(
+        self,
+        *,
+        user_id: int = 0,
+        name: str = "",
+        job_type: str = "generic",
+        steps: list[dict] | None = None,
+    ) -> int:
+        now = time.time()
+        payload = json.dumps(steps or [])
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO scheduled_jobs
+                    (user_id, name, job_type, status, steps_json, current_step,
+                     step_state_json, error, created, updated)
+                VALUES (?, ?, ?, 'pending', ?, 0, '{}', '', ?, ?)
+                """,
+                (user_id, name or "job", job_type, payload, now, now),
+            )
+            return int(cur.lastrowid)
+
+    def get_scheduled_job(self, job_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._job_row_to_dict(row)
+
+    def list_resumable_jobs(self) -> list[dict[str, Any]]:
+        """Jobs that should continue after daemon restart."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM scheduled_jobs
+                WHERE status IN ('pending', 'running')
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        return [self._job_row_to_dict(r) for r in rows]
+
+    def update_scheduled_job(
+        self,
+        job_id: int,
+        *,
+        status: str | None = None,
+        current_step: int | None = None,
+        step_state: dict | None = None,
+        error: str | None = None,
+        started_at: float | None = None,
+        completed_at: float | None = None,
+    ) -> None:
+        fields: list[str] = ["updated = ?"]
+        values: list[Any] = [time.time()]
+        if status is not None:
+            fields.append("status = ?")
+            values.append(status)
+        if current_step is not None:
+            fields.append("current_step = ?")
+            values.append(current_step)
+        if step_state is not None:
+            fields.append("step_state_json = ?")
+            values.append(json.dumps(step_state))
+        if error is not None:
+            fields.append("error = ?")
+            values.append(error)
+        if started_at is not None:
+            fields.append("started_at = ?")
+            values.append(started_at)
+        if completed_at is not None:
+            fields.append("completed_at = ?")
+            values.append(completed_at)
+        values.append(job_id)
+        sql = f"UPDATE scheduled_jobs SET {', '.join(fields)} WHERE id = ?"
+        with self._write_lock, self._connect() as conn:
+            conn.execute(sql, values)
+
+    @staticmethod
+    def _job_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        steps_raw = row["steps_json"] or "[]"
+        state_raw = row["step_state_json"] or "{}"
+        try:
+            steps = json.loads(steps_raw)
+        except json.JSONDecodeError:
+            steps = []
+        try:
+            step_state = json.loads(state_raw)
+        except json.JSONDecodeError:
+            step_state = {}
+        return {
+            "id": int(row["id"]),
+            "user_id": int(row["user_id"] or 0),
+            "name": row["name"] or "",
+            "job_type": row["job_type"] or "generic",
+            "status": row["status"] or "pending",
+            "steps": steps,
+            "current_step": int(row["current_step"] or 0),
+            "step_state": step_state,
+            "error": row["error"] or "",
+            "created": float(row["created"] or 0),
+            "updated": float(row["updated"] or 0),
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+        }
+
+    # ── Playbooks (distilled TASK/GUIDE procedures) ───────────────────────────
+
+    def record_playbook_run(
+        self,
+        user_id: int,
+        *,
+        task_signature: str,
+        goal: str,
+        steps: list[dict[str, Any]],
+        success: bool,
+        had_corrections: bool = False,
+        duration_s: float = 0.0,
+        source: str = "task",
+    ) -> int:
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO playbook_runs
+                    (user_id, task_signature, goal, steps_json, success,
+                     had_corrections, duration_s, source, created)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    task_signature,
+                    goal,
+                    json.dumps(steps),
+                    1 if success else 0,
+                    1 if had_corrections else 0,
+                    float(duration_s or 0),
+                    source,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def count_successful_playbook_runs(self, user_id: int, task_signature: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM playbook_runs
+                WHERE user_id = ? AND task_signature = ? AND success = 1
+                """,
+                (user_id, task_signature),
+            ).fetchone()
+        return int(row["c"] if row else 0)
+
+    def upsert_playbook(
+        self,
+        user_id: int,
+        *,
+        task_signature: str,
+        goal: str,
+        steps_json: str,
+        duration_s: float = 0.0,
+    ) -> int:
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT id, avg_duration_s FROM playbooks
+                WHERE user_id = ? AND task_signature = ?
+                """,
+                (user_id, task_signature),
+            ).fetchone()
+            if existing:
+                pid = int(existing["id"])
+                prev_avg = float(existing["avg_duration_s"] or 0)
+                new_avg = duration_s if prev_avg <= 0 else (prev_avg + duration_s) / 2.0
+                conn.execute(
+                    """
+                    UPDATE playbooks
+                    SET goal = ?, steps_json = ?, last_used = ?,
+                        avg_duration_s = ?, confidence = MIN(1.0, confidence + 0.05)
+                    WHERE id = ?
+                    """,
+                    (goal, steps_json, now, new_avg, pid),
+                )
+                return pid
+            cur = conn.execute(
+                """
+                INSERT INTO playbooks
+                    (user_id, task_signature, goal, steps_json, last_used,
+                     avg_duration_s, confidence, created)
+                VALUES (?, ?, ?, ?, ?, ?, 0.75, ?)
+                """,
+                (user_id, task_signature, goal, steps_json, now, duration_s, now),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_playbook(self, user_id: int, task_signature: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM playbooks
+                WHERE user_id = ? AND task_signature = ?
+                """,
+                (user_id, task_signature),
+            ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        try:
+            data["steps"] = json.loads(data.get("steps_json") or "[]")
+        except Exception:
+            data["steps"] = []
+        return data
+
+    def list_playbooks(self, user_id: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, task_signature, goal, success_count, failure_count,
+                       last_used, avg_duration_s, confidence, created
+                FROM playbooks WHERE user_id = ?
+                ORDER BY last_used DESC, created DESC
+                """,
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_playbook_outcome(
+        self,
+        user_id: int,
+        task_signature: str,
+        *,
+        success: bool,
+        duration_s: float = 0.0,
+        had_corrections: bool = False,
+    ) -> None:
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, success_count, failure_count, avg_duration_s
+                FROM playbooks WHERE user_id = ? AND task_signature = ?
+                """,
+                (user_id, task_signature),
+            ).fetchone()
+            if not row:
+                return
+            pid = int(row["id"])
+            sc = int(row["success_count"] or 0)
+            fc = int(row["failure_count"] or 0)
+            prev_avg = float(row["avg_duration_s"] or 0)
+            if success:
+                sc += 1
+                new_avg = duration_s if prev_avg <= 0 else (prev_avg + duration_s) / 2.0
+                conf_delta = 0.03
+            else:
+                fc += 1
+                new_avg = prev_avg
+                conf_delta = -0.08
+            conn.execute(
+                """
+                UPDATE playbooks
+                SET success_count = ?, failure_count = ?, last_used = ?,
+                    avg_duration_s = ?,
+                    confidence = MAX(0.1, MIN(1.0, confidence + ?))
+                WHERE id = ?
+                """,
+                (sc, fc, now, new_avg, conf_delta, pid),
+            )
+            if had_corrections and success:
+                conn.execute(
+                    "UPDATE playbooks SET failure_count = failure_count + 1 WHERE id = ?",
+                    (pid,),
+                )
+
+    def decay_stale_playbooks(self, days_threshold: int = 90, decay: float = 0.03) -> int:
+        """Lower confidence for playbooks unused for a long time."""
+        cutoff = time.time() - (days_threshold * 86400)
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE playbooks
+                SET confidence = MAX(0.1, confidence - ?)
+                WHERE (last_used IS NULL OR last_used < ?) AND confidence > 0.1
+                """,
+                (decay, cutoff),
+            )
+            return int(cur.rowcount or 0)
+
+    def prune_bad_playbooks(self) -> int:
+        """Remove playbooks that fail more often than they succeed."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM playbooks
+                WHERE failure_count > success_count AND success_count < 2
+                """
+            )
+            return int(cur.rowcount or 0)
+
+    # ── APScheduler job defs, activity log, pending approvals ─────────────────
+
+    def upsert_scheduler_job_def(
+        self,
+        user_id: int,
+        *,
+        job_id: str,
+        job_type: str,
+        name: str,
+        payload: dict[str, Any],
+        trigger: dict[str, Any],
+        enabled: bool = True,
+    ) -> None:
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scheduler_job_defs
+                    (id, user_id, job_type, name, payload_json, trigger_json, enabled, created, updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    job_type = excluded.job_type,
+                    name = excluded.name,
+                    payload_json = excluded.payload_json,
+                    trigger_json = excluded.trigger_json,
+                    enabled = excluded.enabled,
+                    updated = excluded.updated
+                """,
+                (
+                    job_id,
+                    user_id,
+                    job_type,
+                    name,
+                    json.dumps(payload),
+                    json.dumps(trigger),
+                    1 if enabled else 0,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_scheduler_job_def(self, job_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduler_job_defs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        try:
+            data["payload"] = json.loads(data.get("payload_json") or "{}")
+        except Exception:
+            data["payload"] = {}
+        try:
+            data["trigger"] = json.loads(data.get("trigger_json") or "{}")
+        except Exception:
+            data["trigger"] = {}
+        return data
+
+    def list_scheduler_job_defs(self, user_id: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, job_type, name, enabled, created, updated
+                FROM scheduler_job_defs WHERE user_id = ?
+                ORDER BY updated DESC
+                """,
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def log_scheduler_activity(
+        self,
+        user_id: int,
+        *,
+        source: str,
+        category: str,
+        summary: str,
+        detail: dict[str, Any] | None = None,
+        status: str = "completed",
+    ) -> int:
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO scheduler_activity
+                    (user_id, source, category, summary, detail_json, status, created)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    source,
+                    category,
+                    summary,
+                    json.dumps(detail or {}),
+                    status,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_scheduler_activity(
+        self,
+        user_id: int,
+        *,
+        since: float | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if since is not None:
+                rows = conn.execute(
+                    """
+                    SELECT source, category, summary, detail_json, status, created
+                    FROM scheduler_activity
+                    WHERE user_id = ? AND created >= ?
+                    ORDER BY created DESC LIMIT ?
+                    """,
+                    (user_id, since, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT source, category, summary, detail_json, status, created
+                    FROM scheduler_activity
+                    WHERE user_id = ?
+                    ORDER BY created DESC LIMIT ?
+                    """,
+                    (user_id, limit),
+                ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["detail"] = json.loads(item.pop("detail_json") or "{}")
+            except Exception:
+                item["detail"] = {}
+            out.append(item)
+        return out
+
+    def queue_scheduler_pending(
+        self,
+        user_id: int,
+        *,
+        action_type: str,
+        detail: str,
+        risk_class: str,
+        confirm_phrase: str = "",
+        reason: str = "",
+        audit_id: str = "",
+        job_id: str = "",
+    ) -> int:
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO scheduler_pending
+                    (user_id, action_type, detail, risk_class, confirm_phrase,
+                     reason, audit_id, job_id, status, created)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    user_id,
+                    action_type,
+                    detail,
+                    risk_class,
+                    confirm_phrase,
+                    reason,
+                    audit_id,
+                    job_id,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_scheduler_pending(self, user_id: int, *, status: str = "pending") -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, action_type, detail, risk_class, confirm_phrase,
+                       reason, audit_id, job_id, status, created
+                FROM scheduler_pending
+                WHERE user_id = ? AND status = ?
+                ORDER BY created DESC
+                """,
+                (user_id, status),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_scheduler_pending(self, pending_id: int, *, approved: bool) -> None:
+        now = time.time()
+        status = "approved" if approved else "denied"
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE scheduler_pending
+                SET status = ?, resolved = ?
+                WHERE id = ?
+                """,
+                (status, now, pending_id),
+            )

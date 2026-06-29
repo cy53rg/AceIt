@@ -9,7 +9,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from atlas_memory import UserMemory
 
@@ -198,6 +198,7 @@ class LearningEngine:
         self.memory = memory
         self.user_id = user_id
         self.teaching = TeachingPerformanceTracker()
+        self._playbook_persist_hook: Optional[Callable[[bool], None]] = None
         self._turn_count = 0
         self._recent_responses: list[str] = []
         self._pending_correction: Optional[str] = None
@@ -275,6 +276,7 @@ class LearningEngine:
         key = snap.get("task_key") or ""
         counters = snap.get("counters") or {}
         if not key or int(counters.get("steps_total") or 0) == 0:
+            self._invoke_playbook_hook(success=False)
             return
         diag = self.get_self_diagnosis()
         success = (
@@ -290,6 +292,19 @@ class LearningEngine:
             )
         except Exception as exc:
             log.warning("persist_teaching_rollup failed: %s", exc)
+        self._invoke_playbook_hook(success=success)
+
+    def set_playbook_persist_hook(self, hook: Optional[Callable[[bool], None]]) -> None:
+        self._playbook_persist_hook = hook
+
+    def _invoke_playbook_hook(self, *, success: bool) -> None:
+        hook = getattr(self, "_playbook_persist_hook", None)
+        if hook is None:
+            return
+        try:
+            hook(success)
+        except Exception as exc:
+            log.warning("playbook persist hook failed: %s", exc)
 
     def get_teaching_hint(self, goal: str) -> str | None:
         """Past-session hint when this task type struggled before."""
@@ -368,6 +383,47 @@ class LearningEngine:
                 log.info("Decayed %d stale facts", count)
         except Exception as exc:
             log.warning("decay_stale_facts failed: %s", exc)
+
+    def run_weekly_diagnostics(self, recent_responses: list[str] | None = None) -> dict[str, Any]:
+        """Weekly persona-drift + teaching self-check (not gated on turn count)."""
+        responses = list(recent_responses if recent_responses is not None else self._recent_responses)
+        persona_drift = self.check_persona_drift(responses) if responses else None
+        teaching_critique = None
+        if responses:
+            teaching_critique = self._weekly_teaching_critique(responses)
+        return {
+            "persona_drift": persona_drift,
+            "teaching_diagnosis": self.get_self_diagnosis(),
+            "teaching_critique": teaching_critique,
+        }
+
+    def _weekly_teaching_critique(self, recent_responses: list[str]) -> str | None:
+        client = self._get_groq()
+        if client is None or not recent_responses:
+            return None
+        snap = self.teaching.snapshot()
+        diag = self.get_self_diagnosis()
+        prompt = (
+            "Weekly teaching review. Based on session stats and recent assistant replies, "
+            "give 2-3 sentences on what to improve next week.\n\n"
+            f"STATS: {json.dumps({k: diag.get(k) for k in diag if k != 'recent_discrepancies'})}\n"
+            f"RECENT:\n" + "\n---\n".join(recent_responses[-8:])[:3000]
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=ATLAS_FAST_MODEL,
+                messages=[
+                    {"role": "system", "content": "Reply in 2-3 plain sentences only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=180,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            return f"Weekly teaching note: {text}" if text else None
+        except Exception as exc:
+            log.debug("weekly teaching critique failed: %s", exc)
+            return None
 
     def check_persona_drift(self, recent_responses: list[str]) -> str | None:
         """Compare sampled tone to baseline; return correction string or None."""

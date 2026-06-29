@@ -31,6 +31,23 @@ installs the Python wrapper; you must install the Tesseract program once.
 
       python atlas_ui.py
 
+   The UI connects to atlas_daemon (background process). If the daemon is not
+   running, atlas_ui.py will try to start it automatically. You can also run it
+   manually:
+
+      python -m atlas_daemon
+
+8) (Recommended) Install the daemon to start at Windows logon with auto-restart:
+
+      powershell -ExecutionPolicy Bypass -File scripts\install_atlas_daemon.ps1
+
+   Uninstall:
+
+      powershell -ExecutionPolicy Bypass -File scripts\uninstall_atlas_daemon.ps1
+
+   The daemon listens on 127.0.0.1:17847 only (override with ATLAS_DAEMON_PORT).
+   SQLite and job state live under %LOCALAPPDATA%\Atlas\.
+
 If OCR fails with "tesseract is not installed": fix the path — either add the Tesseract
 folder to your user PATH or set the environment variable TESSERACT_CMD to the full path
 of tesseract.exe, for example:

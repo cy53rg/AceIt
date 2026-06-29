@@ -486,8 +486,16 @@ Available actions:
   {"action":"hotkey","keys":["ctrl","l"],"expect":"<...>"}
   {"action":"scroll","amount":<negative=down, positive=up>,"expect":"<...>"}
   {"action":"wait","seconds":<number>}                       let the UI load
+  {"action":"connector","service":"<github|paystack|gmail|notion>","method":"<named action>", ...method params}
   {"action":"done","summary":"<what was accomplished>"}
   {"action":"fail","reason":"<why you cannot continue>"}
+
+Connector actions (explicit methods only — no free-form API calls):
+  github.list_issues      {"service":"github","method":"list_issues","repo":"owner/name"}
+  github.create_issue     {"service":"github","method":"create_issue","repo":"owner/name","title":"...","body":"..."}
+  paystack.get_balance    {"service":"paystack","method":"get_balance"}
+  paystack.initiate_transfer  {"service":"paystack","method":"initiate_transfer","recipient":"...","amount_kobo":1000,"reason":"..."}
+  Every connector action is policy-gated; financial actions always require typed user confirmation.
 
 Rules:
   - Pick the SINGLE best next action for what is ACTUALLY visible right now.
@@ -998,7 +1006,41 @@ class StateEngine:
             return last_result, False
         return last_result, True
 
-    def run_task(self, task: str) -> None:
+    def _run_connector_action(self, decision: dict) -> str:
+        """Execute a named connector method through PolicyEngine (never pre-trusted)."""
+        reg = getattr(self, "connectors", None)
+        if reg is None:
+            return "error: connector registry not available"
+        service = str(decision.get("service") or decision.get("connector") or "").strip().lower()
+        method = str(decision.get("method") or "").strip()
+        if not service or not method:
+            return "error: connector action requires service and method"
+        params = {
+            k: v for k, v in decision.items()
+            if k not in ("action", "say", "thought", "service", "connector", "method", "expect", "expected_state")
+        }
+        result = reg.execute(
+            service,
+            method,
+            safety_mode=str(getattr(self, "safety_mode", "always") or "always"),
+            fs_access_active=bool(getattr(self, "_fs_access_active", False)),
+            execution_blocked=bool(getattr(self, "execution_blocked", False)),
+            **params,
+        )
+        if result.get("ok"):
+            payload = result.get("result", result)
+            return f"connector {service}.{method}: {json.dumps(payload)[:500]}"
+        if result.get("denied"):
+            return f"connector denied ({result.get('decision')}): {result.get('reason', 'denied')}"
+        return f"connector error: {result.get('error') or result.get('reason', 'unknown')}"
+
+    def run_task(
+        self,
+        task: str,
+        *,
+        force_fresh: bool = False,
+        use_playbook: bool = False,
+    ) -> None:
         """Run the autonomous task loop off-thread after optional safety confirmation."""
         task = (task or "").strip()
         if not task:
@@ -1012,6 +1054,26 @@ class StateEngine:
             self._announce("Agent actions are paused — check your account status.")
             return
 
+        if not force_fresh and not use_playbook:
+            proposal = self.playbooks.check_proposal(task)
+            if proposal:
+                self._playbook_proposal = proposal
+                self._announce(proposal["message"])
+                return
+
+        self._reset_procedure_session()
+        self._task_used_playbook = bool(use_playbook and self._playbook_proposal)
+        if self._task_used_playbook and self._playbook_proposal:
+            self._task_playbook_sig = str(self._playbook_proposal.get("task_signature") or "")
+        else:
+            self._task_playbook_sig = None
+        self._playbook_force_fresh = force_fresh
+        if use_playbook and self._playbook_proposal:
+            steps = self._playbook_proposal.get("steps") or []
+            if steps:
+                self._start_task_thread(task, playbook_steps=steps)
+                return
+
         mode = (getattr(self, "safety_mode", "off") or "off").lower()
         self._task_trusted_ok = False
         if mode == "trusted" and self._task_confirm_cb is not None:
@@ -1020,13 +1082,150 @@ class StateEngine:
                 return
             self._task_trusted_ok = True
 
+        self._start_task_thread(task)
+
+    def _start_task_thread(
+        self,
+        task: str,
+        *,
+        playbook_steps: Optional[list[dict]] = None,
+    ) -> None:
         self._task_running = True
         self._task_stop = threading.Event()
+        mode = (getattr(self, "safety_mode", "off") or "off").lower()
         atlas_hands.auto_approve = mode in ("off", "trusted")
         self._emit("task_running", {"active": True, "task": task})
+        if playbook_steps:
+            target = self._run_playbook_task
+            args: tuple = (task, playbook_steps)
+        else:
+            target = self._task_loop
+            args = (task,)
         threading.Thread(
-            target=self._task_loop, args=(task,), daemon=True, name="atlas-task"
+            target=target, args=args, daemon=True, name="atlas-task"
         ).start()
+
+    def _run_startup_decay(self) -> None:
+        try:
+            self.learning.run_decay()
+            self.playbooks.run_maintenance()
+        except Exception as exc:
+            log.warning("startup decay/maintenance failed: %s", exc)
+
+    def _reset_procedure_session(self) -> None:
+        self._procedure_steps = []
+        self._procedure_started_at = time.time()
+        self._last_task_succeeded = False
+
+    def _record_procedure_step(self, step: dict) -> None:
+        if not step:
+            return
+        if not hasattr(self, "_procedure_steps") or self._procedure_steps is None:
+            self._procedure_steps = []
+        self._procedure_steps.append(dict(step))
+
+    def _persist_guide_playbook(self, success: bool) -> None:
+        if self.mode != ModeState.GUIDED:
+            return
+        goal = (self._session_task_goal or "").strip()
+        if not goal or len(self._procedure_steps) < 2:
+            return
+        snap = self.learning.teaching.snapshot()
+        had_corr = int(snap.get("counters", {}).get("steps_needed_correction") or 0) > 0
+        duration = 0.0
+        if self._procedure_started_at:
+            duration = max(0.0, time.time() - self._procedure_started_at)
+        if success:
+            self.playbooks.on_sequence_completed(
+                goal,
+                self._procedure_steps,
+                source="guide",
+                duration_s=duration,
+                had_corrections=had_corr,
+            )
+        else:
+            self.playbooks.on_sequence_failed(goal, had_corrections=True)
+
+    def _finalize_task_playbook(self, task: str, steps: list[dict], succeeded: bool) -> None:
+        duration = 0.0
+        if self._procedure_started_at:
+            duration = max(0.0, time.time() - self._procedure_started_at)
+        snap = self.learning.teaching.snapshot()
+        had_corr = int(snap.get("counters", {}).get("steps_needed_correction") or 0) > 0
+        if succeeded:
+            self.playbooks.on_sequence_completed(
+                task,
+                steps or self._procedure_steps,
+                source="task",
+                duration_s=duration,
+                had_corrections=had_corr,
+                used_playbook=bool(self._task_used_playbook),
+                task_signature=self._task_playbook_sig,
+            )
+        elif steps or self._procedure_steps:
+            self.playbooks.on_sequence_failed(
+                task,
+                had_corrections=True,
+                used_playbook=bool(self._task_used_playbook),
+                task_signature=self._task_playbook_sig,
+            )
+        self._playbook_proposal = None
+        self._playbook_force_fresh = False
+        self._task_used_playbook = False
+        self._task_playbook_sig = None
+
+    def _run_playbook_task(self, task: str, steps: list[dict]) -> None:
+        """Execute a stored playbook step sequence instead of replanning."""
+        self._last_task_succeeded = False
+        try:
+            self._emit("task_status", {"text": f"▶ Playbook: {task}"})
+            voice_engine.speak("Following the saved steps.")
+            for idx, step in enumerate(steps, start=1):
+                if getattr(self, "_task_stop", None) and self._task_stop.is_set():
+                    self._emit("task_status", {"text": "■ Task stopped."})
+                    break
+                action = str(step.get("action") or "click").lower().strip()
+                decision = {
+                    "target": step.get("target") or "",
+                    "action": action,
+                    "text": step.get("instruction") or "",
+                    "expect": step.get("expected_state") or "",
+                    "expected_state": step.get("expected_state") or "",
+                }
+                self._record_procedure_step({
+                    "action": action,
+                    "detail": decision,
+                })
+                if action in self._TASK_PHYSICAL_ACTIONS:
+                    if not self._task_action_allows(action, decision):
+                        self._emit("task_status", {"text": "✗ Playbook step denied by safety mode."})
+                        break
+                result, continue_loop = self._execute_task_action_with_verify(action, decision)
+                self._emit("task_status", {"text": f"{idx}. {step.get('instruction') or action}"})
+                if not continue_loop:
+                    break
+            else:
+                verify_cap = capture_screen_b64()
+                verify_b64 = verify_cap.b64 if verify_cap else None
+                verification = self._verify_task_completion(task, verify_b64)
+                if verification.get("completed"):
+                    self._last_task_succeeded = True
+                    self._emit("task_status", {"text": "✓ Playbook run complete."})
+                    voice_engine.speak("Done.")
+        except Exception as exc:
+            log.error("playbook task failed: %s", exc)
+            self._emit("task_status", {"text": f"Playbook error: {exc}"})
+        finally:
+            atlas_hands.auto_approve = False
+            self._task_trusted_ok = False
+            self._task_running = False
+            self.learning.persist_teaching_rollup()
+            self._finalize_task_playbook(
+                task,
+                self._procedure_steps,
+                self._last_task_succeeded,
+            )
+            self._emit("task_running", {"active": False})
 
     def stop_task(self) -> None:
         ev = getattr(self, "_task_stop", None)
@@ -1066,7 +1265,33 @@ class StateEngine:
 
     def route_command(self, text: str) -> dict:
         """Classify an utterance into a control intent (or {'intent':'chat'})."""
-        t = (text or "").strip().lower()
+        t = (text or "").strip()
+        tl = t.lower()
+        if not t:
+            return {"intent": "chat"}
+        if tl.startswith("/read "):
+            return {"intent": "fs_read", "path": t[6:].strip().strip('"')}
+        if tl.startswith("/ls ") or tl.startswith("/dir "):
+            return {"intent": "fs_list", "path": t.split(maxsplit=1)[1].strip().strip('"') if " " in t else "."}
+        if tl.startswith("/delete "):
+            return {"intent": "fs_delete", "path": t[8:].strip().strip('"')}
+        if tl.startswith("/shell "):
+            return {"intent": "shell_run", "command": t[7:].strip()}
+        if getattr(self, "_playbook_proposal", None):
+            if any(p in tl for p in (
+                "look up fresh", "from scratch", "figure it out fresh",
+                "something changed", "look it up fresh",
+            )) or tl in ("fresh", "no", "nope", "start fresh"):
+                return {"intent": "playbook_fresh", "task": self._playbook_proposal.get("goal", "")}
+            if any(p in tl for p in (
+                "same steps", "use playbook", "follow the same",
+                "yes", "reuse", "go ahead",
+            )) or tl in ("yes", "y", "ok", "sure"):
+                return {
+                    "intent": "playbook_reuse",
+                    "task": self._playbook_proposal.get("goal", ""),
+                }
+        t = tl
         if not t:
             return {"intent": "chat"}
         if any(k in t for k in (
@@ -1262,15 +1487,101 @@ class StateEngine:
             if kind == "run_task":
                 self.run_task(intent.get("task", ""))
                 return True
+            if kind == "playbook_reuse":
+                self.run_task(intent.get("task", ""), use_playbook=True)
+                return True
+            if kind == "playbook_fresh":
+                self._playbook_proposal = None
+                self.run_task(intent.get("task", ""), force_fresh=True)
+                return True
             if kind == "diagnose":
                 summary = self.learning.format_teaching_summary_for_user()
                 diag = self.learning.get_self_diagnosis()
                 self._emit("teaching_diagnosis", {"summary": summary, "diagnosis": diag})
                 self._announce(summary)
                 return True
+            if kind == "fs_read":
+                return self._cmd_fs_read(intent.get("path", ""))
+            if kind == "fs_list":
+                return self._cmd_fs_list(intent.get("path", "."))
+            if kind == "fs_delete":
+                return self._cmd_fs_delete(intent.get("path", ""))
+            if kind == "shell_run":
+                return self._cmd_shell(intent.get("command", ""))
         except Exception as exc:
             log.warning("execute_command(%s) failed: %s", kind, exc)
         return False
+
+    def _sync_fs_policy(self) -> None:
+        """Push runtime safety/fs flags into atlas_fs and shell_runner."""
+        scopes = tuple(s.get("path", "") for s in atlas_fs.list_write_scopes())
+        atlas_fs.set_policy_context(
+            safety_mode=str(getattr(self, "safety_mode", "always") or "always"),
+            fs_access_active=bool(getattr(self, "_fs_access_active", False)),
+            execution_blocked=bool(getattr(self, "execution_blocked", False)),
+        )
+        try:
+            from atlas_shell import shell_runner as _shell
+
+            _shell.set_policy_context(
+                safety_mode=str(getattr(self, "safety_mode", "always") or "always"),
+                fs_access_active=bool(getattr(self, "_fs_access_active", False)),
+                execution_blocked=bool(getattr(self, "execution_blocked", False)),
+                write_scopes=scopes,
+            )
+        except ImportError:
+            pass
+
+    def _cmd_fs_read(self, path: str) -> bool:
+        self._sync_fs_policy()
+        try:
+            content = atlas_fs.read_text(path)
+            self._announce(f"Contents of {path}:\n\n{content[:4000]}")
+        except PermissionError as exc:
+            self._announce(str(exc))
+        except Exception as exc:
+            self._announce(f"Could not read file: {exc}")
+        return True
+
+    def _cmd_fs_list(self, path: str) -> bool:
+        self._sync_fs_policy()
+        try:
+            entries = atlas_fs.list_directory(path or ".")
+            lines = [f"{e['type']:8} {e['name']}" for e in entries[:50]]
+            self._announce(f"Directory {path or '.'}:\n" + "\n".join(lines))
+        except PermissionError as exc:
+            self._announce(str(exc))
+        except Exception as exc:
+            self._announce(f"Could not list directory: {exc}")
+        return True
+
+    def _cmd_fs_delete(self, path: str) -> bool:
+        self._sync_fs_policy()
+        try:
+            atlas_fs.delete_file(path)
+            self._announce(f"Delete requested for {path} (see confirmation prompts).")
+        except PermissionError as exc:
+            self._announce(str(exc))
+        except Exception as exc:
+            self._announce(f"Could not delete: {exc}")
+        return True
+
+    def _cmd_shell(self, command: str) -> bool:
+        self._sync_fs_policy()
+        try:
+            from atlas_shell import shell_runner as _shell
+
+            result = _shell.run(command, safety_mode=str(self.safety_mode or "always"))
+            if result.get("denied"):
+                self._announce(result.get("reason") or "Shell command denied by policy.")
+            elif result.get("ok"):
+                out = (result.get("stdout") or "").strip() or "(no output)"
+                self._announce(f"$ {command}\n{out[:4000]}")
+            else:
+                self._announce(result.get("error") or "Shell command failed.")
+        except Exception as exc:
+            self._announce(f"Shell error: {exc}")
+        return True
 
     def _execute_guide(self, target: str, instruction: str = "") -> None:
         target = (target or "").strip()
@@ -1553,6 +1864,7 @@ class StateEngine:
         steps: list[dict] = []
         screen_hashes: list[str] = []
         false_done_retries = 0
+        self._last_task_succeeded = False
         try:
             self._emit("task_status", {"text": f"▶ Task: {task}"})
             voice_engine.speak("On it.")
@@ -1594,6 +1906,7 @@ class StateEngine:
                         self._emit("task_status", {"text": f"✓ {summary}"})
                         voice_engine.speak(summary)
                         self._log_task_step(step_no, action, "success", screen_hash)
+                        self._last_task_succeeded = True
                         break
                     observed = str(verification.get("observed") or "").strip()
                     reason = str(
@@ -1639,6 +1952,15 @@ class StateEngine:
                     voice_engine.speak(reason)
                     self._log_task_step(step_no, action, "error", screen_hash)
                     break
+                if action == "connector":
+                    result = self._run_connector_action(decision)
+                    steps.append({"step": step_no, "action": action,
+                                  "detail": decision, "result": result})
+                    self._log_task_step(step_no, action, result, screen_hash)
+                    if "denied" in result.lower():
+                        self._emit("task_status", {"text": f"✗ {result}"})
+                        break
+                    continue
                 if action in self._TASK_PHYSICAL_ACTIONS:
                     if not self._task_action_allows(action, decision):
                         result = "action denied by safety mode"
@@ -1663,6 +1985,7 @@ class StateEngine:
                         atlas_hands.auto_approve = prev_auto
                 steps.append({"step": step_no, "action": action,
                               "detail": decision, "result": result})
+                self._record_procedure_step({"action": action, "detail": decision, "result": result})
                 self._log_task_step(step_no, action, result, screen_hash)
                 if not continue_loop:
                     break
@@ -1691,6 +2014,7 @@ class StateEngine:
             self._task_trusted_ok = False
             self._task_running = False
             self.learning.persist_teaching_rollup()
+            self._finalize_task_playbook(task, steps, self._last_task_succeeded)
             self._emit("task_running", {"active": False})
 
     def _describe_task_action(self, action: str, detail: dict) -> str:
@@ -2075,6 +2399,7 @@ class StateEngine:
         on_coordinates: Callable[[dict], None],
         on_token_usage: Callable[[dict], None],
         user_name: str = "default",
+        memory: Optional["UserMemory"] = None,
     ) -> None:
         """
         Parameters
@@ -2110,6 +2435,14 @@ class StateEngine:
         self._research_this_turn = False
         self._pending_guide: Optional[dict] = None
         self._session_task_goal: str = ""
+        self._procedure_steps: list[dict] = []
+        self._procedure_started_at: Optional[float] = None
+        self._playbook_proposal: Optional[dict] = None
+        self._playbook_force_fresh: bool = False
+        self._task_used_playbook: bool = False
+        self._task_playbook_sig: Optional[str] = None
+        self._guide_playbook_offered: bool = False
+        self._last_task_succeeded: bool = False
 
         # Operating mode + session
         self.mode    = ModeState.ACTIVE
@@ -2128,17 +2461,21 @@ class StateEngine:
         self._screen_lock = threading.Lock()
 
         # Persistent user memory, skills, learning, spatial co-pilot.
-        self.memory = UserMemory()
+        self.memory = memory or UserMemory()
         self.user_id = self.memory.create_or_login(user_name)
         self.local_memory = MemoryManager()
         self.local_memory.ensure_session()
         self.skill_registry = SkillRegistry()
         self.learning = LearningEngine(self.memory, self.user_id)
+        from atlas_playbooks import PlaybookManager
+
+        self.playbooks = PlaybookManager(self.memory, self.user_id)
+        self.learning.set_playbook_persist_hook(self._persist_guide_playbook)
         self.active_skill: Optional[str] = None
         self._security_prefs: dict = {}
         self.load_user_prefs()
         threading.Thread(
-            target=self.learning.run_decay,
+            target=self._run_startup_decay,
             daemon=True,
             name="atlas-decay",
         ).start()
@@ -2155,6 +2492,7 @@ class StateEngine:
             on_voice_input=lambda t: self.handle_input(t, source="mic"),
         )
         self.execution_blocked = False
+        self.connectors = None  # set by atlas_daemon — ConnectorRegistry
         # Safety mode: off = auto actions, always = confirm each action, trusted = confirm once per session
         self.safety_mode = str(self.get_user_prefs().get("safety_mode", "off"))
         self._safety_session_ok = False
@@ -2243,6 +2581,8 @@ class StateEngine:
         """
         with self._lock:
             prev = self.mode
+            if prev == ModeState.GUIDED and mode != ModeState.GUIDED:
+                self.learning.persist_teaching_rollup()
             if self.session.is_active and self.session.history_length:
                 hist = list(self.session._history)
                 # Summarisation (Groq call + SQLite write) runs off the UI loop.
@@ -2251,6 +2591,8 @@ class StateEngine:
             self.session.start(self.get_system_prompt())
             self._clear_context_buffer()
             self._pending_guide = None
+            self._guide_playbook_offered = False
+            self._procedure_steps = []
             self.learning.reset_teaching_session()
         self._emit("mode_changed", {"from": prev.name, "to": mode.name})
 
@@ -2490,7 +2832,15 @@ class StateEngine:
             if self.mode == ModeState.GUIDED and (text or "").strip():
                 if not self._session_task_goal:
                     self._session_task_goal = text.strip()
+                    self._reset_procedure_session()
                 self.learning.teaching.set_task_context(self._session_task_goal)
+                if not self._guide_playbook_offered:
+                    self._guide_playbook_offered = True
+                    proposal = self.playbooks.check_proposal(self._session_task_goal)
+                    if proposal and not self._playbook_force_fresh:
+                        self._playbook_proposal = proposal
+                        self._announce(proposal["message"])
+                        return
 
             # ── Enrich the user input with ambient screen context ─────────────────
             context_snap   = self._get_context_snapshot()
@@ -2710,6 +3060,12 @@ class StateEngine:
             if isinstance(evt, StepEvent):
                 evt.verified = True
             self.learning.teaching.record_verified_first_try()
+            self._record_procedure_step({
+                "action": "guide",
+                "target": pending.get("target") or "",
+                "instruction": pending.get("instruction") or "",
+                "expected_state": expected,
+            })
             self._emit("step_verified", {
                 "step_index": step_index,
                 "passed": True,
@@ -3399,12 +3755,8 @@ class StateEngine:
 # 7.  ATLAS FILE SYSTEM
 # ═════════════════════════════════════════════════════════════════════════════
 
-class FSPermission(Enum):
-    """Granularity levels for file-system operations."""
-    READ    = "read"
-    WRITE   = "write"
-    EXECUTE = "execute"
-    DELETE  = "delete"
+# Implementation lives in atlas_fs_v2.py (policy-gated reads, scoped writes).
+from atlas_fs_v2 import AtlasFileSystemV2, FSPermission  # noqa: F401
 
 
 def _check_env_gitignore_safety() -> None:
@@ -3461,327 +3813,9 @@ def _check_env_gitignore_safety() -> None:
         )
 
 
-class AtlasFileSystem:
-    """
-    Controlled local file-system access for Atlas.
+import pyautogui as _pyautogui_mod
 
-    Security model
-    --------------
-    READ operations (list_directory, read_text, file_info) execute immediately
-    with no prompt.  All other operations (WRITE, EXECUTE, DELETE) are
-    intercepted and routed to a UI permission callback before any disk mutation
-    occurs.  If no callback is registered, destructive operations are blocked
-    and logged as warnings.
-
-    Optional sandboxing
-    -------------------
-    Pass ``root_dir`` to restrict all path operations to a subtree.  Any
-    attempt to escape via ``..`` or symlinks resolves to an absolute path and
-    is checked against the sandbox root; out-of-bounds paths raise
-    PermissionError before any callback is invoked.
-
-    FIX-6 Case-Insensitive Sandboxing
-    -----------------------------------
-    On Windows, NTFS is case-insensitive but Python's Path.relative_to() is
-    case-sensitive.  _resolve() now lowercases both the resolved path and the
-    sandbox root before comparison on Windows, preventing trivial case-variant
-    escapes (e.g. ``C:\\Projects\\Atlas`` vs ``c:\\projects\\atlas``).
-
-    UI integration
-    --------------
-    Register the callback after construction:
-
-        atlas_fs.register_permission_callback(my_qt_permission_handler)
-
-    Callback signature:
-        (action: str, path: str, approve_fn: Callable, deny_fn: Callable) -> None
-
-    The callback fires on whatever thread called the write/execute method.
-    Qt UIs must marshal to the main thread (e.g. via a Signal).
-    """
-
-    def __init__(
-        self,
-        permission_callback: Optional[Callable] = None,
-        root_dir:            Optional[str | Path] = None,
-    ) -> None:
-        self._permission_callback = permission_callback
-        self._root_dir: Optional[Path] = (
-            Path(root_dir).expanduser().resolve() if root_dir else None
-        )
-
-    # ── Callback registration ─────────────────────────────────────────────────
-
-    def register_permission_callback(self, callback: Callable) -> None:
-        """
-        Wire the UI permission handler after construction.
-
-        Convenience for the common pattern where atlas_fs is imported as a
-        module-level singleton before the Qt window exists.
-        """
-        self._permission_callback = callback
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    def _resolve(self, path: str | Path) -> Path:
-        """
-        Resolve path to an absolute, canonical Path.
-
-        If a sandbox root_dir was configured, raises PermissionError for any
-        path that resolves outside it.
-
-        FIX-6: On Windows, path comparisons are performed with both sides
-        lowercased to handle NTFS case-insensitivity.  On all other platforms
-        the original cased strings are compared (POSIX file systems are
-        case-sensitive).
-        """
-        resolved = Path(path).expanduser().resolve()
-
-        if self._root_dir is not None:
-            _is_windows = platform.system() == "Windows"
-
-            if _is_windows:
-                # Normalise to lowercase strings for Windows comparison
-                resolved_str = str(resolved).lower()
-                root_str     = str(self._root_dir).lower()
-
-                # Manual prefix check since relative_to() is case-sensitive
-                if not resolved_str.startswith(root_str):
-                    raise PermissionError(
-                        f"AtlasFileSystem: path '{resolved}' is outside the "
-                        f"sandbox root '{self._root_dir}' (case-insensitive check)."
-                    )
-            else:
-                try:
-                    resolved.relative_to(self._root_dir)
-                except ValueError:
-                    raise PermissionError(
-                        f"AtlasFileSystem: path '{resolved}' is outside the "
-                        f"sandbox root '{self._root_dir}'."
-                    )
-
-        return resolved
-
-    def _request_permission(
-        self,
-        action:  FSPermission,
-        path:    Path,
-        proceed: Callable,
-    ) -> None:
-        """
-        Gate a destructive operation behind the UI permission callback.
-
-        If no callback is registered, the operation is blocked and a warning
-        is logged — Atlas never mutates the file system without human approval.
-        """
-        if self._permission_callback is None:
-            log.warning(
-                "AtlasFileSystem: '%s' on '%s' blocked — "
-                "no permission callback registered.",
-                action.value, path,
-            )
-            return
-
-        def _approve() -> None:
-            try:
-                proceed()
-            except Exception as exc:
-                log.error(
-                    "AtlasFileSystem: approved '%s' on '%s' failed: %s",
-                    action.value, path, exc,
-                )
-
-        def _deny() -> None:
-            log.info(
-                "AtlasFileSystem: '%s' on '%s' denied by user.",
-                action.value, path,
-            )
-
-        self._permission_callback(action.value, str(path), _approve, _deny)
-
-    # ── READ operations — no permission required ──────────────────────────────
-
-    def list_directory(self, path: str | Path = ".") -> list[dict]:
-        """
-        List directory contents.
-
-        Returns
-        -------
-        list of dicts with keys:
-            "name"  — entry name
-            "type"  — "file" or "dir"
-            "size"  — byte size for files, None for directories
-        """
-        target = self._resolve(path)
-        if not target.exists():
-            raise FileNotFoundError(f"Directory not found: {target}")
-        if not target.is_dir():
-            raise NotADirectoryError(f"Not a directory: {target}")
-
-        entries = []
-        for item in sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
-            entries.append({
-                "name": item.name,
-                "type": "file" if item.is_file() else "dir",
-                "size": item.stat().st_size if item.is_file() else None,
-            })
-        return entries
-
-    def read_text(
-        self,
-        path:      str | Path,
-        encoding:  str = "utf-8",
-        max_chars: int = 50_000,
-    ) -> str:
-        """
-        Read and return the textual content of a file.
-
-        Files larger than max_chars are truncated with a clear marker so Atlas
-        does not silently lose context on large codebases.
-        """
-        target = self._resolve(path)
-        if not target.exists():
-            raise FileNotFoundError(f"File not found: {target}")
-        if not target.is_file():
-            raise IsADirectoryError(f"Path is a directory: {target}")
-
-        text = target.read_text(encoding=encoding, errors="replace")
-        if len(text) > max_chars:
-            text = text[:max_chars] + f"\n\n[… file truncated at {max_chars:,} chars]"
-        return text
-
-    def file_info(self, path: str | Path) -> dict:
-        """
-        Return metadata about a file or directory.
-
-        Keys: path, name, type, size, modified (epoch float), suffix.
-        """
-        target = self._resolve(path)
-        if not target.exists():
-            raise FileNotFoundError(f"Path not found: {target}")
-        stat = target.stat()
-        return {
-            "path":     str(target),
-            "name":     target.name,
-            "type":     "file" if target.is_file() else "dir",
-            "size":     stat.st_size,
-            "modified": stat.st_mtime,
-            "suffix":   target.suffix,
-        }
-
-    # ── WRITE operations — require explicit user permission ───────────────────
-
-    def write_text(
-        self,
-        path:     str | Path,
-        content:  str,
-        encoding: str = "utf-8",
-    ) -> None:
-        """
-        Write text to a file, creating parent directories as needed.
-        Requires user approval via the permission callback.
-        """
-        target = self._resolve(path)
-
-        def _do_write() -> None:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding=encoding)
-            log.info("AtlasFileSystem: wrote %d chars → %s", len(content), target)
-
-        self._request_permission(FSPermission.WRITE, target, _do_write)
-
-    def append_text(
-        self,
-        path:     str | Path,
-        content:  str,
-        encoding: str = "utf-8",
-    ) -> None:
-        """Append text to a file.  Requires user approval."""
-        target = self._resolve(path)
-
-        def _do_append() -> None:
-            with open(target, "a", encoding=encoding) as fh:
-                fh.write(content)
-            log.info("AtlasFileSystem: appended %d chars → %s", len(content), target)
-
-        self._request_permission(FSPermission.WRITE, target, _do_append)
-
-    def create_directory(self, path: str | Path) -> None:
-        """
-        Create a directory (and any missing parents).
-        Requires user approval.
-        """
-        target = self._resolve(path)
-
-        def _do_mkdir() -> None:
-            target.mkdir(parents=True, exist_ok=True)
-            log.info("AtlasFileSystem: created directory %s", target)
-
-        self._request_permission(FSPermission.WRITE, target, _do_mkdir)
-
-    def move_file(self, src: str | Path, dst: str | Path) -> None:
-        """
-        Move or rename a file.  Both source and destination are sandbox-checked.
-        Requires user approval.
-        """
-        src_path = self._resolve(src)
-        dst_path = self._resolve(dst)
-
-        def _do_move() -> None:
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
-            src_path.rename(dst_path)
-            log.info("AtlasFileSystem: moved %s → %s", src_path, dst_path)
-
-        self._request_permission(FSPermission.WRITE, src_path, _do_move)
-
-    def delete_file(self, path: str | Path) -> None:
-        """Delete a file.  Requires user approval."""
-        target = self._resolve(path)
-
-        def _do_delete() -> None:
-            target.unlink(missing_ok=True)
-            log.info("AtlasFileSystem: deleted %s", target)
-
-        self._request_permission(FSPermission.DELETE, target, _do_delete)
-
-    # ── EXECUTE operations — require explicit user permission ─────────────────
-
-    def run_script(
-        self,
-        path: str | Path,
-        args: Optional[list[str]] = None,
-    ) -> None:
-        """
-        Execute a script or binary in a subprocess.
-
-        Safety notes
-        ------------
-        - shell=False is enforced to prevent injection.
-        - Execution is capped at 30 seconds.
-        - stdout/stderr are captured and logged (first 200 chars each).
-        - Requires user approval via the permission callback.
-        """
-        target = self._resolve(path)
-        cmd    = [str(target)] + (args or [])
-
-        def _do_run() -> None:
-            log.info("AtlasFileSystem: executing %s", cmd)
-            result = subprocess.run(
-                cmd,
-                capture_output = True,
-                text           = True,
-                timeout        = 30,
-            )
-            log.info(
-                "Exit code %d — stdout: %s",
-                result.returncode,
-                result.stdout[:200],
-            )
-            if result.returncode != 0:
-                log.warning("Script stderr: %s", result.stderr[:200])
-
-        self._request_permission(FSPermission.EXECUTE, target, _do_run)
-
+_pyautogui_mod.FAILSAFE = True
 
 import pyautogui as _pyautogui_mod
 
@@ -3791,7 +3825,7 @@ _pyautogui_mod.FAILSAFE = True
 class AtlasHands:
     """Permission-gated physical automation wrapper around pyautogui."""
 
-    def __init__(self, fs: AtlasFileSystem) -> None:
+    def __init__(self, fs: AtlasFileSystemV2) -> None:
         self._fs = fs
         # When True, individual actions run WITHOUT a per-action permission
         # dialog.  Set only after a single task-level approval (see
@@ -3878,9 +3912,11 @@ class AtlasHands:
 # The UI layer calls atlas_fs.register_permission_callback(handler) once the
 # Qt window is ready.  Until then, all write/execute/delete operations are
 # blocked with a logged warning rather than crashing.
-atlas_fs = AtlasFileSystem()
+atlas_fs = AtlasFileSystemV2()
 atlas_hands = AtlasHands(atlas_fs)
 step_orchestrator = StepOrchestrator()
+
+from atlas_shell import shell_runner  # noqa: E402
 
 # FIX-6: Run the .env gitignore safety check at module import time so developers
 # see the warning in their console the moment they load atlas_core.
