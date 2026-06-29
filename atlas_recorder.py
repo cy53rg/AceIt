@@ -219,6 +219,7 @@ class StreamBracketFilter:
     def __init__(self) -> None:
         self._buf = ""
         self._in_token = False
+        self.incomplete_action_token: str | None = None
 
     @staticmethod
     def _maybe_prefix(buf: str) -> bool:
@@ -270,13 +271,15 @@ class StreamBracketFilter:
     def flush(self) -> tuple[str, list[str]]:
         """Return leftover visible text and any complete token held at stream end."""
         tokens: list[str] = []
+        self.incomplete_action_token = None
         if self._in_token:
             j = self._buf.find("]]")
             if j != -1:
                 tokens.append(self._buf[: j + 2])
                 visible = self._buf[j + 2 :]
             else:
-                visible = self._buf
+                self.incomplete_action_token = self._buf
+                visible = ""
         else:
             visible = self._buf
         self._buf = ""

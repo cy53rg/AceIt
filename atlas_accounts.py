@@ -270,6 +270,8 @@ class AccountManager:
         self.email: Optional[str] = None
         self._pending_2fa_uid: Optional[int] = None
         self._pending_2fa_email: str = ""
+        # Pending TOTP secrets live in memory only (never plaintext in SQLite).
+        self._totp_pending: dict[int, tuple[str, float]] = {}
 
     @property
     def cloud_available(self) -> bool:
@@ -463,25 +465,39 @@ class AccountManager:
         secret = pyotp.random_base32()
         uri = pyotp.totp.TOTP(secret).provisioning_uri(
             name=label, issuer_name="Atlas")
+        self._totp_pending[int(user_id)] = (secret, time.time() + 600.0)
         sec = self._sec(user_id, self.memory)
-        sec["totp_pending_secret"] = secret
+        sec.pop("totp_pending_secret", None)
         self._save_sec(user_id, self.memory, sec)
         return secret, uri
 
     def confirm_totp_setup(self, user_id: int, code: str) -> tuple[bool, str]:
         sec = self._sec(user_id, self.memory)
-        secret = sec.pop("totp_pending_secret", None)
+        uid = int(user_id)
+        pending = self._totp_pending.get(uid)
+        secret = None
+        if pending:
+            secret, expires = pending
+            if time.time() > expires:
+                self._totp_pending.pop(uid, None)
+                return (False, "Authenticator setup expired — start again.")
+        if secret is None:
+            secret = sec.pop("totp_pending_secret", None)
         if not secret:
             return (False, "No pending authenticator setup.")
         try:
             import pyotp
             if not pyotp.TOTP(secret).verify(code.strip(), valid_window=1):
+                if uid in self._totp_pending:
+                    return (False, "Incorrect code — try again.")
                 sec["totp_pending_secret"] = secret
                 self._save_sec(user_id, self.memory, sec)
                 return (False, "Incorrect code — try again.")
+            self._totp_pending.pop(uid, None)
             sec["totp_secret"] = secret
             sec["twofa_enabled"] = True
             sec["twofa_method"] = "totp"
+            sec.pop("totp_pending_secret", None)
             self._save_sec(user_id, self.memory, sec)
             return (True, "Authenticator app linked.")
         except Exception as exc:
@@ -524,11 +540,15 @@ class AccountManager:
         stored = str(stored)
         if "$" in stored:
             return UserMemory._verify_password(pin or "", stored)
-        # Legacy installs: constant salt + bare hex digest.
+        # Legacy installs: constant salt + bare hex digest — migrate on success.
         legacy = hashlib.pbkdf2_hmac(
             "sha256", (pin or "").encode(), b"atlas-lock", 120_000,
         ).hex()
-        return hmac.compare_digest(legacy, stored)
+        if hmac.compare_digest(legacy, stored):
+            sec["app_lock_hash"] = UserMemory._hash_password(pin or "")
+            self._save_sec(user_id, self.memory, sec)
+            return True
+        return False
 
     def change_password_local(self, user_id: int, old: str, new: str) -> tuple[bool, str]:
         prof = self.memory.get_profile(user_id)

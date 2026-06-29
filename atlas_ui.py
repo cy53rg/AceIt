@@ -2789,7 +2789,10 @@ class AtlasWindow(QMainWindow):
         self.bridge.stream_started.connect(self._on_stream_started)
         self.bridge.stream_complete.connect(self._on_stream_complete_slot)
         self.bridge.token_usage.connect(self._on_token_usage)
-        self.bridge.spatial_coords.connect(self._on_spatial_coords)
+        self.bridge.spatial_coords.connect(
+            self._on_spatial_coords,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self.bridge.ptt_active.connect(self._on_ptt_active)
         self.bridge.ptt_breakin.connect(self._on_ptt_breakin)
         self.bridge.listen_state.connect(self._on_listen_state)
@@ -4102,6 +4105,17 @@ class AtlasWindow(QMainWindow):
                 self.bridge.set_status.emit(text)
             if event_type == "learn_status":
                 QTimer.singleShot(0, self._sync_learn_btn)
+        elif event_type == "task_truncated":
+            msg = (
+                f"⚠ Atlas stopped after {payload.get('max_steps', 16)} steps — "
+                "the task may be incomplete."
+            )
+
+            def _notify_truncated(m: str = msg) -> None:
+                self.bridge.set_status.emit(m)
+                self._show_pill(m[:72])
+
+            QTimer.singleShot(0, _notify_truncated)
         elif event_type == "task_running":
             active = bool(payload.get("active", False))
             QTimer.singleShot(0, lambda: (
@@ -4119,9 +4133,13 @@ class AtlasWindow(QMainWindow):
             if payload.get("found") and self.overlay:
                 x, y = int(payload["x"]), int(payload["y"])
                 w, h = int(payload.get("w", 0)), int(payload.get("h", 0))
-                self.overlay.mark_target(
-                    x, y, w, h, label=str(payload.get("label", "")),
-                )
+                label = str(payload.get("label", ""))
+
+                def _mark_guide(x=x, y=y, w=w, h=h, label=label) -> None:
+                    if self.overlay:
+                        self.overlay.mark_target(x, y, w, h, label=label)
+
+                QTimer.singleShot(0, _mark_guide)
         elif event_type == "spatial_error":
             err = str(payload.get("error", "Location failed"))
 

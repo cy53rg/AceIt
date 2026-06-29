@@ -26,6 +26,7 @@ ATLAS_FAST_MODEL = (
 ).strip() or _default_fast_model
 
 _MEMORY_CACHE_TTL_S = 30.0
+_MEMORY_PROMPT_TOKEN_BUDGET = int(os.environ.get("ATLAS_MEMORY_TOKEN_BUDGET") or 1200)
 
 
 # ── Optional Qt signal bridge ─────────────────────────────────────────────────
@@ -342,12 +343,25 @@ class UserMemory:
                     (now, email, row["id"]),
                 )
                 return int(row["id"])
-            cur = conn.execute(
-                "INSERT INTO users (name, email, created, last_seen, updated) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (clean_name, email, now, now, now),
-            )
-            return int(cur.lastrowid or 0)
+            try:
+                cur = conn.execute(
+                    "INSERT INTO users (name, email, created, last_seen, updated) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (clean_name, email, now, now, now),
+                )
+                return int(cur.lastrowid or 0)
+            except sqlite3.IntegrityError:
+                row = conn.execute(
+                    "SELECT id FROM users WHERE lower(name) = lower(?)",
+                    (clean_name,),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE users SET last_seen = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                    return int(row["id"])
+                raise
 
     # ── Accounts / profiles ───────────────────────────────────────────────────
 
@@ -463,6 +477,7 @@ class UserMemory:
         args.append(user_id)
         with self._write_lock, self._connect() as conn:
             conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", args)
+        self._invalidate_cache()
 
     # ── Per-user settings (prefs JSON) ────────────────────────────────────────
 
@@ -486,6 +501,7 @@ class UserMemory:
                 "UPDATE users SET prefs = ?, updated = ? WHERE id = ?",
                 (json.dumps(prefs), time.time(), user_id),
             )
+        self._invalidate_cache()
 
     # ── Global context (per-user notes applied to ALL features) ───────────────
 
@@ -876,8 +892,33 @@ class UserMemory:
             "Use quietly to personalize; do not mention memory unless relevant.",
         ]
         if facts:
+            facts_sorted = sorted(
+                facts,
+                key=lambda f: (float(f.get("confidence", 0)), float(f.get("created", 0))),
+                reverse=True,
+            )
+            selected: list[dict[str, Any]] = []
+            est_tokens = sum(len(line) for line in lines) // 4
+            truncated = False
+            for fact in facts_sorted:
+                key = str(fact["key"]).replace("_", " ")
+                value = str(fact["value"])
+                conf = float(fact["confidence"])
+                line = f"- {key}: {value} (confidence {conf:.2f})"
+                line_tokens = max(1, len(line) // 4)
+                if est_tokens + line_tokens > _MEMORY_PROMPT_TOKEN_BUDGET:
+                    truncated = True
+                    break
+                selected.append(fact)
+                est_tokens += line_tokens
+            if truncated:
+                log.info(
+                    "build_memory_prompt truncated facts for user %s (budget=%d tokens)",
+                    user_id,
+                    _MEMORY_PROMPT_TOKEN_BUDGET,
+                )
             grouped: dict[str, list[dict[str, Any]]] = {}
-            for fact in facts:
+            for fact in selected:
                 grouped.setdefault(str(fact["category"]), []).append(fact)
             for category, items in grouped.items():
                 lines.append(f"\n### {category.title()}")

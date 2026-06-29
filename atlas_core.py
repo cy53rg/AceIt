@@ -73,6 +73,7 @@ from atlas_memory_manager import MemoryManager
 from atlas_memory import UserMemory
 from atlas_skills import SkillRegistry
 from atlas_logging import get_logger, setup_logging, task_scope, new_task_id, log_outcome_json
+from atlas_task_safety import check_task_goal_allowed
 from atlas_stepevent import StepEvent, StepOrchestrator, StepOrchestratorStalled
 
 setup_logging()
@@ -726,7 +727,12 @@ class StateEngine:
             return
         tm = self._TASK_TOKEN_RE.match(raw)
         if tm:
-            self.run_task(tm.group(1).strip())
+            goal = tm.group(1).strip()
+            allowed, reason = check_task_goal_allowed(goal)
+            if not allowed:
+                self._emit("task_status", {"text": f"Task blocked: {reason}"})
+                return
+            self.run_task(goal)
             return
         m = self._ACTION_TOKEN_RE.match(raw)
         if not m:
@@ -1034,6 +1040,49 @@ class StateEngine:
             return f"connector denied ({result.get('decision')}): {result.get('reason', 'denied')}"
         return f"connector error: {result.get('error') or result.get('reason', 'unknown')}"
 
+    def _task_auto_approve_for_mode(self) -> bool:
+        """
+        Map Safety Mode to atlas_hands.auto_approve (UI labels in Security tab).
+
+        off     — act without per-step prompts
+        always  — confirm each physical action (never auto-approve hands)
+        trusted — per-step auto after one task-start confirmation
+        """
+        mode = (getattr(self, "safety_mode", "off") or "off").lower()
+        if mode == "off":
+            return True
+        if mode == "trusted" and getattr(self, "_task_trusted_ok", False):
+            return True
+        return False
+
+    def _prepare_task_start(self, task: str) -> bool:
+        """Goal allowlist + mode-specific start gate. False → do not start thread."""
+        mode = (getattr(self, "safety_mode", "off") or "off").lower()
+        trusted_gate = mode == "trusted"
+        allowed, reason = check_task_goal_allowed(task, trusted_only=trusted_gate)
+        if not allowed:
+            self._emit("task_status", {"text": f"Task blocked: {reason}"})
+            return False
+
+        if mode == "trusted":
+            if self._task_confirm_cb is not None:
+                if not self._task_confirm_cb(task):
+                    self._emit("task_status", {"text": "Task cancelled — not confirmed."})
+                    return False
+            self._task_trusted_ok = True
+        elif mode == "always":
+            # Per-step PermissionDialog — no batch auto-approve at task start.
+            self._task_trusted_ok = False
+        else:
+            # off — unrestricted after allowlist; audit every autonomous start.
+            log.info(
+                "task audit: auto-start safety_mode=off goal=%r user_id=%s",
+                task[:200],
+                getattr(self, "user_id", 0),
+            )
+            self._task_trusted_ok = False
+        return True
+
     def run_task(
         self,
         task: str,
@@ -1071,16 +1120,13 @@ class StateEngine:
         if use_playbook and self._playbook_proposal:
             steps = self._playbook_proposal.get("steps") or []
             if steps:
+                if not self._prepare_task_start(task):
+                    return
                 self._start_task_thread(task, playbook_steps=steps)
                 return
 
-        mode = (getattr(self, "safety_mode", "off") or "off").lower()
-        self._task_trusted_ok = False
-        if mode == "trusted" and self._task_confirm_cb is not None:
-            if not self._task_confirm_cb(task):
-                self._emit("task_status", {"text": "Task cancelled — not confirmed."})
-                return
-            self._task_trusted_ok = True
+        if not self._prepare_task_start(task):
+            return
 
         self._start_task_thread(task)
 
@@ -1092,8 +1138,7 @@ class StateEngine:
     ) -> None:
         self._task_running = True
         self._task_stop = threading.Event()
-        mode = (getattr(self, "safety_mode", "off") or "off").lower()
-        atlas_hands.auto_approve = mode in ("off", "trusted")
+        atlas_hands.auto_approve = self._task_auto_approve_for_mode()
         self._emit("task_running", {"active": True, "task": task})
         if playbook_steps:
             target = self._run_playbook_task
@@ -1857,6 +1902,16 @@ class StateEngine:
                 "result": status,
                 "screen_hash": screen_hash,
             })
+            uid = int(getattr(self, "user_id", 0) or 0)
+            if uid:
+                self.memory.log_scheduler_activity(
+                    uid,
+                    source="interactive",
+                    category="task_step",
+                    summary=f"Step {step_no}: {action}",
+                    detail={"step": step_no, "action": action, "result": result},
+                    status=status,
+                )
         except Exception:
             pass
 
@@ -1974,15 +2029,12 @@ class StateEngine:
                         continue
                 mode = (getattr(self, "safety_mode", "off") or "off").lower()
                 prev_auto = atlas_hands.auto_approve
-                if mode == "always":
-                    atlas_hands.auto_approve = True
                 try:
                     result, continue_loop = self._execute_task_action_with_verify(
                         action, decision,
                     )
                 finally:
-                    if mode == "always":
-                        atlas_hands.auto_approve = prev_auto
+                    atlas_hands.auto_approve = prev_auto
                 steps.append({"step": step_no, "action": action,
                               "detail": decision, "result": result})
                 self._record_procedure_step({"action": action, "detail": decision, "result": result})
@@ -1990,8 +2042,17 @@ class StateEngine:
                 if not continue_loop:
                     break
             else:
-                self._emit("task_status", {"text": "Reached step limit; stopping."})
-                voice_engine.speak("I've reached my step limit, so I'll stop here.")
+                trunc_msg = (
+                    f"Atlas stopped after {_TASK_MAX_STEPS} steps — "
+                    "the task may be incomplete."
+                )
+                self._emit("task_status", {"text": trunc_msg})
+                self._emit("task_truncated", {
+                    "task": task,
+                    "steps_completed": len(steps),
+                    "max_steps": self._TASK_MAX_STEPS,
+                })
+                voice_engine.speak(trunc_msg)
                 self._log_task_step(
                     self._TASK_MAX_STEPS,
                     "step_limit",
@@ -2015,6 +2076,21 @@ class StateEngine:
             self._task_running = False
             self.learning.persist_teaching_rollup()
             self._finalize_task_playbook(task, steps, self._last_task_succeeded)
+            try:
+                self.memory.log_scheduler_activity(
+                    self.user_id,
+                    source="interactive",
+                    category="task_checkpoint",
+                    summary=f"Task ended ({len(steps)} steps): {task[:120]}",
+                    detail={
+                        "task": task,
+                        "steps": steps[-20:],
+                        "succeeded": self._last_task_succeeded,
+                    },
+                    status="completed" if self._last_task_succeeded else "truncated",
+                )
+            except Exception as exc:
+                log.debug("task checkpoint log failed: %s", exc)
             self._emit("task_running", {"active": False})
 
     def _describe_task_action(self, action: str, detail: dict) -> str:
@@ -2127,7 +2203,35 @@ class StateEngine:
             )
             raw = resp.choices[0].message.content or "{}"
             match = re.search(r"\{[\s\S]*\}", raw)
-            return json.loads(match.group(0) if match else raw)
+            blob = match.group(0) if match else raw
+            try:
+                return json.loads(blob)
+            except json.JSONDecodeError as exc:
+                log.warning(
+                    "task planner JSON parse failed (%s); raw=%r",
+                    exc,
+                    raw[:240],
+                )
+                retry_content = content.copy()
+                retry_content[-1] = {
+                    "type": "text",
+                    "text": user_text + "\n\nYour last reply was not valid JSON. Return ONE JSON object only.",
+                }
+                resp2 = groq_client.chat.completions.create(
+                    model=GROQ_VISION_MODEL,
+                    messages=[
+                        {"role": "system", "content": _ATLAS_TASK_AGENT},
+                        {"role": "user", "content": retry_content},
+                    ],
+                    temperature=0,
+                    max_tokens=300,
+                )
+                raw2 = resp2.choices[0].message.content or "{}"
+                match2 = re.search(r"\{[\s\S]*\}", raw2)
+                return json.loads(match2.group(0) if match2 else raw2)
+        except json.JSONDecodeError as exc:
+            log.warning("_decide_next_step JSONDecodeError: %s", exc)
+            return None
         except Exception as exc:
             log.warning("_decide_next_step failed: %s", exc)
             return None
@@ -3343,6 +3447,13 @@ class StateEngine:
 
             # Release any text the bracket filter was holding at stream end.
             tail, tail_tokens = bracket.flush()
+            if getattr(bracket, "incomplete_action_token", None):
+                warn = (
+                    "Atlas started an action but the response was cut off "
+                    f"({bracket.incomplete_action_token[:60]}…)"
+                )
+                self._emit("task_status", {"text": warn})
+                log.warning("incomplete action token at stream end: %r", bracket.incomplete_action_token[:120])
             tail = harmony.feed(tail) + harmony.flush()
             tail = coord_filt.feed(tail)
             for tok in tail_tokens:

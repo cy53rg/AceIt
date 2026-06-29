@@ -427,6 +427,13 @@ class LearningEngine:
 
     def check_persona_drift(self, recent_responses: list[str]) -> str | None:
         """Compare sampled tone to baseline; return correction string or None."""
+        style = (
+            str((self.memory.get_prefs(self.user_id) or {}).get("response_style") or "")
+            .strip()
+            .lower()
+        )
+        if style in ("terse", "brief", "concise", "short", "minimal"):
+            return None
         client = self._get_groq()
         if client is None or not recent_responses:
             return None

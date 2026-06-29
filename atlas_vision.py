@@ -391,15 +391,11 @@ class SpatialBrain:
         self.model = model
 
     def capture_screen_png_b64(self) -> str:
-        try:
-            from PIL import ImageGrab
-        except ImportError as exc:
-            raise RuntimeError("Pillow ImageGrab is required for spatial location") from exc
-
-        img = ImageGrab.grab()
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64_encode(buf.getvalue())
+        """Canonical capture — same path as ``capture_screen_b64()`` (scale-aware)."""
+        cap = capture_screen_b64()
+        if cap is None or not cap.b64:
+            raise RuntimeError("Screen capture failed")
+        return cap.b64
 
     def locate(
         self,
@@ -600,8 +596,18 @@ class SpatialBrain:
         scale: Optional[float],
     ) -> dict:
         if screen_b64 is None:
-            frame = self.capture_screen_png_b64()
-            scale = 1.0
+            cap = capture_screen_b64()
+            if cap is None or not cap.b64:
+                return {
+                    "found": False,
+                    "x": 0,
+                    "y": 0,
+                    "w": 0,
+                    "h": 0,
+                    "confidence": 0.0,
+                }
+            frame = cap.b64
+            scale = cap.scale
         else:
             frame = screen_b64
             if scale is None:

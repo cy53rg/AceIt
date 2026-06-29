@@ -50,6 +50,8 @@ def test_app_lock_pin_legacy_constant_salt_still_verifies():
 
     assert acct.verify_app_lock_pin(uid, "5678") is True
     assert acct.verify_app_lock_pin(uid, "1234") is False
+    migrated = acct._sec(uid, mem)["app_lock_hash"]
+    assert migrated.startswith("pbkdf2_sha256$")
 
 
 def test_change_password_rejects_cloud_only_account():

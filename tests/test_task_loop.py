@@ -95,7 +95,11 @@ def test_task_loop_step_ceiling(monkeypatch):
     engine._task_loop("never finish")
 
     status_texts = [p["text"] for t, p in engine._events if t == "task_status"]
-    assert any("step limit" in text.lower() for text in status_texts)
+    assert any(
+        "stopped after" in text.lower() or "incomplete" in text.lower()
+        for text in status_texts
+    )
+    assert any(t == "task_truncated" for t, _ in engine._events)
     assert decide_calls["n"] == limit
 
 
