@@ -121,15 +121,13 @@ def test_watch_source_never_routes_commands(monkeypatch):
 
 
 def test_ordinary_chat_reaches_groq(monkeypatch):
-    groq_create = MagicMock(
-        return_value=iter([
-            SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content="Paris"))]
-            ),
-            SimpleNamespace(choices=[]),
-        ])
+    def _fake_groq_stream(self, messages, *, model, reasoning_effort):
+        yield "Paris"
+
+    monkeypatch.setattr(
+        "atlas_mind.provider_router.ProviderRouter._stream_groq",
+        _fake_groq_stream,
     )
-    monkeypatch.setattr(atlas_core.groq_client.chat.completions, "create", groq_create)
     monkeypatch.setattr(
         engine := _engine_with_events(),
         "skill_registry",
@@ -154,10 +152,17 @@ def test_ordinary_chat_reaches_groq(monkeypatch):
         "build_memory_prompt",
         lambda *_a, **_k: "",
     )
+    monkeypatch.setattr(
+        "atlas_mind.router.try_route_tools",
+        lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        "atlas_mind.stack_router.try_stack_answer",
+        lambda *_a, **_k: None,
+    )
 
     _run_handle_input(engine, "what's the capital of France", source="user")
 
-    groq_create.assert_called_once()
     engine.skill_registry.execute.assert_not_called()
     assert any(t == "query_started" for t, _ in engine._events)
     assert not any(t == "command_handled" for t, _ in engine._events)

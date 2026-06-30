@@ -32,8 +32,10 @@ class GitHubConnector(Connector):
 
     def scope_boundary_text(self) -> str:
         return (
-            "Atlas can read your GitHub repositories and issues, and create new issues. "
-            "It cannot delete repositories, change billing, or access organization admin settings."
+            "Atlas can read your GitHub repositories and issues, create repositories and issues, "
+            "and push local folders via git. "
+            "It cannot delete repositories without typed confirmation, change billing, "
+            "or access organization admin settings."
         )
 
     def connect(self) -> tuple[bool, str]:
@@ -156,6 +158,109 @@ class GitHubConnector(Connector):
             f"/repos/{owner}/{name}/issues",
             {"title": title, "body": body},
         )
+
+    @connector_action("list_repos", RiskClass.READ_ONLY, description="List your GitHub repositories")
+    def list_repos(self, *, per_page: int = 30) -> dict:
+        data = self._api_get(f"/user/repos?per_page={max(1, min(int(per_page), 100))}&sort=updated")
+        repos = []
+        for row in data if isinstance(data, list) else []:
+            repos.append({
+                "full_name": row.get("full_name"),
+                "private": bool(row.get("private")),
+                "html_url": row.get("html_url"),
+            })
+        return {"repos": repos}
+
+    @connector_action("create_repo", RiskClass.WRITE_SCOPED, description="Create a new GitHub repository")
+    def create_repo(
+        self,
+        name: str,
+        *,
+        private: bool = False,
+        description: str = "",
+    ) -> dict:
+        payload = {
+            "name": (name or "").strip(),
+            "private": bool(private),
+            "description": (description or "")[:350],
+            "auto_init": False,
+        }
+        if not payload["name"]:
+            raise ValueError("Repository name is required")
+        return self._api_post("/user/repos", payload)
+
+    @connector_action("push_folder", RiskClass.SHELL_DANGEROUS, description="Git init/add/commit/push a folder")
+    def push_folder(
+        self,
+        folder_path: str,
+        repo: str,
+        *,
+        commit_message: str = "Atlas commit",
+        branch: str = "main",
+    ) -> dict:
+        from pathlib import Path
+
+        from atlas_shell import shell_runner
+
+        folder = Path(folder_path).expanduser().resolve()
+        if not folder.is_dir():
+            raise RuntimeError(f"Folder not found: {folder}")
+
+        tok = self._token_store.load_token(self.connector_id)
+        if not tok or not tok.get("access_token"):
+            raise RuntimeError("GitHub not connected")
+        token = str(tok["access_token"])
+        repo = (repo or "").strip().strip("/")
+        if "/" not in repo:
+            raise ValueError("repo must be owner/name")
+
+        remote = f"https://github.com/{repo}.git"
+        msg = (commit_message or "Atlas commit").replace('"', "'")[:200]
+        steps: list[tuple[str, str]] = []
+
+        if not (folder / ".git").exists():
+            steps.extend([
+                ("git init", "git init"),
+                (f"git branch -M {branch}", f"git branch -M {branch}"),
+                (f'git remote add origin "{remote}"', f"git remote add origin {repo}"),
+            ])
+        else:
+            steps.append(
+                (f'git remote set-url origin "{remote}"', f"git remote set-url origin {repo}")
+            )
+
+        steps.extend([
+            ("git add -A", "git add -A"),
+            (f'git commit -m "{msg}"', f'git commit -m "{msg}"'),
+        ])
+        push_cmd = (
+            f'git -c http.extraHeader="Authorization: Bearer {token}" '
+            f"push -u origin {branch}"
+        )
+        steps.append((push_cmd, f"git push -u origin {branch} ({repo})"))
+
+        outputs: list[str] = []
+        for cmd, audit_detail in steps:
+            result = shell_runner.run(cmd, cwd=str(folder), audit_detail=audit_detail)
+            if result.get("denied"):
+                raise PermissionError(result.get("reason") or "git command denied by policy")
+            if not result.get("ok"):
+                err = result.get("error") or (result.get("stderr") or "").strip()
+                if "nothing to commit" in (result.get("stdout") or "").lower() + err.lower():
+                    if "commit" in cmd:
+                        continue
+                if result.get("returncode") not in (0, None) and "commit" not in cmd:
+                    raise RuntimeError(err or f"git step failed: {audit_detail}")
+            out = (result.get("stdout") or "").strip()
+            if out:
+                outputs.append(out[:500])
+
+        return {
+            "repo": repo,
+            "folder": str(folder),
+            "branch": branch,
+            "output": "\n".join(outputs)[-2000:],
+        }
 
     @connector_action("delete_repo", RiskClass.IRREVERSIBLE, description="Delete a repository")
     def delete_repo(self, repo: str) -> dict:

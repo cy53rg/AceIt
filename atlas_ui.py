@@ -48,7 +48,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor, QFont, QIcon, QTextCursor, QPainter, QPen, QBrush, QAction, QDragEnterEvent, QDropEvent,
-    QRadialGradient, QCursor, QKeyEvent, QMouseEvent, QResizeEvent,
+    QRadialGradient, QCursor, QKeyEvent, QMouseEvent, QResizeEvent, QCloseEvent,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
@@ -285,6 +285,7 @@ class SignalBridge(QObject):
     stream_token       = Signal(str)
     stream_started     = Signal()
     stream_complete    = Signal(str)
+    spoken_text        = Signal(str)
     spatial_coords     = Signal(dict)
     token_usage        = Signal(dict)
     ptt_active         = Signal(bool)
@@ -2771,8 +2772,11 @@ class AtlasWindow(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(420, 520)
         self.resize(540, 760)
-        # Companion overlay: no native edge resize bands (prevents stray resize cursors).
         self._mouse_capture_locked = False
+        self._resize_active: str | None = None
+        self._resize_start_pos: QPoint | None = None
+        self._resize_start_geo: QRect | None = None
+        self.setMouseTracking(True)
 
         self._is_floating   = False
         self.bridge         = SignalBridge()
@@ -2788,6 +2792,7 @@ class AtlasWindow(QMainWindow):
         self.bridge.stream_token.connect(self._on_stream_token)
         self.bridge.stream_started.connect(self._on_stream_started)
         self.bridge.stream_complete.connect(self._on_stream_complete_slot)
+        self.bridge.spoken_text.connect(self._on_voice_spoken)
         self.bridge.token_usage.connect(self._on_token_usage)
         self.bridge.spatial_coords.connect(
             self._on_spatial_coords,
@@ -2835,6 +2840,7 @@ class AtlasWindow(QMainWindow):
                 on_error=self._on_engine_error,
                 on_coordinates=self.bridge.spatial_coords.emit,
                 on_token_usage=self.bridge.token_usage.emit,
+                on_spoken=self.bridge.spoken_text.emit,
                 step_ui_handler=self._post_step_pending,
             )
             self.state.register_permission_handler(self._daemon_fs_permission)
@@ -2942,7 +2948,6 @@ class AtlasWindow(QMainWindow):
         self._is_streaming = False
         self._interaction_source = ""
         self._stream_start_ts = 0.0
-        self._render_pending = False
         self._token_prompt = 0
         self._token_completion = 0
         self._clipboard = QApplication.clipboard()
@@ -2963,6 +2968,7 @@ class AtlasWindow(QMainWindow):
             # TTS is live by default — reflect that in the toggle so users know
             # Atlas WILL speak its replies (and can mute it here if desired).
             voice_engine.unmute()
+            voice_engine.on_spoken = lambda t: self.bridge.spoken_text.emit(t)
             self._action_ve.setChecked(True)
             self._action_ve.toggled.connect(self._toggle_voice_action)
 
@@ -3382,6 +3388,119 @@ class AtlasWindow(QMainWindow):
             w = w.parentWidget()
         return False
 
+    def _resize_margin(self) -> int:
+        return 12
+
+    def _resize_edge_at(self, local: QPoint) -> str | None:
+        """Return edge/corner id when *local* is in the resize band, else None."""
+        if self._is_floating:
+            return None
+        r = self.rect()
+        m = self._resize_margin()
+        x, y = local.x(), local.y()
+        on_l = x <= m
+        on_r = x >= r.width() - m
+        on_t = y <= m
+        on_b = y >= r.height() - m
+        if on_t and on_l:
+            return "tl"
+        if on_t and on_r:
+            return "tr"
+        if on_b and on_l:
+            return "bl"
+        if on_b and on_r:
+            return "br"
+        if on_t:
+            return "t"
+        if on_b:
+            return "b"
+        if on_l:
+            return "l"
+        if on_r:
+            return "r"
+        return None
+
+    _WIN_HT_RESIZE = {
+        "l": 10, "r": 11, "t": 12, "tl": 13, "tr": 14,
+        "b": 15, "bl": 16, "br": 17,
+    }
+
+    _EDGE_CURSORS = {
+        "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
+        "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+        "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+        "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor,
+    }
+
+    def _cursor_for_resize_edge(self, edge: str) -> Qt.CursorShape:
+        return self._EDGE_CURSORS.get(edge, Qt.ArrowCursor)
+
+    def _apply_resize_drag(self, global_pos: QPoint) -> None:
+        if not self._resize_active or not self._resize_start_geo or not self._resize_start_pos:
+            return
+        geo = QRect(self._resize_start_geo)
+        delta = global_pos - self._resize_start_pos
+        edge = self._resize_active
+        min_w = max(self.minimumWidth(), 1)
+        min_h = max(self.minimumHeight(), 1)
+
+        if edge in ("l", "tl", "bl"):
+            new_left = geo.left() + delta.x()
+            max_left = geo.right() - min_w + 1
+            geo.setLeft(min(new_left, max_left))
+        if edge in ("r", "tr", "br"):
+            geo.setWidth(max(min_w, geo.width() + delta.x()))
+        if edge in ("t", "tl", "tr"):
+            new_top = geo.top() + delta.y()
+            max_top = geo.bottom() - min_h + 1
+            geo.setTop(min(new_top, max_top))
+        if edge in ("b", "bl", "br"):
+            geo.setHeight(max(min_h, geo.height() + delta.y()))
+
+        self.setGeometry(geo)
+
+    def _begin_resize(self, edge: str, global_pos: QPoint) -> None:
+        self._resize_active = edge
+        self._resize_start_pos = global_pos
+        self._resize_start_geo = self.geometry()
+        self.lock_mouse_capture(True)
+
+    def _end_resize(self) -> None:
+        self._resize_active = None
+        self._resize_start_pos = None
+        self._resize_start_geo = None
+        self.lock_mouse_capture(False)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            edge = self._resize_edge_at(event.position().toPoint())
+            if edge:
+                self._begin_resize(edge, event.globalPosition().toPoint())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        local = event.position().toPoint()
+        if self._resize_active and event.buttons() & Qt.LeftButton:
+            self._apply_resize_drag(event.globalPosition().toPoint())
+            event.accept()
+            return
+        if not self._mouse_capture_locked and not self._is_floating:
+            edge = self._resize_edge_at(local)
+            if edge:
+                self.setCursor(self._cursor_for_resize_edge(edge))
+            elif not self._mouse_target_accepts_input(local):
+                self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._resize_active and event.button() == Qt.LeftButton:
+            self._end_resize()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
     def lock_mouse_capture(self, locked: bool = True) -> None:
         """Engage full hit-testing (e.g. while dragging the title bar or a modal)."""
         self._mouse_capture_locked = locked
@@ -3483,9 +3602,8 @@ class AtlasWindow(QMainWindow):
         """
         Windows companion-layer hit testing.
 
-        Transparent layout gutters and outer margins return HTTRANSPARENT so the
-        cursor and clicks pass through to the desktop (Skales / HeyClicky style).
-        Edge resize bands are intentionally disabled — only the QSizeGrip resizes.
+        Transparent layout gutters return HTTRANSPARENT so clicks pass through.
+        Window edges return native resize hit-test codes (HTLEFT, HTBOTTOM, …).
         """
         if platform.system() == "Windows" and eventType == b"windows_generic_MSG":
             try:
@@ -3503,8 +3621,11 @@ class AtlasWindow(QMainWindow):
                     local = self.mapFromGlobal(QPoint(gx, gy))
                     if not self.rect().contains(local):
                         return super().nativeEvent(eventType, message)
-                    if self._is_floating or not self.isVisible():
+                    if self._is_floating:
                         return True, HTTRANSPARENT
+                    edge = self._resize_edge_at(local)
+                    if edge:
+                        return True, self._WIN_HT_RESIZE[edge]
                     if self._mouse_target_accepts_input(local):
                         return True, HTCLIENT
                     return True, HTTRANSPARENT
@@ -4134,6 +4255,19 @@ class AtlasWindow(QMainWindow):
             message = str(payload.get("message", ""))
             if message:
                 QTimer.singleShot(0, lambda: self._append_response(message))
+        elif event_type == "weekly_recap":
+            text = str(payload.get("text", ""))
+            if text:
+                QTimer.singleShot(0, lambda: self._append_response(text))
+        elif event_type == "pre_meeting_brief":
+            title = str(payload.get("event_title") or "Upcoming session")
+            brief = str(payload.get("text", ""))
+            if brief:
+                def _show_brief(t=title, b=brief) -> None:
+                    self._show_pill(f"Pre-meeting brief: {t}")
+                    self._append_response(b)
+
+                QTimer.singleShot(0, _show_brief)
         elif event_type == "focus_changed":
             QTimer.singleShot(0, lambda: self._on_focus_mode_changed(
                 payload.get("enabled", False)))
@@ -4316,6 +4450,49 @@ class AtlasWindow(QMainWindow):
     def _hot_reload(self):
         self._do_reload()
 
+    def _shutdown_session(self) -> None:
+        """Stop audio, TTS, and daemon generation when the UI exits."""
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        self._stop_gen.set()
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        if self.audio:
+            try:
+                if getattr(self.audio, "mic_active", False):
+                    self.audio.stop_mic()
+                if getattr(self.audio, "speaker_active", False):
+                    self.audio.stop_speaker()
+            except Exception:
+                pass
+        if voice_engine:
+            try:
+                voice_engine.skip()
+                voice_engine.flush()
+                voice_engine.shutdown()
+            except Exception:
+                pass
+        client = getattr(self, "_daemon_client", None)
+        if client:
+            try:
+                client.stop_voice()
+            except Exception:
+                try:
+                    client.cancel_current()
+                except Exception:
+                    pass
+            try:
+                client.stop()
+            except Exception:
+                pass
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._shutdown_session()
+        super().closeEvent(event)
+
     def _do_reload(self):
         try:
             self._stop_gen.set()
@@ -4497,7 +4674,7 @@ class AtlasWindow(QMainWindow):
                     from atlas_audio import _strip_markdown
                     clean = _strip_markdown(full_text.strip())
                     if clean:
-                        voice_engine.speak(clean)
+                        voice_engine.speak(clean, echo_chat=False)
         if full_text:
             if self._is_floating:
                 self.bridge.notify_pill.emit(full_text.replace("\n", " ")[:60] + "…")
@@ -4528,13 +4705,18 @@ class AtlasWindow(QMainWindow):
             self.bridge.stream_started.emit()
         self._streaming_html += token
         self._md_ai_buffer += token
-        if not self._render_pending:
-            self._render_pending = True
-            QTimer.singleShot(120, self._flush_render)
-
-    def _flush_render(self) -> None:
-        self._render_pending = False
         self.chat_view.update_stream(self._md_ai_buffer)
+
+    @Slot(str)
+    def _on_voice_spoken(self, text: str) -> None:
+        """Show TTS utterances on the assistant side when not already streaming."""
+        if self._md_ai_streaming:
+            return
+        clean = (text or "").strip()
+        if not clean:
+            return
+        self.chat_view.add_message("assistant", clean)
+        self._chat_messages.append({"role": "assistant", "text": clean, "ts": time.time()})
 
     def _wire_message_card(self, card: object) -> None:
         if not isinstance(card, ChatMessageCard):
@@ -4549,7 +4731,7 @@ class AtlasWindow(QMainWindow):
 
     def _read_message_aloud(self, text: str) -> None:
         if voice_engine and text.strip():
-            voice_engine.speak(text.strip())
+            voice_engine.speak(text.strip(), echo_chat=False)
 
     def _pin_message(self, text: str) -> None:
         if not self.state or not text.strip():
@@ -5135,8 +5317,8 @@ class AtlasWindow(QMainWindow):
 
     def _stop_running_task(self) -> None:
         """Stop an in-flight TASK / routine loop and hide emergency-stop UI."""
-        if self.state and getattr(self.state, "_task_running", False):
-            self.state.stop_task()
+        if self.state:
+            self.state.engage_killswitch()
         else:
             self._hide_task_stop_ui()
 
@@ -5346,10 +5528,22 @@ class AtlasWindow(QMainWindow):
         src = (source or "").lower()
         if src == "mic" and self.audio and not self.audio.mic_active:
             return
+        if src == "speaker" and self.audio and not self.audio.speaker_active:
+            return
         routed = "forward"
         if self.state and getattr(self.state, "audio_watcher", None):
             routed = self.state.audio_watcher.route_transcript(text, source)
         if routed == "buffer":
+            clean_buf = (text or "").strip()
+            if src == "speaker":
+                self.bridge.set_status.emit("🔊 Speaker — context only (not sent as input)")
+                if (
+                    self.state
+                    and getattr(self.state, "glass", None)
+                    and self.state.glass.active
+                    and clean_buf
+                ):
+                    self.state.ingest_glass_transcript(clean_buf, "speaker")
             return
         if routed == "drop":
             self.bridge.set_status.emit(
@@ -5358,6 +5552,14 @@ class AtlasWindow(QMainWindow):
         clean = (text or "").strip()
         if not clean:
             return
+        if src == "mic":
+            watcher = getattr(self.state, "audio_watcher", None) if self.state else None
+            if watcher and watcher.is_likely_speaker_echo(clean):
+                self.bridge.set_status.emit("🎤 Ignored — matched speaker audio")
+                return
+            if voice_engine and voice_engine.is_echo_of_recent_speech(clean):
+                self.bridge.set_status.emit("🎤 Ignored — Atlas voice echo")
+                return
         self.bridge.set_status.emit(f"🎤 Heard ({source}) — processing…")
         msg = self.chat_view.add_message("user", clean)
         self._chat_messages.append(msg)
@@ -5459,12 +5661,20 @@ class AtlasWindow(QMainWindow):
             self._last_clipboard = text
             self._append_user_bubble(f"[clipboard] {text[:120]}…")
             if self.state:
-                threading.Thread(
-                    target=self.state.handle_input,
-                    args=(text,),
-                    kwargs={"source": "highlight"},
-                    daemon=True,
-                ).start()
+                if getattr(self.state, "glass", None) and self.state.glass.active:
+                    threading.Thread(
+                        target=self.state.handle_glass_interview_question,
+                        args=(text,),
+                        kwargs={"source": "highlight"},
+                        daemon=True,
+                    ).start()
+                else:
+                    threading.Thread(
+                        target=self.state.handle_input,
+                        args=(text,),
+                        kwargs={"source": "highlight"},
+                        daemon=True,
+                    ).start()
 
     # ═════════════════════════════════════════════════════════════════════════
     # SCREEN WATCHER
@@ -5889,6 +6099,16 @@ if __name__ == "__main__":
     win.apply_account_identity(chosen_name or "Guest")
     if win.state and win.state.focus_mode:
         win._on_focus_mode_changed(True)
+    try:
+        from atlas_onboarding import run_onboarding_if_needed
+
+        run_onboarding_if_needed(
+            engine=win.state,
+            daemon_client=daemon_client,
+            parent=win,
+        )
+    except Exception:
+        pass
     if win.telemetry and win.state:
         email = getattr(account, "email", "") if account else ""
         st = win.telemetry.check_license(email)
@@ -5897,4 +6117,5 @@ if __name__ == "__main__":
             win._on_license_update(st)
         win.telemetry.start_daily_check(email, on_update=win._on_license_update)
     win.show()
+    app.aboutToQuit.connect(win._shutdown_session)
     sys.exit(app.exec())

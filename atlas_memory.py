@@ -312,6 +312,78 @@ class UserMemory:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_takeaways_user ON session_takeaways(user_id, created DESC)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meetings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    profile TEXT NOT NULL DEFAULT 'general',
+                    summary TEXT NOT NULL DEFAULT '',
+                    started_at REAL NOT NULL,
+                    ended_at REAL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meeting_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created REAL NOT NULL,
+                    FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_meeting_chunks_meeting "
+                "ON meeting_chunks(meeting_id, created DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_meetings_user "
+                "ON meetings(user_id, started_at DESC)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS goals (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    goal_text TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    current_step INTEGER NOT NULL DEFAULT 0,
+                    steps_json TEXT NOT NULL DEFAULT '[]',
+                    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_goals_user "
+                "ON goals(user_id, updated DESC)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS atlas_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    created REAL NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_user "
+                "ON atlas_audit_log(user_id, created DESC)"
+            )
             self._migrate(conn)
 
     # Additive, idempotent column migrations on the users table — keeps existing
@@ -1767,3 +1839,330 @@ class UserMemory:
                 lines.append(f"- {takeaway} (learned {ts})")
         lines.append("</LocalContextMemory>")
         return "\n".join(lines)
+
+    # ── Atlas Glass — meetings + transcript chunks ───────────────────────────
+
+    def glass_start_meeting(
+        self,
+        user_id: int,
+        *,
+        title: str = "",
+        profile: str = "general",
+    ) -> int:
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO meetings (user_id, title, profile, summary, started_at, status)
+                VALUES (?, ?, ?, '', ?, 'active')
+                """,
+                (int(user_id), (title or "Glass session").strip()[:200], profile, now),
+            )
+            return int(cur.lastrowid or 0)
+
+    def glass_end_meeting(
+        self,
+        user_id: int,
+        meeting_id: int,
+        *,
+        summary: str = "",
+    ) -> None:
+        now = time.time()
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE meetings
+                SET ended_at = ?, status = 'ended', summary = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (now, (summary or "").strip()[:12000], int(meeting_id), int(user_id)),
+            )
+
+    def glass_add_chunk(
+        self,
+        meeting_id: int,
+        source: str,
+        text: str,
+    ) -> None:
+        body = (text or "").strip()
+        if not body:
+            return
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO meeting_chunks (meeting_id, source, text, created)
+                VALUES (?, ?, ?, ?)
+                """,
+                (int(meeting_id), (source or "user")[:32], body[:8000], time.time()),
+            )
+
+    def glass_update_profile(self, meeting_id: int, profile: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE meetings SET profile = ? WHERE id = ?",
+                ((profile or "general")[:40], int(meeting_id)),
+            )
+
+    def glass_list_meetings(self, user_id: int, *, limit: int = 30) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, profile, summary, started_at, ended_at, status
+                FROM meetings
+                WHERE user_id = ?
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (int(user_id), max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def glass_get_meeting(self, user_id: int, meeting_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, title, profile, summary, started_at, ended_at, status
+                FROM meetings
+                WHERE id = ? AND user_id = ?
+                """,
+                (int(meeting_id), int(user_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def glass_recent_chunks(
+        self,
+        meeting_id: int,
+        *,
+        limit: int = 60,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT source, text, created
+                FROM meeting_chunks
+                WHERE meeting_id = ?
+                ORDER BY created DESC
+                LIMIT ?
+                """,
+                (int(meeting_id), max(1, min(int(limit), 500))),
+            ).fetchall()
+        items = [dict(r) for r in reversed(rows)]
+        return items
+
+    def glass_search_chunks(
+        self,
+        user_id: int,
+        query: str,
+        *,
+        top_k: int = 8,
+        meeting_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        terms = [t for t in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(t) > 2]
+        if not terms:
+            return []
+        with self._connect() as conn:
+            if meeting_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT c.source, c.text, c.created, m.id AS meeting_id, m.title
+                    FROM meeting_chunks c
+                    JOIN meetings m ON m.id = c.meeting_id
+                    WHERE m.user_id = ? AND c.meeting_id = ?
+                    ORDER BY c.created DESC
+                    LIMIT 400
+                    """,
+                    (int(user_id), int(meeting_id)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT c.source, c.text, c.created, m.id AS meeting_id, m.title
+                    FROM meeting_chunks c
+                    JOIN meetings m ON m.id = c.meeting_id
+                    WHERE m.user_id = ?
+                    ORDER BY c.created DESC
+                    LIMIT 800
+                    """,
+                    (int(user_id),),
+                ).fetchall()
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            hay = f"{row['text']} {row['title']}".lower()
+            if not all(t in hay for t in terms):
+                continue
+            score = sum(3.0 if t in str(row["text"]).lower() else 1.0 for t in terms)
+            score += float(row["created"]) / 1e12
+            scored.append((score, dict(row)))
+        scored.sort(key=lambda x: -x[0])
+        return [item for _, item in scored[: max(1, min(int(top_k), 25))]]
+
+    # ── Atlas Do — goals + audit log ─────────────────────────────────────────
+
+    def goal_create(
+        self,
+        user_id: int,
+        goal_text: str,
+        *,
+        steps: list[str] | None = None,
+    ) -> str:
+        goal_id = uuid.uuid4().hex[:12]
+        now = time.time()
+        steps_json = json.dumps(list(steps or [goal_text]))
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE goals SET status = 'paused'
+                WHERE user_id = ? AND status = 'active'
+                """,
+                (int(user_id),),
+            )
+            conn.execute(
+                """
+                INSERT INTO goals (
+                    id, user_id, goal_text, status, current_step,
+                    steps_json, checkpoint_json, created, updated
+                )
+                VALUES (?, ?, ?, 'active', 0, ?, '{}', ?, ?)
+                """,
+                (
+                    goal_id,
+                    int(user_id),
+                    (goal_text or "").strip()[:4000],
+                    steps_json,
+                    now,
+                    now,
+                ),
+            )
+        return goal_id
+
+    def goal_get(self, user_id: int, goal_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, goal_text, status, current_step, steps_json, checkpoint_json,
+                       created, updated
+                FROM goals
+                WHERE id = ? AND user_id = ?
+                """,
+                (str(goal_id), int(user_id)),
+            ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        try:
+            data["steps"] = json.loads(data.pop("steps_json") or "[]")
+        except json.JSONDecodeError:
+            data["steps"] = []
+        try:
+            data["checkpoint"] = json.loads(data.pop("checkpoint_json") or "{}")
+        except json.JSONDecodeError:
+            data["checkpoint"] = {}
+        return data
+
+    def goal_get_active(self, user_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, goal_text, status, current_step, steps_json, checkpoint_json,
+                       created, updated
+                FROM goals
+                WHERE user_id = ? AND status = 'active'
+                ORDER BY updated DESC
+                LIMIT 1
+                """,
+                (int(user_id),),
+            ).fetchone()
+        if not row:
+            return None
+        return self.goal_get(user_id, str(row["id"]))
+
+    def goal_update_status(self, user_id: int, goal_id: str, status: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE goals SET status = ?, updated = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                ((status or "active")[:32], time.time(), str(goal_id), int(user_id)),
+            )
+
+    def goal_checkpoint(
+        self,
+        user_id: int,
+        goal_id: str,
+        step_index: int,
+        step_text: str = "",
+    ) -> None:
+        payload = json.dumps({
+            "step_index": int(step_index),
+            "step_text": (step_text or "")[:500],
+            "at": time.time(),
+        })
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE goals
+                SET current_step = ?, checkpoint_json = ?, updated = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (int(step_index), payload, time.time(), str(goal_id), int(user_id)),
+            )
+
+    def goal_list(self, user_id: int, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, goal_text, status, current_step, created, updated
+                FROM goals
+                WHERE user_id = ?
+                ORDER BY updated DESC
+                LIMIT ?
+                """,
+                (int(user_id), max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def audit_log(
+        self,
+        user_id: int,
+        category: str,
+        summary: str,
+        detail: dict[str, Any] | None = None,
+    ) -> int:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO atlas_audit_log (user_id, category, summary, detail_json, created)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    int(user_id),
+                    (category or "general")[:40],
+                    (summary or "")[:500],
+                    json.dumps(detail or {}),
+                    time.time(),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def audit_list(self, user_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, category, summary, detail_json, created
+                FROM atlas_audit_log
+                WHERE user_id = ?
+                ORDER BY created DESC
+                LIMIT ?
+                """,
+                (int(user_id), max(1, min(int(limit), 200))),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["detail"] = json.loads(item.pop("detail_json") or "{}")
+            except json.JSONDecodeError:
+                item["detail"] = {}
+            out.append(item)
+        return out

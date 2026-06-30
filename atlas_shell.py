@@ -138,6 +138,7 @@ class ShellRunner:
         safety_mode: str | None = None,
         timeout: int = 30,
         cwd: str | None = None,
+        audit_detail: str | None = None,
     ) -> dict:
         from atlas_policy import PolicyContext
 
@@ -157,9 +158,10 @@ class ShellRunner:
             execution_blocked=self._execution_blocked,
             write_scopes=self._write_scopes,
         )
+        policy_detail = (audit_detail or command).strip()
         auth = self._policy.authorize(
             "shell.exec",
-            command,
+            policy_detail,
             risk,
             context=ctx,
         )

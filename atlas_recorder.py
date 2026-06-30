@@ -361,9 +361,10 @@ class HarmonyStreamFilter:
     )
     _CONTROL_TOKEN_RE = re.compile(r"<\|[^|]+\|>")
 
-    def __init__(self) -> None:
+    def __init__(self, *, wait_for_final: bool = False) -> None:
         self._buf = ""
-        self._emitting = True
+        self._wait_for_final = wait_for_final
+        self._emitting = not wait_for_final
 
     def feed(self, delta: str) -> str:
         if not delta:

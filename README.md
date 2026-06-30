@@ -45,7 +45,16 @@ flowchart TB
 3. Create `.env` with `GROQ_API_KEY=...`
 4. `python verify_env.py`
 5. Start daemon (or let UI auto-start): `python -m atlas_daemon`
-6. `python atlas_ui.py`
+6. `python atlas_ui.py` — full PySide6 UI (default)
+
+**Optional — Electron shell (Phase 7):**
+
+```powershell
+python -m atlas_daemon
+powershell -ExecutionPolicy Bypass -File scripts\start_atlas_shell.ps1
+```
+
+See `docs/PHASE7_SHELL.md`.
 
 Recommended: install daemon at logon:
 
@@ -69,7 +78,8 @@ Prefs reload on account switch; FS policy syncs on daemon `set_user` and safety 
 
 | Module | Role |
 |--------|------|
-| `atlas_ui.py` | Main window, chat, overlay hooks, permission dialogs |
+| `atlas_ui.py` | Main window (PySide6), chat, overlay hooks, permission dialogs |
+| `atlas_shell/` | Optional Electron + React shell (daemon IPC) |
 | `atlas_settings_ui.py` | Accounts, security, connectors, scheduler tabs |
 | `atlas_daemon.py` | FastAPI service, owns `StateEngine` and schedulers |
 | `atlas_state_proxy.py` | UI-side proxy to daemon |
@@ -80,7 +90,7 @@ Prefs reload on account switch; FS policy syncs on daemon `set_user` and safety 
 | `atlas_policy.py` / `atlas_fs_v2.py` | Permission and scoped filesystem |
 | `atlas_apscheduler.py` | Cron jobs, weekly routine, connector dispatch |
 | `atlas_scheduler.py` | `JobScheduler` — multi-step job recovery |
-| `atlas_connectors/` | GitHub, Paystack, Gmail/Notion stubs |
+| `atlas_connectors/` | GitHub, Calendar, Gmail, Notion, Paystack, optional Composio |
 | `atlas_overlay.py` | Holo overlay, DPI scaling, WCAG captions |
 | `atlas_recorder.py` | Demonstration capture for learn-and-execute |
 | `atlas_task_safety.py` | Task loop guards and confirmation |

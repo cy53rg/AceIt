@@ -139,8 +139,10 @@ class SettingsDialog(QDialog):
         self._build_account_tab()
         self._build_connectors_tab()
         self._build_filesystem_tab()
+        self._build_glass_tab()
         self._build_ssh_tab()
         self._build_scheduler_tab()
+        self._build_activity_tab()
         self._build_security_tab()
         self._build_hotkeys_tab()
         self._build_teaching_tab()
@@ -279,7 +281,7 @@ class SettingsDialog(QDialog):
         try:
             voice_engine.set_eleven_voice(vid)
             self.ui.bridge.set_status.emit(f"Voice → {name} (ElevenLabs)")
-            voice_engine.speak(f"This is {name}, your new Atlas voice.")
+            voice_engine.speak(f"This is {name}, your new Atlas voice.", echo_chat=False)
         except Exception as exc:
             self.ui.bridge.set_status.emit(f"Voice change failed: {exc}")
 
@@ -292,7 +294,7 @@ class SettingsDialog(QDialog):
             self.ui.bridge.set_status.emit("Voice engine unavailable")
             return
         voice_engine.unmute()
-        voice_engine.speak("Atlas voice engine online. You can hear me clearly.")
+        voice_engine.speak("Atlas voice engine online. You can hear me clearly.", echo_chat=False)
         self.ui.bridge.set_status.emit("🔊 Testing voice…")
 
     def _build_appearance_tab(self) -> None:
@@ -462,6 +464,41 @@ class SettingsDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.connectors_container)
         lay.addWidget(scroll, 1)
+
+        prefs_box = QFrame()
+        prefs_box.setObjectName("ctrl_chrome")
+        prefs_lay = QVBoxLayout(prefs_box)
+        prefs_lay.addWidget(QLabel("<b>Integration preferences</b>"))
+        repo_row = QHBoxLayout()
+        repo_row.addWidget(QLabel("Default GitHub repo:"))
+        self.github_default_repo_input = QLineEdit()
+        self.github_default_repo_input.setPlaceholderText("owner/repo (used when you omit repo in chat)")
+        repo_row.addWidget(self.github_default_repo_input, 1)
+        btn_save_repo = QPushButton("Save")
+        btn_save_repo.clicked.connect(self._save_github_default_repo)
+        repo_row.addWidget(btn_save_repo)
+        prefs_lay.addLayout(repo_row)
+        cal_hint = QLabel(
+            "Google Calendar uses GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET in .env "
+            "(enable Calendar API in Google Cloud Console)."
+        )
+        cal_hint.setWordWrap(True)
+        cal_hint.setStyleSheet(f"color: {_get_pal()['muted']}; font-size: 10px;")
+        prefs_lay.addWidget(cal_hint)
+        gmail_hint = QLabel(
+            "Gmail uses the same GOOGLE_CLIENT_ID/SECRET with Gmail API enabled (port 8767 callback)."
+        )
+        gmail_hint.setWordWrap(True)
+        gmail_hint.setStyleSheet(f"color: {_get_pal()['muted']}; font-size: 10px;")
+        prefs_lay.addWidget(gmail_hint)
+        notion_hint = QLabel(
+            "Notion: set NOTION_TOKEN for internal integrations, or NOTION_CLIENT_ID/SECRET for OAuth."
+        )
+        notion_hint.setWordWrap(True)
+        notion_hint.setStyleSheet(f"color: {_get_pal()['muted']}; font-size: 10px;")
+        prefs_lay.addWidget(notion_hint)
+        lay.addWidget(prefs_box)
+
         self.tabs.addTab(w, "Connected Accounts")
         self._connectors_tab_index = self.tabs.count() - 1
         self.tabs.currentChanged.connect(
@@ -470,6 +507,12 @@ class SettingsDialog(QDialog):
     def _refresh_connectors(self) -> None:
         PAL = _get_pal()
         client = getattr(self.ui, "_daemon_client", None)
+        if hasattr(self, "github_default_repo_input") and self.engine:
+            try:
+                repo = str(self.engine.get_user_prefs().get("github_default_repo") or "")
+                self.github_default_repo_input.setText(repo)
+            except Exception:
+                pass
         while self.connectors_list.count():
             item = self.connectors_list.takeAt(0)
             if item.widget():
@@ -493,15 +536,10 @@ class SettingsDialog(QDialog):
             cid = info.get("id", "")
             name = info.get("display_name", cid)
             connected = info.get("connected", False)
-            stub = cid in ("gmail", "notion") and not connected
             status = (
                 f"<span style='color:{PAL['success']}'>Connected</span>"
                 if connected else
-                (
-                    f"<span style='color:{PAL['gold']}'>Needs configuration</span>"
-                    if stub else
-                    f"<span style='color:{PAL['muted']}'>Not connected</span>"
-                )
+                f"<span style='color:{PAL['muted']}'>Not connected</span>"
             )
             title = QLabel(f"<b>{name}</b> — {status}")
             bl.addWidget(title)
@@ -510,16 +548,7 @@ class SettingsDialog(QDialog):
             boundary.setStyleSheet(f"color: {PAL['text']}; font-size: 11px;")
             bl.addWidget(boundary)
             btn_row = QHBoxLayout()
-            if stub:
-                hint = QLabel(
-                    "Set GOOGLE_CLIENT_ID / NOTION_TOKEN in .env and connect when OAuth is wired."
-                    if cid == "gmail" else
-                    "Notion OAuth pending — connect when configured."
-                )
-                hint.setWordWrap(True)
-                hint.setStyleSheet(f"color: {PAL['muted']}; font-size: 10px;")
-                bl.addWidget(hint)
-            elif connected:
+            if connected:
                 btn = QPushButton("Disconnect")
                 btn.clicked.connect(lambda _=False, c=cid: self._connector_toggle(c, False))
             else:
@@ -548,6 +577,18 @@ class SettingsDialog(QDialog):
 
         threading.Thread(target=_work, daemon=True, name="atlas-connector").start()
 
+    def _save_github_default_repo(self) -> None:
+        if not self.engine or not hasattr(self, "github_default_repo_input"):
+            return
+        val = self.github_default_repo_input.text().strip()
+        try:
+            self.engine.set_user_pref("github_default_repo", val)
+            self.ui.bridge.set_status.emit(
+                f"Default GitHub repo saved: {val or '(cleared)'}"
+            )
+        except Exception as exc:
+            self.ui.bridge.set_status.emit(f"Could not save repo pref: {exc}")
+
     def _build_filesystem_tab(self) -> None:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -571,10 +612,41 @@ class SettingsDialog(QDialog):
         btn_rem = QPushButton("Remove selected scope")
         btn_rem.clicked.connect(self._fs_remove_scope)
         lay.addWidget(btn_rem)
+
+        idx_hdr = QLabel(
+            "<b>File search index</b> — Atlas indexes filenames under these folders "
+            "so you can say \"open my tax return\" or \"find resume PDF\".")
+        idx_hdr.setWordWrap(True)
+        lay.addWidget(idx_hdr)
+        self.fs_index_status = QLabel("Index status: —")
+        self.fs_index_status.setWordWrap(True)
+        lay.addWidget(self.fs_index_status)
+        self.fs_index_roots_list = QListWidget()
+        lay.addWidget(self.fs_index_roots_list, 1)
+        idx_row = QHBoxLayout()
+        self.fs_index_root_path = QLineEdit()
+        self.fs_index_root_path.setPlaceholderText("C:\\Users\\you\\Documents")
+        idx_row.addWidget(self.fs_index_root_path, 1)
+        btn_idx_add = QPushButton("Add index root")
+        btn_idx_add.clicked.connect(self._fs_add_index_root)
+        idx_row.addWidget(btn_idx_add)
+        lay.addLayout(idx_row)
+        idx_btn_row = QHBoxLayout()
+        btn_idx_rem = QPushButton("Remove selected index root")
+        btn_idx_rem.clicked.connect(self._fs_remove_index_root)
+        idx_btn_row.addWidget(btn_idx_rem)
+        btn_rebuild = QPushButton("Rebuild index")
+        btn_rebuild.clicked.connect(self._fs_rebuild_index)
+        idx_btn_row.addWidget(btn_rebuild)
+        idx_btn_row.addStretch()
+        lay.addLayout(idx_btn_row)
+
         self.tabs.addTab(w, "Filesystem")
         self._filesystem_tab_index = self.tabs.count() - 1
         self.tabs.currentChanged.connect(
             lambda i: self._refresh_fs_scopes() if i == self._filesystem_tab_index else None)
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_file_index() if i == self._filesystem_tab_index else None)
 
     def _refresh_fs_scopes(self) -> None:
         client = getattr(self.ui, "_daemon_client", None)
@@ -617,6 +689,287 @@ class SettingsDialog(QDialog):
                 client._post("/api/fs/write_scopes/remove", {"path": path})
                 self.ui.bridge.set_status.emit("Scope removed")
                 QTimer.singleShot(0, self._refresh_fs_scopes)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _refresh_file_index(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        self.fs_index_roots_list.clear()
+        if not client:
+            self.fs_index_status.setText("Index status: daemon not connected.")
+            self.fs_index_roots_list.addItem("Daemon not connected.")
+            return
+        try:
+            status = client._get("/api/files/index/status")
+            roots = status.get("roots") or []
+            count = status.get("indexed_files", 0)
+            rebuilding = " (rebuilding…)" if status.get("rebuilding") else ""
+            self.fs_index_status.setText(
+                f"Index status: {count:,} files indexed{rebuilding}"
+            )
+            for item in roots:
+                self.fs_index_roots_list.addItem(
+                    f"{item.get('path')}  ({item.get('label', '')})"
+                )
+            if not roots:
+                self.fs_index_roots_list.addItem("No index roots configured.")
+        except Exception as exc:
+            self.fs_index_status.setText(f"Index status: error — {exc}")
+            self.fs_index_roots_list.addItem(str(exc))
+
+    def _fs_add_index_root(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        path = self.fs_index_root_path.text().strip()
+        if not (client and path):
+            return
+
+        def _work():
+            try:
+                data = client._post("/api/files/index/roots", {"path": path})
+                self.ui.bridge.set_status.emit(data.get("message", "Done"))
+                QTimer.singleShot(0, self._refresh_file_index)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _fs_remove_index_root(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        item = self.fs_index_roots_list.currentItem()
+        if not (client and item):
+            return
+        path = item.text().split("  (")[0].strip()
+
+        def _work():
+            try:
+                client._post("/api/files/index/roots/remove", {"path": path})
+                self.ui.bridge.set_status.emit("Index root removed")
+                QTimer.singleShot(0, self._refresh_file_index)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _fs_rebuild_index(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        if not client:
+            return
+        self.ui.bridge.set_status.emit("Rebuilding file index…")
+
+        def _work():
+            try:
+                client._post("/api/files/index/rebuild", {})
+                self.ui.bridge.set_status.emit("File index rebuild started")
+                QTimer.singleShot(1500, self._refresh_file_index)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _build_glass_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        hdr = QLabel(
+            "<b>Atlas Glass</b> — live meeting and interview mode. "
+            "Toggle <b>Focus</b> in the main window to start a session. "
+            "Mic and speaker audio are kept separate; speaker text is context only.")
+        hdr.setWordWrap(True)
+        lay.addWidget(hdr)
+        self.glass_status_lbl = QLabel("Session: —")
+        self.glass_status_lbl.setWordWrap(True)
+        lay.addWidget(self.glass_status_lbl)
+        btn_row = QHBoxLayout()
+        btn_start = QPushButton("Start Glass session")
+        btn_start.clicked.connect(self._glass_start_session)
+        btn_end = QPushButton("End session")
+        btn_end.clicked.connect(self._glass_end_session)
+        btn_row.addWidget(btn_start)
+        btn_row.addWidget(btn_end)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        lay.addWidget(QLabel("<b>Interview copilot</b>"))
+        brief_hdr = QLabel(
+            "Tell Atlas how to answer (role, stack, tone). Used during Focus / Glass sessions."
+        )
+        brief_hdr.setWordWrap(True)
+        lay.addWidget(brief_hdr)
+        from PySide6.QtWidgets import QTextEdit
+
+        self.glass_interview_brief = QTextEdit()
+        self.glass_interview_brief.setPlaceholderText(
+            "e.g. Senior Python backend role. Be concise, first-person, STAR for behavioral."
+        )
+        self.glass_interview_brief.setMaximumHeight(100)
+        lay.addWidget(self.glass_interview_brief)
+        self.glass_auto_answer = QCheckBox("Auto-answer when a question is heard or detected on screen")
+        self.glass_auto_answer.setChecked(True)
+        lay.addWidget(self.glass_auto_answer)
+        self.glass_screen_watch = QCheckBox("Watch screen for written interview questions")
+        self.glass_screen_watch.setChecked(True)
+        lay.addWidget(self.glass_screen_watch)
+        btn_save_glass = QPushButton("Save interview settings")
+        btn_save_glass.clicked.connect(self._save_glass_interview_prefs)
+        lay.addWidget(btn_save_glass)
+
+        lay.addWidget(QLabel("<b>Past meetings</b>"))
+        self.glass_meetings_list = QListWidget()
+        lay.addWidget(self.glass_meetings_list, 1)
+        self.glass_meeting_detail = QLabel("Select a meeting to view its summary.")
+        self.glass_meeting_detail.setWordWrap(True)
+        self.glass_meeting_detail.setStyleSheet(f"color: {_get_pal()['text']}; font-size: 11px;")
+        lay.addWidget(self.glass_meeting_detail)
+        self.glass_meetings_list.currentItemChanged.connect(self._on_glass_meeting_selected)
+        self.tabs.addTab(w, "Glass")
+        self._glass_tab_index = self.tabs.count() - 1
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_glass_tab() if i == self._glass_tab_index else None)
+
+    def _refresh_glass_tab(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        prefs = {}
+        if self.engine:
+            try:
+                prefs = self.engine.get_user_prefs()
+            except Exception:
+                prefs = {}
+        elif client:
+            try:
+                data = client._post("/api/invoke", {
+                    "method": "get_user_prefs", "args": [], "kwargs": {},
+                })
+                prefs = data.get("result") or data.get("data") or {}
+            except Exception:
+                prefs = {}
+        self.glass_interview_brief.setPlainText(
+            str(prefs.get("glass_interview_brief") or "")
+        )
+        auto = prefs.get("glass_auto_answer")
+        self.glass_auto_answer.setChecked(True if auto is None else bool(auto))
+        screen = prefs.get("glass_screen_watch")
+        self.glass_screen_watch.setChecked(True if screen is None else bool(screen))
+        if not client:
+            self.glass_status_lbl.setText("Session: daemon not connected.")
+            return
+        try:
+            status = client._get("/api/glass/status")
+            glass = status.get("glass") or {}
+            if glass.get("active"):
+                prof = glass.get("profile", "general")
+                dur = int(glass.get("duration_s") or 0)
+                chunks = glass.get("chunk_count", 0)
+                self.glass_status_lbl.setText(
+                    f"Session: active — profile {prof}, {chunks} transcript lines, {dur // 60}m {dur % 60}s"
+                )
+            else:
+                self.glass_status_lbl.setText("Session: inactive (use Focus button or Start below)")
+        except Exception as exc:
+            self.glass_status_lbl.setText(f"Session: error — {exc}")
+        self.glass_meetings_list.clear()
+        try:
+            data = client._get("/api/glass/meetings")
+            for m in data.get("meetings") or []:
+                started = m.get("started_at") or 0
+                import time as _time
+                ts = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(float(started)))
+                title = m.get("title") or "Meeting"
+                status = m.get("status", "")
+                item = QListWidgetItem(f"{ts} — {title} ({status})")
+                item.setData(Qt.UserRole, int(m.get("id") or 0))
+                self.glass_meetings_list.addItem(item)
+        except Exception as exc:
+            self.glass_meetings_list.addItem(f"Error loading meetings: {exc}")
+
+    def _on_glass_meeting_selected(self, current, _previous) -> None:
+        if not current:
+            return
+        mid = int(current.data(Qt.UserRole) or 0)
+        if not mid:
+            return
+        client = getattr(self.ui, "_daemon_client", None)
+        if not client:
+            return
+
+        def _work():
+            try:
+                data = client._get(f"/api/glass/meetings/{mid}")
+                meeting = data.get("meeting") or {}
+                summary = (meeting.get("summary") or "").strip()
+                if not summary:
+                    chunks = data.get("chunks") or []
+                    summary = "\n".join(
+                        f"[{c.get('source')}] {c.get('text')}"
+                        for c in chunks[-12:]
+                    )
+                text = summary[:4000] if summary else "(no summary yet)"
+                QTimer.singleShot(0, lambda: self.glass_meeting_detail.setText(text))
+            except Exception as exc:
+                QTimer.singleShot(0, lambda: self.glass_meeting_detail.setText(str(exc)))
+
+        threading.Thread(target=_work, daemon=True, name="atlas-glass-detail").start()
+
+    def _save_glass_interview_prefs(self) -> None:
+        brief = self.glass_interview_brief.toPlainText().strip()
+        auto = self.glass_auto_answer.isChecked()
+        screen = self.glass_screen_watch.isChecked()
+        client = getattr(self.ui, "_daemon_client", None)
+
+        def _apply() -> tuple[bool, str]:
+            if self.engine:
+                self.engine.set_user_pref("glass_interview_brief", brief)
+                self.engine.set_user_pref("glass_auto_answer", auto)
+                self.engine.set_user_pref("glass_screen_watch", screen)
+                return True, "Interview settings saved."
+            if client:
+                for key, val in (
+                    ("glass_interview_brief", brief),
+                    ("glass_auto_answer", auto),
+                    ("glass_screen_watch", screen),
+                ):
+                    client._post("/api/invoke", {
+                        "method": "set_user_pref",
+                        "args": [key, val],
+                        "kwargs": {},
+                    })
+                return True, "Interview settings saved."
+            return False, "Not connected."
+
+        def _work() -> None:
+            ok, msg = _apply()
+            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Glass", msg if ok else msg))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _glass_start_session(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        if not client:
+            return
+        if hasattr(self.ui, "btn_focus"):
+            self.ui.btn_focus.setChecked(True)
+
+        def _work():
+            try:
+                client._post("/api/glass/meetings/start", {})
+                QTimer.singleShot(0, self._refresh_glass_tab)
+            except Exception as exc:
+                self.ui.bridge.set_status.emit(str(exc))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _glass_end_session(self) -> None:
+        client = getattr(self.ui, "_daemon_client", None)
+        if not client:
+            return
+        if hasattr(self.ui, "btn_focus"):
+            self.ui.btn_focus.setChecked(False)
+
+        def _work():
+            try:
+                client._post("/api/glass/meetings/end", {})
+                QTimer.singleShot(0, self._refresh_glass_tab)
             except Exception as exc:
                 self.ui.bridge.set_status.emit(str(exc))
 
@@ -723,6 +1076,73 @@ class SettingsDialog(QDialog):
         self._scheduler_tab_index = self.tabs.count() - 1
         self.tabs.currentChanged.connect(
             lambda i: self._refresh_scheduler_tab() if i == self._scheduler_tab_index else None)
+
+    def _build_activity_tab(self) -> None:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        lay.addWidget(QLabel(
+            "<b>Activity log</b> — what Atlas did while you were away "
+            "(goals, workflows, Glass, scheduled jobs)."
+        ))
+        row = QHBoxLayout()
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.clicked.connect(self._refresh_activity_tab)
+        btn_recap = QPushButton("Generate weekly recap")
+        btn_recap.clicked.connect(self._generate_weekly_recap)
+        row.addWidget(btn_refresh)
+        row.addWidget(btn_recap)
+        row.addStretch()
+        lay.addLayout(row)
+        self.activity_audit_list = QListWidget()
+        lay.addWidget(self.activity_audit_list, 1)
+        self.activity_recap = QLabel("")
+        self.activity_recap.setWordWrap(True)
+        lay.addWidget(self.activity_recap)
+        self.tabs.addTab(w, "Activity")
+        self._activity_tab_index = self.tabs.count() - 1
+        self.tabs.currentChanged.connect(
+            lambda i: self._refresh_activity_tab() if i == self._activity_tab_index else None)
+
+    def _refresh_activity_tab(self) -> None:
+        from datetime import datetime
+
+        self.activity_audit_list.clear()
+        entries: list = []
+        client = self._daemon_client()
+        if client:
+            try:
+                entries = client.list_audit(limit=80)
+            except Exception as exc:
+                self.activity_audit_list.addItem(f"Error: {exc}")
+                return
+        elif self.engine:
+            entries = self.engine.memory.audit_list(self.engine.user_id, limit=80)
+        if not entries:
+            self.activity_audit_list.addItem("(no activity logged yet)")
+            return
+        for row in entries:
+            ts = datetime.fromtimestamp(float(row.get("created") or 0)).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            cat = str(row.get("category") or "general")
+            summary = str(row.get("summary") or "")
+            self.activity_audit_list.addItem(f"[{ts}] ({cat}) {summary}")
+
+    def _generate_weekly_recap(self) -> None:
+        client = self._daemon_client()
+        text = ""
+        if client:
+            try:
+                text = client.get_weekly_recap(days=7)
+            except Exception as exc:
+                self.activity_recap.setText(f"Error: {exc}")
+                return
+        elif self.engine:
+            from atlas_recap import build_weekly_recap
+
+            text = build_weekly_recap(self.engine.memory, self.engine.user_id)
+        self.activity_recap.setText(text or "(nothing to recap yet)")
 
     def _daemon_client(self):
         return getattr(self.ui, "_daemon_client", None)

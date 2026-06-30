@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import re
 import shutil
 import sys
 import threading
@@ -16,6 +17,41 @@ log = logging.getLogger("atlas_skills")
 SKILL_DIR = Path.home() / ".atlas" / "skills"
 EXECUTE_TIMEOUT_S = 30
 
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def _parse_skill_md_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    match = _FRONTMATTER_RE.match(text or "")
+    if not match:
+        return {}, (text or "").strip()
+    raw_fm = match.group(1)
+    body = text[match.end():].strip()
+    manifest: dict[str, Any] = {}
+    current_key = ""
+    for line in raw_fm.splitlines():
+        if not line.strip():
+            continue
+        key_m = re.match(r"^([\w-]+):\s*(.*)$", line)
+        if key_m:
+            current_key = key_m.group(1).strip().lower()
+            val = key_m.group(2).strip()
+            if val:
+                manifest[current_key] = val.strip('"').strip("'")
+            else:
+                manifest[current_key] = []
+            continue
+        list_m = re.match(r"^\s*-\s+(.+)$", line)
+        if list_m and current_key:
+            item = list_m.group(1).strip().strip('"').strip("'")
+            cur = manifest.get(current_key)
+            if not isinstance(cur, list):
+                cur = []
+            cur.append(item)
+            manifest[current_key] = cur
+    if "triggers" in manifest and isinstance(manifest["triggers"], str):
+        manifest["triggers"] = [manifest["triggers"]]
+    return manifest, body
+
 
 class SkillRegistry:
     """Discover, install, and execute Python skill modules."""
@@ -26,7 +62,7 @@ class SkillRegistry:
         self.scan()
 
     def scan(self) -> None:
-        """Walk SKILL_DIR for *.py, validate manifest + run(), register."""
+        """Walk SKILL_DIR for *.py and SKILL.md, register manifests."""
         self._skills.clear()
         for path in sorted(SKILL_DIR.glob("*.py")):
             if path.name.startswith("_"):
@@ -49,9 +85,29 @@ class SkillRegistry:
                     "manifest": manifest,
                     "run": run_fn,
                     "path": path,
+                    "kind": "python",
                 }
             except Exception as exc:
                 log.warning("Failed to load skill %s: %s", path.name, exc)
+        for path in sorted(SKILL_DIR.rglob("SKILL.md")):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                manifest, body = _parse_skill_md_frontmatter(text)
+                name = str(manifest.get("name") or path.parent.name).strip()
+                if not name:
+                    continue
+                manifest.setdefault("name", name)
+                manifest.setdefault("display", name)
+                manifest.setdefault("version", "1.0.0")
+                manifest.setdefault("triggers", [])
+                self._skills[name] = {
+                    "manifest": manifest,
+                    "path": path,
+                    "kind": "markdown",
+                    "body": body,
+                }
+            except Exception as exc:
+                log.warning("Failed to load SKILL.md %s: %s", path, exc)
 
     def get(self, name: str) -> dict[str, Any] | None:
         return self._skills.get(name)
@@ -121,6 +177,18 @@ class SkillRegistry:
         if not entry:
             return {"response": "Skill not found.", "facts": [], "success": False}
 
+        if entry.get("kind") == "markdown":
+            body = str(entry.get("body") or "").strip()
+            manifest = entry.get("manifest") or {}
+            display = str(manifest.get("display") or name)
+            inject = f"<Skill name=\"{display}\">\n{body}\n</Skill>" if body else ""
+            return {
+                "response": "",
+                "facts": [],
+                "success": True,
+                "inject_context": inject,
+            }
+
         context = {
             "user_text": user_text,
             "history": history,
@@ -152,4 +220,5 @@ class SkillRegistry:
             "response": str(raw.get("response", "")),
             "facts": raw.get("facts", []) if isinstance(raw.get("facts"), list) else [],
             "success": bool(raw.get("success", True)),
+            "inject_context": str(raw.get("inject_context", "") or ""),
         }

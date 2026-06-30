@@ -39,11 +39,11 @@ ATLAS_WHISPER_MODEL = (
 
 def _endpoint_silence_s() -> float:
     """Trailing silence (seconds) after speech before Atlas transcribes and replies."""
-    raw = (os.environ.get("ATLAS_ENDPOINT_SILENCE_S") or "1.5").strip()
+    raw = (os.environ.get("ATLAS_ENDPOINT_SILENCE_S") or "1.0").strip()
     try:
-        return max(0.8, min(4.0, float(raw)))
+        return max(0.6, min(4.0, float(raw)))
     except ValueError:
-        return 1.5
+        return 1.0
 
 _VOICE_ALWAYS_ON = os.environ.get("ATLAS_VOICE_ALWAYS_ON", "").strip().lower() in (
     "1", "true", "yes", "on",
@@ -107,11 +107,12 @@ class AudioWatcher:
         Returns
         -------
         ``"buffer"``  — consumed silently (system-audio context buffer)
-        ``"drop"``    — consumed and discarded (user typed recently)
-        ``"forward"`` — caller should continue normal routing
+        ``"drop"``    — consumed and discarded (user typed recently / echo)
+        ``"consumed"`` — voice-always-on forwarded to copilot handler
+        ``"forward"`` — caller should continue normal routing (mic only)
         """
         src = (source or "").lower()
-        if src == "speaker" and self._copilot_active and self._system_audio:
+        if src == "speaker":
             self._append_buffer(text)
             return "buffer"
         if src == "mic" and self._copilot_active and self._voice_always_on:
@@ -126,12 +127,43 @@ class AudioWatcher:
             return "consumed"
         return "forward"
 
+    def is_likely_speaker_echo(self, mic_text: str, window_s: float = 14.0) -> bool:
+        """True when *mic_text* probably came from loopback/speaker bleed."""
+        mic = (mic_text or "").strip().lower()
+        if len(mic) < 4:
+            return False
+        cutoff = time.time() - max(2.0, float(window_s))
+        with self._lock:
+            recent = [t for ts, t in self._buffer if ts >= cutoff and t]
+        for spk in recent:
+            spk_l = spk.lower()
+            if mic in spk_l or spk_l in mic:
+                return True
+            mic_words = set(mic.split())
+            spk_words = set(spk_l.split())
+            if len(mic_words) >= 3 and mic_words and spk_words:
+                overlap = len(mic_words & spk_words) / len(mic_words)
+                if overlap >= 0.72:
+                    return True
+        return False
+
     def get_audio_context(self, seconds: float = 20.0) -> str:
         """Last *seconds* of system-audio transcript (for prompt injection)."""
+        return self.get_speaker_context(seconds)
+
+    def get_speaker_context(self, seconds: float = 20.0) -> str:
+        """Speaker / loopback channel only — never merged with mic."""
         cutoff = time.time() - max(1.0, float(seconds))
         with self._lock:
             parts = [t for ts, t in self._buffer if ts >= cutoff]
         return " ".join(parts).strip()
+
+    def get_dual_audio_context(self, seconds: float = 20.0) -> dict[str, str]:
+        """Separate mic vs speaker channels for Glass (Natively pattern)."""
+        return {
+            "speaker": self.get_speaker_context(seconds),
+            "mic": "",
+        }
 
     def _append_buffer(self, text: str) -> None:
         now = time.time()
@@ -197,7 +229,7 @@ class AudioEngine:
 
     _LISTEN_RATE         = 16_000
     _LISTEN_FRAME_MS     = 30      # 480 samples @ 16 kHz — valid webrtcvad frame
-    _ENDPOINT_SILENCE_S  = 1.5     # trailing silence before transcribe (override via env)
+    _ENDPOINT_SILENCE_S  = 1.0     # trailing silence before transcribe (override via env)
     _LISTEN_MIN_SPEECH_S = 0.25    # ignore sub-250 ms blips (clicks, taps)
     _LISTEN_MAX_S        = 30.0    # hard safety cap on a single utterance
     _LISTEN_PREROLL_S    = 0.20    # audio kept just before speech onset
@@ -324,45 +356,53 @@ class AudioEngine:
             threshold = max(self._LISTEN_ABS_FLOOR, self._listen_floor * 2.5)
         return rms > threshold
 
-    def _listen_loop(self) -> None:
+    def _capture_utterance(
+        self,
+        *,
+        stop: threading.Event,
+        finalize: threading.Event | None = None,
+        cancel: threading.Event | None = None,
+    ) -> tuple["np.ndarray | None", float]:
+        """Record one utterance using VAD endpointing; returns audio and speech duration."""
         import queue as _queue
 
         import sounddevice as sd
 
-        rate      = self._LISTEN_RATE
+        rate = self._LISTEN_RATE
         frame_len = int(rate * self._LISTEN_FRAME_MS / 1000.0)
         frame_dur = self._LISTEN_FRAME_MS / 1000.0
         preroll_frames = max(1, int(self._LISTEN_PREROLL_S / frame_dur))
+        endpoint_s = getattr(self, "_endpoint_silence_s", _endpoint_silence_s())
 
         audio_q: "_queue.Queue[np.ndarray]" = _queue.Queue()
 
         def _cb(indata, frames, time_info, status):  # noqa: ANN001
             if status:
-                log.debug("listen stream status: %s", status)
+                log.debug("utterance stream status: %s", status)
             audio_q.put(indata[:, 0].copy())
 
         collected: list[np.ndarray] = []
-        preroll:   list[np.ndarray] = []
-        speech_started   = False
+        preroll: list[np.ndarray] = []
+        speech_started = False
         trailing_silence = 0.0
-        speech_dur       = 0.0
-        start_t          = time.time()
-        done             = False
+        speech_dur = 0.0
+        start_t = time.time()
+        done = False
         buf = np.empty(0, dtype=np.float32)
 
         try:
             with sd.InputStream(
-                samplerate = rate,
-                channels   = 1,
-                dtype      = "float32",
-                blocksize  = frame_len,
-                callback   = _cb,
+                samplerate=rate,
+                channels=1,
+                dtype="float32",
+                blocksize=frame_len,
+                callback=_cb,
             ):
-                while not self._listen_stop.is_set() and not done:
-                    if self._finalize_now.is_set():
+                while not stop.is_set() and not done:
+                    if finalize is not None and finalize.is_set():
                         break
                     try:
-                        data = audio_q.get(timeout=0.1)
+                        data = audio_q.get(timeout=0.08)
                     except _queue.Empty:
                         if (time.time() - start_t) > self._LISTEN_MAX_S:
                             break
@@ -371,7 +411,7 @@ class AudioEngine:
                     buf = np.concatenate([buf, data]) if buf.size else data
                     while len(buf) >= frame_len:
                         frame = buf[:frame_len]
-                        buf   = buf[frame_len:]
+                        buf = buf[frame_len:]
 
                         if self._frame_is_voiced(frame, rate):
                             if not speech_started:
@@ -385,7 +425,7 @@ class AudioEngine:
                             if speech_started:
                                 trailing_silence += frame_dur
                                 collected.append(frame)
-                                if trailing_silence >= self._endpoint_silence_s:
+                                if trailing_silence >= endpoint_s:
                                     done = True
                                     break
                             else:
@@ -396,7 +436,35 @@ class AudioEngine:
                     if (time.time() - start_t) > self._LISTEN_MAX_S:
                         done = True
         except Exception as exc:
+            log.debug("utterance capture error: %s", exc)
+            return None, 0.0
+
+        if cancel is not None and cancel.is_set():
+            return None, 0.0
+        if not speech_started or speech_dur < self._LISTEN_MIN_SPEECH_S:
+            return None, 0.0
+
+        keep_tail = int(self._LISTEN_TAIL_KEEP_S / frame_dur)
+        drop = max(0, int(trailing_silence / frame_dur) - keep_tail)
+        if drop and drop < len(collected):
+            collected = collected[:-drop]
+        if not collected:
+            return None, 0.0
+
+        audio = np.concatenate(collected).astype(np.float32)
+        return audio, speech_dur
+
+    def _listen_loop(self) -> None:
+        try:
+            audio, speech_dur = self._capture_utterance(
+                stop=self._listen_stop,
+                finalize=self._finalize_now,
+                cancel=self._listen_cancel,
+            )
+        except Exception as exc:
             self._on_status(f"🎧 listen error: {exc}")
+            self.is_listening = False
+            return
         finally:
             self.is_listening = False
 
@@ -404,24 +472,14 @@ class AudioEngine:
             self._on_state("idle")
             return
 
-        if not speech_started or speech_dur < self._LISTEN_MIN_SPEECH_S:
+        if audio is None:
             self._on_state("idle")
             self._on_status("🎧 No speech detected")
             return
 
-        keep_tail = int(self._LISTEN_TAIL_KEEP_S / frame_dur)
-        drop = max(0, int(trailing_silence / frame_dur) - keep_tail)
-        if drop and drop < len(collected):
-            collected = collected[:-drop]
-
-        if not collected:
-            self._on_state("idle")
-            return
-
         self._on_state("processing")
         self._on_status("📝 Transcribing…")
-        audio = np.concatenate(collected).astype(np.float32)
-        self._transcribe_listen(audio, rate)
+        self._transcribe_listen(audio, self._LISTEN_RATE)
 
     def _transcribe_listen(self, audio: "np.ndarray", rate: int) -> None:
         try:
@@ -546,43 +604,26 @@ class AudioEngine:
 
     def _mic_loop(self) -> None:
         try:
-            import sounddevice as sd
+            import sounddevice as sd  # noqa: F401
         except ImportError:
             self._on_status("🎤 sounddevice not installed")
             self.mic_active = False
             return
 
-        chunk_samples = self._MIC_RATE * self._MIC_CHUNK_S
-
         while not self._mic_stop.is_set():
-            try:
-                audio = sd.rec(
-                    chunk_samples,
-                    samplerate = self._MIC_RATE,
-                    channels   = 1,
-                    dtype      = "float32",
-                )
-                sd.wait()
-                if not self._passes_voice_gate(audio, self._MIC_RATE):
-                    continue
-
-                wav_buf = self._to_wav_buffer(audio, self._MIC_RATE)
-                result  = groq_client.audio.transcriptions.create(
-                    model           = ATLAS_WHISPER_MODEL,
-                    file            = wav_buf,
-                    response_format = "text",
-                    language        = "en",
-                    temperature     = 0.0,
-                )
-                txt = result.strip() if isinstance(result, str) else result.text.strip()
-                if self._is_hallucination(txt):
-                    log.debug("Mic: dropped hallucination %r", txt)
-                    continue
-                self._on_transcript(txt, "mic")
-
-            except Exception as exc:
-                log.debug("Mic loop error: %s", exc)
-                time.sleep(1)
+            self._listen_floor = 0.005
+            self._endpoint_silence_s = _endpoint_silence_s()
+            audio, _speech_dur = self._capture_utterance(stop=self._mic_stop)
+            if self._mic_stop.is_set():
+                break
+            if audio is None:
+                continue
+            self._on_state("processing")
+            self._on_status("📝 Transcribing…")
+            self._transcribe_listen(audio, self._LISTEN_RATE)
+            if not self._mic_stop.is_set():
+                self._on_state("idle")
+                self._on_status("🎤 Mic active")
 
     def start_speaker(self) -> None:
         if self.speaker_active:
@@ -754,6 +795,24 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
+_SPEECH_SKIP_RE = re.compile(
+    r"^(?:let me think|i need to think|thinking about|analyzing|reasoning|"
+    r"step by step|first,? i(?:'ll| will)|my plan is)\b",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_for_speech(text: str) -> str:
+    """Strip markdown and meta-reasoning phrasing before TTS."""
+    clean = _strip_markdown(text or "")
+    if not clean:
+        return ""
+    if _SPEECH_SKIP_RE.match(clean):
+        return ""
+    clean = re.sub(r"<\|[^|]+\|>", "", clean)
+    return clean.strip()
+
+
 class KokoroVoiceEngine:
     _instance: Optional["KokoroVoiceEngine"] = None
 
@@ -804,7 +863,7 @@ class KokoroVoiceEngine:
     def speak(self, text: str) -> None:
         if self._muted or not text or not text.strip():
             return
-        clean = _strip_markdown(text)
+        clean = _sanitize_for_speech(text)
         if clean:
             self._queue.put(clean)
 
@@ -876,6 +935,8 @@ class KokoroVoiceEngine:
         self.speed = max(0.5, min(2.0, speed))
 
     def shutdown(self) -> None:
+        self.skip()
+        self.flush()
         self._queue.put(None)
 
     @staticmethod
@@ -1072,7 +1133,7 @@ class ElevenLabsVoiceEngine:
     def speak(self, text: str) -> None:
         if self._muted or not text or not text.strip():
             return
-        clean = _strip_markdown(text)
+        clean = _sanitize_for_speech(text)
         if clean:
             self._queue.put(clean)
 
@@ -1126,6 +1187,8 @@ class ElevenLabsVoiceEngine:
         self.last_error = ""
 
     def shutdown(self) -> None:
+        self.skip()
+        self.flush()
         self._queue.put(None)
 
     def _worker(self) -> None:
@@ -1185,20 +1248,99 @@ class ElevenLabsVoiceEngine:
 
 
 class VoiceRouter:
+    _SPEECH_IDLE_S = 0.45
+
     def __init__(self, voice: str = "af_sarah", speed: float = 1.0) -> None:
         self.kokoro = KokoroVoiceEngine(voice=voice, speed=speed)
         self.eleven = ElevenLabsVoiceEngine(fallback=self.kokoro, speed=speed)
+        self.on_spoken: Callable[[str], None] | None = None
+        self._pending_speech = ""
+        self._pending_echo_chat = True
+        self._speech_timer: threading.Timer | None = None
+        self._speech_lock = threading.Lock()
+        self._recent_spoken: list[tuple[float, str]] = []
 
     def _active(self):
         return self.eleven if self.eleven.is_active else self.kokoro
 
-    def speak(self, text: str) -> None:
-        self._active().speak(text)
+    def is_echo_of_recent_speech(self, text: str, window_s: float = 18.0) -> bool:
+        mic = (text or "").strip().lower()
+        if len(mic) < 4:
+            return False
+        cutoff = time.time() - max(2.0, float(window_s))
+        with self._speech_lock:
+            recent = [t for ts, t in self._recent_spoken if ts >= cutoff]
+        for spoken in recent:
+            if mic in spoken or spoken in mic:
+                return True
+            mic_words = set(mic.split())
+            spk_words = set(spoken.split())
+            if len(mic_words) >= 3 and mic_words and spk_words:
+                if len(mic_words & spk_words) / len(mic_words) >= 0.7:
+                    return True
+        return False
+
+    def _cancel_speech_timer(self) -> None:
+        t = self._speech_timer
+        self._speech_timer = None
+        if t is not None:
+            t.cancel()
+
+    def _arm_speech_timer(self) -> None:
+        self._cancel_speech_timer()
+        timer = threading.Timer(self._SPEECH_IDLE_S, self._flush_pending_speech)
+        timer.daemon = True
+        self._speech_timer = timer
+        timer.start()
+
+    def _flush_pending_speech(self) -> None:
+        with self._speech_lock:
+            pending = self._pending_speech.strip()
+            echo = self._pending_echo_chat
+            self._pending_speech = ""
+            self._pending_echo_chat = True
+            self._speech_timer = None
+        if pending:
+            self._emit_speech(pending, echo_chat=echo)
+
+    def _emit_speech(self, text: str, *, echo_chat: bool) -> None:
+        clean = _sanitize_for_speech(text)
+        if not clean:
+            return
+        with self._speech_lock:
+            self._recent_spoken.append((time.time(), clean.lower()))
+            if len(self._recent_spoken) > 40:
+                self._recent_spoken = self._recent_spoken[-40:]
+        if echo_chat and self.on_spoken:
+            try:
+                self.on_spoken(clean)
+            except Exception:
+                log.debug("on_spoken callback failed", exc_info=True)
+        self._active().speak(clean)
+
+    def speak(self, text: str, *, echo_chat: bool = True) -> None:
+        clean = _sanitize_for_speech(text)
+        if not clean:
+            return
+        with self._speech_lock:
+            if self._pending_speech:
+                self._pending_speech += " " + clean
+            else:
+                self._pending_speech = clean
+            self._pending_echo_chat = echo_chat
+            ready = bool(re.search(r"[.!?][\"')\]]*\s*$", self._pending_speech))
+        if ready:
+            self._cancel_speech_timer()
+            self._flush_pending_speech()
+        else:
+            self._arm_speech_timer()
 
     def skip(self) -> None:
         self.eleven.skip(); self.kokoro.skip()
 
     def flush(self) -> None:
+        self._cancel_speech_timer()
+        self._flush_pending_speech()
         self.eleven.flush(); self.kokoro.flush()
 
     def mute(self) -> None:
@@ -1255,7 +1397,13 @@ class VoiceRouter:
             ).start()
 
     def shutdown(self) -> None:
-        self.eleven.shutdown(); self.kokoro.shutdown()
+        self._cancel_speech_timer()
+        with self._speech_lock:
+            self._pending_speech = ""
+        self.skip()
+        self.flush()
+        self.eleven.shutdown()
+        self.kokoro.shutdown()
 
 
 voice_engine = VoiceRouter(voice="af_sarah", speed=1.0)

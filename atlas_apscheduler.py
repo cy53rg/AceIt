@@ -8,6 +8,7 @@ CONFIRM_TYPED / ASK while unattended → queue pending approval, never auto-esca
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -122,6 +123,8 @@ class JobDispatcher:
         safety_mode: str = DEFAULT_SAFETY_MODE,
         fs_access_active: bool = False,
         execution_blocked: bool = False,
+        run_task: Callable[[str], None] | None = None,
+        ssh_manager: Any = None,
     ) -> None:
         self.memory = memory
         self.user_id = user_id
@@ -134,6 +137,8 @@ class JobDispatcher:
         self.safety_mode = safety_mode
         self.fs_access_active = fs_access_active
         self.execution_blocked = execution_blocked
+        self._run_task = run_task
+        self._ssh_manager = ssh_manager
 
     def _ctx(self) -> PolicyContext:
         return PolicyContext(
@@ -249,6 +254,20 @@ class JobDispatcher:
                 return {"ok": False, "denied": True, "reason": "Task requires confirmation."}
             if auth.decision == PolicyOutcome.DENY:
                 return {"ok": False, "denied": True, "reason": auth.reason}
+            if auth.decision == PolicyOutcome.ALLOW and self._run_task:
+                threading.Thread(
+                    target=self._run_task,
+                    args=(goal,),
+                    daemon=True,
+                    name="atlas-scheduled-task",
+                ).start()
+                self._log_activity(
+                    source=source,
+                    category="task",
+                    summary=f"Started scheduled task: {goal[:100]}",
+                    detail={"goal": goal},
+                )
+                return {"ok": True, "started": True, "goal": goal}
             self._log_activity(
                 source=source,
                 category="task",
@@ -270,6 +289,8 @@ class JobDispatcher:
         connector_id = str(action.get("connector") or "")
         method = str(action.get("method") or "")
         params = dict(action.get("params") or {})
+        if connector_id == "ssh":
+            return self._execute_ssh(action, job_id=job_id, source=source, attended=attended)
         if not self.connectors:
             return {"ok": False, "error": "connector registry unavailable"}
 
@@ -334,6 +355,83 @@ class JobDispatcher:
         )
         return result
 
+    def _execute_ssh(
+        self,
+        action: dict[str, Any],
+        *,
+        job_id: str,
+        source: str,
+        attended: bool,
+    ) -> dict[str, Any]:
+        if not self._ssh_manager:
+            return {"ok": False, "error": "ssh manager unavailable"}
+        from atlas_connectors.ssh_targets import SSH_ACTION_RISKS
+
+        params = dict(action.get("params") or {})
+        target = str(action.get("target") or params.get("target") or "").strip()
+        command = str(action.get("command") or params.get("command") or "").strip()
+        method = str(action.get("method") or "run_command").strip()
+        if method == "run":
+            method = "run_command"
+        if method == "run_command" and (not target or not command):
+            return {"ok": False, "error": "ssh requires target and command"}
+        if method == "service_status":
+            service = str(params.get("service") or command or "").strip()
+            if not target or not service:
+                return {"ok": False, "error": "ssh service_status requires target and service"}
+            detail = f"ssh://{target}/service_status/{service}"
+            risk = SSH_ACTION_RISKS.get("ssh.service_status", RiskClass.SHELL_SAFE)
+            auth = self.policy.authorize(
+                "ssh.service_status",
+                detail,
+                risk,
+                context=self._ctx(),
+            )
+            if auth.decision in (PolicyOutcome.CONFIRM_TYPED, PolicyOutcome.ASK):
+                if not attended:
+                    return self._queue_pending(
+                        action_type="ssh.service_status",
+                        detail=detail,
+                        risk_class=risk,
+                        auth=auth,
+                        job_id=job_id,
+                    )
+                return {"ok": False, "denied": True, "reason": auth.reason or "Confirmation required."}
+            if auth.decision == PolicyOutcome.DENY:
+                return {"ok": False, "denied": True, "reason": auth.reason}
+            result = self._ssh_manager.service_status(target, service)
+        else:
+            detail = f"ssh://{target}/{command[:200]}"
+            risk = SSH_ACTION_RISKS.get("ssh.run_command", RiskClass.SHELL_DANGEROUS)
+            auth = self.policy.authorize(
+                "ssh.run_command",
+                detail,
+                risk,
+                context=self._ctx(),
+            )
+            if auth.decision in (PolicyOutcome.CONFIRM_TYPED, PolicyOutcome.ASK):
+                if not attended:
+                    return self._queue_pending(
+                        action_type="ssh.run_command",
+                        detail=detail,
+                        risk_class=risk,
+                        auth=auth,
+                        job_id=job_id,
+                    )
+                return {"ok": False, "denied": True, "reason": auth.reason or "Confirmation required."}
+            if auth.decision == PolicyOutcome.DENY:
+                return {"ok": False, "denied": True, "reason": auth.reason}
+            result = self._ssh_manager.run_command(target, command)
+        ok = bool(result.get("ok"))
+        self._log_activity(
+            source=source,
+            category="ssh",
+            summary=f"ssh {target}: {'ok' if ok else result.get('error', 'failed')}",
+            detail=result,
+            status="completed" if ok else "failed",
+        )
+        return result if isinstance(result, dict) else {"ok": ok, "result": result}
+
     def dispatch_goal(self, goal: str, *, job_id: str = "", source: str = "scheduled") -> dict[str, Any]:
         """Classify and route a free-text goal."""
         route = classify_task(goal)
@@ -387,6 +485,14 @@ class WeeklyRoutineRunner:
         pending = self.memory.list_scheduler_pending(self.user_id, status="pending")
 
         digest = self._build_digest(activity, pending, checklist_results, diagnostics)
+        try:
+            from atlas_recap import build_weekly_recap
+
+            recap = build_weekly_recap(self.memory, self.user_id)
+            if recap:
+                digest = f"{digest}\n\n---\n\n{recap}"
+        except Exception as exc:
+            log.warning("weekly recap append failed: %s", exc)
         self.memory.log_scheduler_activity(
             self.user_id,
             source="weekly_routine",
@@ -414,6 +520,10 @@ class WeeklyRoutineRunner:
         reg = getattr(self.dispatcher, "connectors", None)
         out: list[dict[str, Any]] = []
         for item in items:
+            prepared = self._prepare_checklist_item(dict(item))
+            if prepared is None:
+                continue
+            item = prepared
             if item.get("route") != "connector":
                 out.append(dict(item))
                 continue
@@ -425,6 +535,21 @@ class WeeklyRoutineRunner:
                     continue
             out.append(dict(item))
         return tuple(out)
+
+    def _prepare_checklist_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        if item.get("connector") == "github" and item.get("method") == "list_issues":
+            params = dict(item.get("params") or {})
+            if not params.get("repo"):
+                repo = (os.environ.get("ATLAS_GITHUB_DEFAULT_REPO") or "").strip()
+                if not repo:
+                    prefs = self.memory.get_prefs(self.user_id)
+                    repo = str(prefs.get("github_default_repo") or "").strip()
+                if not repo:
+                    log.info("weekly routine: skipping github list_issues — no default repo")
+                    return None
+                params["repo"] = repo
+            item["params"] = params
+        return item
 
     def _build_digest(
         self,

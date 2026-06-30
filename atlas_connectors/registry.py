@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from atlas_connectors.base import Connector, ConnectorActionSpec
 from atlas_connectors.gmail import GmailConnector
 from atlas_connectors.github import GitHubConnector
+from atlas_connectors.google_calendar import GoogleCalendarConnector
 from atlas_connectors.notion import NotionConnector
 from atlas_connectors.paystack import PaystackConnector
 from atlas_connectors.tokens import TokenStore
@@ -61,10 +63,15 @@ class ConnectorRegistry:
         self._policy = policy_engine or PolicyEngine(self._db_path, user_id=user_id)
         self._connectors: dict[str, Connector] = {
             "github": GitHubConnector(self._tokens),
+            "google_calendar": GoogleCalendarConnector(self._tokens),
             "paystack": PaystackConnector(self._tokens),
             "gmail": GmailConnector(self._tokens),
             "notion": NotionConnector(self._tokens),
         }
+        if (os.environ.get("COMPOSIO_API_KEY") or "").strip():
+            from atlas_connectors.composio_bridge import ComposioBridgeConnector
+
+            self._connectors["composio"] = ComposioBridgeConnector(self._tokens)
         global ACTION_RISK_MAP
         ACTION_RISK_MAP = _build_action_risk_map(self._connectors)
         self._permission_handler: Optional[PermissionHandler] = None

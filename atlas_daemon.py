@@ -34,6 +34,7 @@ _connectors = None
 _ssh_manager = None
 _dispatcher = None
 _playbooks = None
+_file_indexer = None
 _ui_bridge: Optional["UIBridge"] = None
 
 
@@ -133,7 +134,7 @@ class UIBridge:
 
 def _init_services(user_name: str = "default") -> None:
     global _state, _account, _memory, _scheduler, _apscheduler, _connectors
-    global _ui_bridge, _ssh_manager, _dispatcher, _playbooks
+    global _ui_bridge, _ssh_manager, _dispatcher, _playbooks, _file_indexer
 
     from atlas_accounts import AccountManager
     from atlas_connectors.registry import ConnectorRegistry
@@ -165,6 +166,13 @@ def _init_services(user_name: str = "default") -> None:
 
     def _on_token_usage(usage: dict) -> None:
         _ui_bridge.broadcast({"type": "token_usage", "usage": usage})
+
+    from atlas_audio import voice_engine as _voice_engine
+
+    def _on_spoken(text: str) -> None:
+        _ui_bridge.broadcast({"type": "spoken", "text": text})
+
+    _voice_engine.on_spoken = _on_spoken
 
     _state = StateEngine(
         on_chunk=_on_chunk,
@@ -342,6 +350,8 @@ def _init_services(user_name: str = "default") -> None:
         safety_mode=str(getattr(_state, "safety_mode", None) or DEFAULT_SAFETY_MODE),
         fs_access_active=bool(getattr(_state, "_fs_access_active", False)),
         execution_blocked=bool(getattr(_state, "execution_blocked", False)),
+        run_task=lambda goal: _state.run_task(goal),
+        ssh_manager=_ssh_manager,
     )
 
     from atlas_data import atlas_data_dir
@@ -355,6 +365,14 @@ def _init_services(user_name: str = "default") -> None:
     )
     _apscheduler.configure_weekly_routine(day_of_week="mon", hour=8, minute=0)
     _apscheduler.start()
+    _state.apscheduler = _apscheduler
+
+    from atlas_files.indexer import FileIndexer
+
+    _file_indexer = FileIndexer(atlas_db_path())
+    _file_indexer.ensure_default_roots()
+    _state.file_indexer = _file_indexer
+    _file_indexer.start_background_rebuild_if_stale()
 
     _scheduler.start()
     log.info("Atlas daemon services ready (db=%s)", atlas_db_path())
@@ -429,16 +447,19 @@ def _state_invoke(method: str, args: list, kwargs: dict) -> Any:
 
 def create_app():
     from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+    from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
     from atlas_core import atlas_fs
 
     app = FastAPI(title="Atlas Daemon", docs_url=None, redoc_url=None)
-
-    class HandleInputBody(BaseModel):
-        text: str
-        source: str = "user"
-        webcam_b64: str | None = None
-        screen_b64: str | None = None
+    # Electron + Vite dev shell (Phase 7) — daemon is localhost-only.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     class GenericBody(BaseModel):
         method: str
@@ -455,15 +476,29 @@ def create_app():
         }
 
     @app.post("/api/handle_input")
-    def handle_input(body: HandleInputBody):
+    def api_handle_input(body: dict):
         if _state is None:
             raise HTTPException(503, "state not ready")
-        if body.screen_b64:
-            _state.inject_screen_capture(body.screen_b64)
+        text = str(body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(400, "text is required")
+        source = str(body.get("source") or "user")
+        webcam_b64 = body.get("webcam_b64")
+        screen_b64 = body.get("screen_b64")
+        if screen_b64:
+            _state.inject_screen_capture(screen_b64)
+        if source == "highlight" and _state.glass.active:
+            target = _state.handle_glass_interview_question
+            thread_args: tuple = (text,)
+            thread_kwargs = {"source": "highlight"}
+        else:
+            target = _state.handle_input
+            thread_args = (text,)
+            thread_kwargs = {"source": source, "webcam_b64": webcam_b64}
         threading.Thread(
-            target=_state.handle_input,
-            args=(body.text,),
-            kwargs={"source": body.source, "webcam_b64": body.webcam_b64},
+            target=target,
+            args=thread_args,
+            kwargs=thread_kwargs,
             daemon=True,
             name="atlas-handle-input",
         ).start()
@@ -471,6 +506,25 @@ def create_app():
 
     @app.post("/api/cancel")
     def cancel():
+        if _state:
+            _state.cancel_current()
+        try:
+            from atlas_audio import voice_engine as _ve
+            _ve.skip()
+            _ve.flush()
+        except Exception:
+            pass
+        return {"ok": True}
+
+    @app.post("/api/voice/stop")
+    def voice_stop():
+        """Immediately silence TTS and drop queued speech."""
+        try:
+            from atlas_audio import voice_engine as _ve
+            _ve.skip()
+            _ve.flush()
+        except Exception:
+            pass
         if _state:
             _state.cancel_current()
         return {"ok": True}
@@ -559,6 +613,118 @@ def create_app():
         if _state and hasattr(_state, "_sync_fs_policy"):
             _state._sync_fs_policy()
         return {"ok": True}
+
+    @app.get("/api/files/index/status")
+    def files_index_status():
+        if _file_indexer is None:
+            raise HTTPException(503, "file indexer not ready")
+        return _file_indexer.status()
+
+    @app.post("/api/files/index/rebuild")
+    def files_index_rebuild():
+        if _file_indexer is None:
+            raise HTTPException(503, "file indexer not ready")
+        return _file_indexer.rebuild(async_run=True)
+
+    @app.get("/api/files/index/roots")
+    def files_index_list_roots():
+        if _file_indexer is None:
+            raise HTTPException(503, "file indexer not ready")
+        return {"roots": _file_indexer.list_roots()}
+
+    @app.post("/api/files/index/roots")
+    def files_index_add_root(body: dict):
+        if _file_indexer is None:
+            raise HTTPException(503, "file indexer not ready")
+        ok, msg = _file_indexer.add_root(
+            str(body.get("path", "")),
+            label=str(body.get("label", "")),
+        )
+        return {"ok": ok, "message": msg}
+
+    @app.post("/api/files/index/roots/remove")
+    def files_index_remove_root(body: dict):
+        if _file_indexer is None:
+            raise HTTPException(503, "file indexer not ready")
+        _file_indexer.remove_root(str(body.get("path", "")))
+        return {"ok": True}
+
+    @app.get("/api/glass/status")
+    def glass_status():
+        if _state is None:
+            raise HTTPException(503, "state not ready")
+        return {"glass": _state.glass.status(), "focus_mode": _state.focus_mode}
+
+    @app.get("/api/glass/meetings")
+    def glass_list_meetings(limit: int = 30):
+        if _state is None or _memory is None:
+            raise HTTPException(503, "not ready")
+        return {"meetings": _memory.glass_list_meetings(_state.user_id, limit=limit)}
+
+    @app.get("/api/glass/meetings/{meeting_id}")
+    def glass_get_meeting(meeting_id: int):
+        if _state is None or _memory is None:
+            raise HTTPException(503, "not ready")
+        meeting = _memory.glass_get_meeting(_state.user_id, int(meeting_id))
+        if not meeting:
+            raise HTTPException(404, "meeting not found")
+        chunks = _memory.glass_recent_chunks(int(meeting_id), limit=500)
+        return {"meeting": meeting, "chunks": chunks}
+
+    @app.post("/api/glass/meetings/start")
+    def glass_start_meeting(body: dict):
+        if _state is None:
+            raise HTTPException(503, "state not ready")
+        if not _state.focus_mode:
+            _state.set_focus_mode(True)
+        return {"ok": True, "status": _state.glass.status()}
+
+    @app.post("/api/glass/meetings/end")
+    def glass_end_meeting():
+        if _state is None:
+            raise HTTPException(503, "state not ready")
+        _state.set_focus_mode(False)
+        return {"ok": True, "status": _state.glass.status()}
+
+    @app.post("/api/killswitch")
+    def engage_killswitch():
+        if _state is None:
+            raise HTTPException(503, "state not ready")
+        _state.engage_killswitch()
+        return {"ok": True}
+
+    @app.get("/api/goals")
+    def list_goals(limit: int = 20):
+        if _memory is None or _state is None:
+            raise HTTPException(503, "state not ready")
+        active = _memory.goal_get_active(_state.user_id)
+        goals = _memory.goal_list(_state.user_id, limit=limit)
+        return {"active": active, "goals": goals}
+
+    @app.post("/api/goals/start")
+    def start_goal(body: dict):
+        if _state is None:
+            raise HTTPException(503, "state not ready")
+        goal_text = str(body.get("goal") or "").strip()
+        if not goal_text:
+            raise HTTPException(400, "goal required")
+        goal_id = _state.goals.start(goal_text)
+        return {"ok": True, "goal_id": goal_id}
+
+    @app.get("/api/audit")
+    def list_audit(limit: int = 50):
+        if _memory is None or _state is None:
+            raise HTTPException(503, "state not ready")
+        return {"entries": _memory.audit_list(_state.user_id, limit=limit)}
+
+    @app.get("/api/recap")
+    def weekly_recap(days: int = 7):
+        if _memory is None or _state is None:
+            raise HTTPException(503, "state not ready")
+        from atlas_recap import build_weekly_recap
+
+        text = build_weekly_recap(_memory, _state.user_id, days=max(1, min(days, 30)))
+        return {"recap": text}
 
     @app.post("/api/shell/run")
     def shell_run(body: dict):

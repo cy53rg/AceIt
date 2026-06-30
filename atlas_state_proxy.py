@@ -143,6 +143,7 @@ class AtlasStateProxy:
         on_error: Callable[[str], None],
         on_coordinates: Callable[[dict], None],
         on_token_usage: Callable[[dict], None],
+        on_spoken: Callable[[str], None] | None = None,
         step_ui_handler: Callable[[_RemoteStepPending], None] | None = None,
     ) -> None:
         self._client = client
@@ -151,6 +152,7 @@ class AtlasStateProxy:
         self._on_error = on_error
         self._on_coordinates = on_coordinates
         self._on_token_usage = on_token_usage
+        self._on_spoken = on_spoken
         self._step_ui_handler = step_ui_handler
         self._listeners: list[Callable] = []
         self._permission_handler: Callable[[str, str], bool] | None = None
@@ -218,6 +220,9 @@ class AtlasStateProxy:
             self._on_coordinates(dict(msg.get("coord") or {}))
         elif msg_type == "token_usage":
             self._on_token_usage(dict(msg.get("usage") or {}))
+        elif msg_type == "spoken":
+            if self._on_spoken:
+                self._on_spoken(str(msg.get("text", "")))
         elif msg_type == "state_event":
             self._emit_local(str(msg.get("event_type", "")), dict(msg.get("payload") or {}))
             if msg.get("event_type") == "task_running":
@@ -341,8 +346,11 @@ class AtlasStateProxy:
         *,
         webcam_b64: str | None = None,
     ) -> None:
+        clean = (text or "").strip()
+        if not clean:
+            return
         self.audio_watcher.mark_user_typed()
-        self._client.handle_input(text, source, webcam_b64=webcam_b64)
+        self._client.handle_input(clean, source, webcam_b64=webcam_b64)
 
     def cancel_current(self) -> None:
         self._client.cancel_current()

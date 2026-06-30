@@ -261,11 +261,15 @@ class DaemonClient:
         webcam_b64: str | None = None,
         screen_b64: str | None = None,
     ) -> None:
+        clean = (text or "").strip()
+        if not clean:
+            log.debug("handle_input skipped: empty text (source=%r)", source)
+            return
         self._post(
             "/api/handle_input",
             {
-                "text": text,
-                "source": source,
+                "text": clean,
+                "source": source or "user",
                 "webcam_b64": webcam_b64,
                 "screen_b64": screen_b64,
             },
@@ -273,6 +277,10 @@ class DaemonClient:
 
     def cancel_current(self) -> None:
         self._post("/api/cancel")
+
+    def stop_voice(self) -> None:
+        """Stop daemon TTS and cancel any in-flight generation."""
+        self._post("/api/voice/stop")
 
     def stop_task(self) -> None:
         self._post("/api/stop_task")
@@ -367,6 +375,13 @@ class DaemonClient:
             )
             or []
         )
+
+    def list_audit(self, *, limit: int = 50) -> list[dict]:
+        return list(self._get("/api/audit", params={"limit": limit}).get("entries") or [])
+
+    def get_weekly_recap(self, *, days: int = 7) -> str:
+        data = self._get("/api/recap", params={"days": days})
+        return str(data.get("recap") or "")
 
     # ── Account RPC ───────────────────────────────────────────────────────────
 

@@ -1,5 +1,12 @@
 ﻿
-# Virtual environment
+# Node / Electron shell
+
+atlas_shell/node_modules/
+
+atlas_shell/dist/
+
+atlas_shell/.vite/
+
 
 .venv/
 
@@ -58,4 +65,6 @@ Thumbs.db
 desktop.ini
 
 .DS_Store
+
+.cursor/
 
