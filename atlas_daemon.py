@@ -7,6 +7,8 @@ The UI (atlas_ui.py) connects via localhost HTTP + WebSocket (atlas_ipc.py).
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -38,6 +40,43 @@ _file_indexer = None
 _ui_bridge: Optional["UIBridge"] = None
 
 
+async def _daemon_websocket_endpoint(websocket) -> None:
+    """Starlette WS handler (bypasses FastAPI param parsing; PEP 563 breaks WebSocket injection)."""
+    from starlette.websockets import WebSocketDisconnect
+
+    await websocket.accept()
+    outbound: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _sender() -> None:
+        while True:
+            raw = await outbound.get()
+            if raw is None:
+                break
+            await websocket.send_text(raw)
+
+    sender_task = asyncio.create_task(_sender())
+    if _ui_bridge:
+        _ui_bridge.attach(websocket, outbound)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if _ui_bridge:
+                _ui_bridge.handle_client_message(msg)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if _ui_bridge:
+            _ui_bridge.detach(websocket)
+        await outbound.put(None)
+        sender_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sender_task
+
+
 def _sync_daemon_user(user_id: int) -> None:
     """Keep scheduler/connector subsystems aligned after account switch."""
     if _connectors is not None:
@@ -65,35 +104,46 @@ class UIBridge:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._connections: list[Any] = []
+        self._connections: list[tuple[Any, asyncio.Queue[str | None]]] = []
         self._pending: dict[str, threading.Event] = {}
         self._responses: dict[str, dict] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-    def attach(self, ws: Any) -> None:
+    def attach(self, ws: Any, outbound: asyncio.Queue[str | None]) -> None:
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         with self._lock:
-            self._connections.append(ws)
+            self._connections.append((ws, outbound))
 
     def detach(self, ws: Any) -> None:
         with self._lock:
-            try:
-                self._connections.remove(ws)
-            except ValueError:
-                pass
+            self._connections = [(w, q) for w, q in self._connections if w is not ws]
+
+    def _enqueue_sync(self, queue: asyncio.Queue[str | None], raw: str) -> None:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError("WebSocket event loop not available")
+        fut = asyncio.run_coroutine_threadsafe(queue.put(raw), loop)
+        fut.result(timeout=5.0)
 
     def broadcast(self, payload: dict) -> None:
         raw = json.dumps(payload)
         with self._lock:
-            dead = []
-            for ws in self._connections:
-                try:
-                    ws.send_text(raw)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                try:
-                    self._connections.remove(ws)
-                except ValueError:
-                    pass
+            connections = list(self._connections)
+        dead: list[Any] = []
+        for ws, queue in connections:
+            try:
+                self._enqueue_sync(queue, raw)
+            except Exception as exc:
+                log.debug("WebSocket broadcast failed: %s", exc)
+                dead.append(ws)
+        if dead:
+            with self._lock:
+                self._connections = [
+                    (w, q) for w, q in self._connections if w not in dead
+                ]
 
     def request(
         self,
@@ -446,9 +496,8 @@ def _state_invoke(method: str, args: list, kwargs: dict) -> Any:
 
 
 def create_app():
-    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
-    from pydantic import BaseModel
     from atlas_core import atlas_fs
 
     app = FastAPI(title="Atlas Daemon", docs_url=None, redoc_url=None)
@@ -460,11 +509,6 @@ def create_app():
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    class GenericBody(BaseModel):
-        method: str
-        args: list = []
-        kwargs: dict = {}
 
     @app.get("/health")
     def health():
@@ -805,9 +849,12 @@ def create_app():
         }
 
     @app.post("/api/invoke")
-    def invoke(body: GenericBody):
+    def invoke(body: dict):
+        method = str(body.get("method") or "")
+        args = list(body.get("args") or [])
+        kwargs = dict(body.get("kwargs") or {})
         try:
-            result = _state_invoke(body.method, body.args, body.kwargs)
+            result = _state_invoke(method, args, kwargs)
         except PermissionError as exc:
             raise HTTPException(403, str(exc)) from exc
         except Exception as exc:
@@ -819,8 +866,11 @@ def create_app():
         return {"available": bool(_account and _account.cloud_available)}
 
     @app.post("/api/accounts/call")
-    def accounts_call(body: GenericBody):
-        return _account_call(body.method, body.args, body.kwargs)
+    def accounts_call(body: dict):
+        method = str(body.get("method") or "")
+        args = list(body.get("args") or [])
+        kwargs = dict(body.get("kwargs") or {})
+        return _account_call(method, args, kwargs)
 
     @app.post("/api/jobs/enqueue")
     def jobs_enqueue(body: dict):
@@ -954,25 +1004,9 @@ def create_app():
             **body,
         )
 
-    @app.websocket("/ws")
-    async def websocket_endpoint(ws: WebSocket):
-        await ws.accept()
-        if _ui_bridge:
-            _ui_bridge.attach(ws)
-        try:
-            while True:
-                raw = await ws.receive_text()
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if _ui_bridge:
-                    _ui_bridge.handle_client_message(msg)
-        except WebSocketDisconnect:
-            pass
-        finally:
-            if _ui_bridge:
-                _ui_bridge.detach(ws)
+    from starlette.routing import WebSocketRoute
+
+    app.router.routes.append(WebSocketRoute("/ws", endpoint=_daemon_websocket_endpoint))
 
     return app
 

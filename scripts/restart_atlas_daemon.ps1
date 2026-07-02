@@ -7,10 +7,10 @@ $Port = if ($env:ATLAS_DAEMON_PORT) { $env:ATLAS_DAEMON_PORT } else { "17847" }
 
 $lines = netstat -ano | Select-String ":$Port\s" | Select-String "LISTENING"
 foreach ($line in $lines) {
-    $pid = ($line -split '\s+')[-1]
-    if ($pid -match '^\d+$') {
-        Write-Host "Stopping PID $pid on port $Port..."
-        taskkill /PID $pid /F | Out-Null
+    $procId = ($line -split '\s+')[-1]
+    if ($procId -match '^\d+$') {
+        Write-Host "Stopping PID $procId on port $Port..."
+        taskkill /PID $procId /F | Out-Null
     }
 }
 

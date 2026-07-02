@@ -562,6 +562,7 @@ class SettingsDialog(QDialog):
     def _connector_toggle(self, connector_id: str, connect: bool) -> None:
         client = getattr(self.ui, "_daemon_client", None)
         if not client:
+            QMessageBox.warning(self, "Atlas", "Daemon not connected — restart Atlas.")
             return
         path = f"/api/connectors/{connector_id}/{'connect' if connect else 'disconnect'}"
         self.ui.bridge.set_status.emit(f"{'Connecting' if connect else 'Disconnecting'} {connector_id}…")
@@ -569,11 +570,26 @@ class SettingsDialog(QDialog):
         def _work():
             try:
                 data = client._post(path, {})
-                msg = data.get("message", "Done")
+                msg = str(data.get("message") or "Done")
+                ok = bool(data.get("ok", True))
                 self.ui.bridge.set_status.emit(msg)
+                if connect and not ok:
+                    QTimer.singleShot(
+                        0,
+                        lambda: QMessageBox.warning(
+                            self,
+                            f"Could not connect {connector_id}",
+                            msg + "\n\nCheck .env for API keys (see Settings → Connected Accounts).",
+                        ),
+                    )
                 QTimer.singleShot(0, self._refresh_connectors)
             except Exception as exc:
-                self.ui.bridge.set_status.emit(f"Connector error: {exc}")
+                err = str(exc)
+                self.ui.bridge.set_status.emit(f"Connector error: {err}")
+                QTimer.singleShot(
+                    0,
+                    lambda: QMessageBox.warning(self, "Connector error", err),
+                )
 
         threading.Thread(target=_work, daemon=True, name="atlas-connector").start()
 

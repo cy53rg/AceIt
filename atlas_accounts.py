@@ -193,7 +193,10 @@ class SupabaseSync:
         if not self._ensure_client():
             return (False, "Cloud sync isn't configured.")
         try:
-            self._client.auth.sign_in_with_otp({"email": email})
+            self._client.auth.sign_in_with_otp({
+                "email": email,
+                "options": {"should_create_user": True},
+            })
             return (True, "Check your email for a 6-digit code.")
         except Exception as exc:
             self.last_error = str(exc)
@@ -211,9 +214,15 @@ class SupabaseSync:
             res = self._client.auth.verify_otp(
                 {"email": email, "token": token, "type": "email"})
             user = getattr(res, "user", None)
+            if user is None and isinstance(res, dict):
+                user = res.get("user")
             if user is None:
                 return (False, "Invalid or expired code.")
-            self._cloud_id = getattr(user, "id", None)
+            self._cloud_id = getattr(user, "id", None) or (
+                user.get("id") if isinstance(user, dict) else None
+            )
+            if not self._cloud_id:
+                return (False, "Invalid or expired code.")
             return (True, "Signed in.")
         except Exception as exc:
             self.last_error = str(exc)

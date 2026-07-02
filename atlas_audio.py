@@ -231,7 +231,7 @@ class AudioEngine:
     _LISTEN_FRAME_MS     = 30      # 480 samples @ 16 kHz — valid webrtcvad frame
     _ENDPOINT_SILENCE_S  = 1.0     # trailing silence before transcribe (override via env)
     _LISTEN_MIN_SPEECH_S = 0.25    # ignore sub-250 ms blips (clicks, taps)
-    _LISTEN_MAX_S        = 30.0    # hard safety cap on a single utterance
+    _LISTEN_MAX_S        = 18.0    # hard safety cap on a single utterance
     _LISTEN_PREROLL_S    = 0.20    # audio kept just before speech onset
     _LISTEN_TAIL_KEEP_S  = 0.12    # minimal trailing silence sent to Whisper
     _LISTEN_ABS_FLOOR    = 0.010   # absolute RMS floor for the fallback detector
@@ -1261,7 +1261,10 @@ class VoiceRouter:
         self._recent_spoken: list[tuple[float, str]] = []
 
     def _active(self):
-        return self.eleven if self.eleven.is_active else self.kokoro
+        prefer = (os.environ.get("ATLAS_TTS_ENGINE") or "kokoro").strip().lower()
+        if prefer == "eleven" and self.eleven.is_active:
+            return self.eleven
+        return self.kokoro
 
     def is_echo_of_recent_speech(self, text: str, window_s: float = 18.0) -> bool:
         mic = (text or "").strip().lower()

@@ -2375,7 +2375,11 @@ class TwoFactorDialog(QDialog):
         self.verified = False
 
     def _verify(self) -> None:
-        ok, msg, uid = self.account.complete_pending_2fa(self.code_in.text().strip())
+        try:
+            ok, msg, uid = self.account.complete_pending_2fa(self.code_in.text().strip())
+        except Exception as exc:
+            self.msg.setText(str(exc))
+            return
         if ok:
             self.verified = True
             self.accept()
@@ -2383,8 +2387,11 @@ class TwoFactorDialog(QDialog):
             self.msg.setText(msg)
 
     def _resend(self) -> None:
-        ok, msg = self.account.start_2fa_challenge(
-            self.user_id, getattr(self.account, "_pending_2fa_email", ""))
+        try:
+            ok, msg = self.account.start_2fa_challenge(
+                self.user_id, getattr(self.account, "_pending_2fa_email", ""))
+        except Exception as exc:
+            ok, msg = False, str(exc)
         self.msg.setStyleSheet(f"color: {PAL['success'] if ok else PAL['danger']}; "
                                f"font-size: 11px;")
         self.msg.setText(msg)
@@ -2601,8 +2608,13 @@ class LoginDialog(QDialog):
         if not self.account or self._busy:
             return
         email = self.otp_email.text().strip()
+        if not email:
+            return self._fail("Enter your email.")
         self._set_busy(True, "Sending code…")
-        ok, msg = self.account.cloud.send_email_otp(email)
+        try:
+            ok, msg = self.account.cloud.send_email_otp(email)
+        except Exception as exc:
+            return self._fail(f"Couldn't send code: {exc}")
         self._set_busy(False)
         self.msg.setStyleSheet(
             f"font-size: 11px; color: {PAL['success'] if ok else PAL['danger']};")
@@ -2613,6 +2625,8 @@ class LoginDialog(QDialog):
             return
         email = self.otp_email.text().strip()
         code = self.otp_code.text().strip()
+        if not email or not code:
+            return self._fail("Enter the email and code from your inbox.")
         self._set_busy(True, "Verifying…")
         try:
             ok, msg, uid = self.account.login_otp_cloud(email, code)
@@ -2673,8 +2687,13 @@ class LoginDialog(QDialog):
 
     def _set_busy(self, busy: bool, label: str = "") -> None:
         self._busy = busy
-        for b in (self.btn_signin, self.btn_create, self.btn_guest):
-            b.setEnabled(not busy)
+        for b in (
+            self.btn_signin, self.btn_create, self.btn_guest,
+            getattr(self, "btn_send_code", None),
+            getattr(self, "btn_otp", None),
+        ):
+            if b is not None:
+                b.setEnabled(not busy)
         if not busy:
             self._refresh_strength()   # restore create-button gating
         if label:
@@ -2711,16 +2730,16 @@ class LoginDialog(QDialog):
                 ok, msg, uid = self.account.login_local(ident, pw or None)
         except Exception as exc:
             return self._fail(f"Sign-in error: {exc}")
+        if msg == "2FA_REQUIRED" and uid:
+            needs, method = self.account.needs_2fa(uid)
+            twofa = TwoFactorDialog(
+                self.account, uid, method,
+                getattr(self.account, "_pending_2fa_email", ident), self)
+            if twofa.exec() == QDialog.Accepted and twofa.verified:
+                disp = ident.split("@")[0] if "@" in ident else ident
+                return self._finish(uid, disp)
+            return self._fail("Two-step verification required.")
         if ok:
-            if msg == "2FA_REQUIRED":
-                needs, method = self.account.needs_2fa(uid)
-                twofa = TwoFactorDialog(
-                    self.account, uid, method,
-                    getattr(self.account, "_pending_2fa_email", ident), self)
-                if twofa.exec() == QDialog.Accepted and twofa.verified:
-                    disp = ident.split("@")[0] if "@" in ident else ident
-                    return self._finish(uid, disp)
-                return self._fail("Two-step verification required.")
             self._finish(uid, ident.split("@")[0] if "@" in ident else ident)
         else:
             self._fail(msg or "Sign-in failed.")
@@ -2768,10 +2787,10 @@ class AtlasWindow(QMainWindow):
 
     def __init__(self, daemon_client: Optional["DaemonClient"] = None):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Window)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setMinimumSize(420, 520)
-        self.resize(540, 760)
+        self.setMinimumSize(480, 560)
+        self.resize(580, 820)
         self._mouse_capture_locked = False
         self._resize_active: str | None = None
         self._resize_start_pos: QPoint | None = None
@@ -2896,6 +2915,7 @@ class AtlasWindow(QMainWindow):
 
         self._build_ui()
         self._bind_hotkeys()
+        self._install_resize_tracking()
 
         # ── Standalone float widgets ──────────────────────────────────────────
         self._bubble   = FloatBubble()
@@ -3256,7 +3276,7 @@ class AtlasWindow(QMainWindow):
         ws_lay.addLayout(resp_lay)
 
         # Status bar
-        self.status_lbl = QLabel("  Ready")
+        self.status_lbl = QLabel("  Atlas online")
         self.status_lbl.setStyleSheet(f"color: {PAL['muted']}; font-size: 10px; padding: 4px 14px;")
         ws_lay.addWidget(self.status_lbl)
 
@@ -3389,7 +3409,7 @@ class AtlasWindow(QMainWindow):
         return False
 
     def _resize_margin(self) -> int:
-        return 12
+        return 18
 
     def _resize_edge_at(self, local: QPoint) -> str | None:
         """Return edge/corner id when *local* is in the resize band, else None."""
@@ -3535,7 +3555,7 @@ class AtlasWindow(QMainWindow):
     def _release_companion_mode(
         self,
         *,
-        status: str = "Ready",
+        status: str = "Atlas online",
         error: str = "",
         finalize_thinking: bool = True,
     ) -> None:
@@ -3574,7 +3594,44 @@ class AtlasWindow(QMainWindow):
         text = msg if msg.startswith("⚠") or "Couldn't" in msg else friendly_error("api", msg)
         self._release_companion_mode(error=f"⚠ {text.lstrip('⚠ ')}", finalize_thinking=True)
 
+    def _install_resize_tracking(self) -> None:
+        """Edge resize works on child widgets, not only the bare window rect."""
+        for w in (self.root_widget, self.workspace, self.header):
+            if isinstance(w, QWidget):
+                w.setMouseTracking(True)
+                w.installEventFilter(self)
+
+    def _map_event_to_window(self, obj, event) -> QPoint:
+        if isinstance(obj, QWidget) and obj is not self:
+            return obj.mapTo(self, event.position().toPoint())
+        return event.position().toPoint()
+
+    def _handle_resize_event(self, obj, event) -> bool:
+        if self._is_floating:
+            return False
+        et = event.type()
+        local = self._map_event_to_window(obj, event)
+        if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            edge = self._resize_edge_at(local)
+            if edge:
+                self._begin_resize(edge, event.globalPosition().toPoint())
+                return True
+        if et == QEvent.MouseMove:
+            if self._resize_active and event.buttons() & Qt.LeftButton:
+                self._apply_resize_drag(event.globalPosition().toPoint())
+                return True
+            edge = self._resize_edge_at(local)
+            if edge:
+                self.setCursor(self._cursor_for_resize_edge(edge))
+                return False
+        if et == QEvent.MouseButtonRelease and self._resize_active:
+            self._end_resize()
+            return True
+        return False
+
     def eventFilter(self, obj, event) -> bool:
+        if obj in (self.root_widget, self.workspace) and self._handle_resize_event(obj, event):
+            return True
         if obj is getattr(self, "header", None):
             et = event.type()
             if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
@@ -3616,9 +3673,13 @@ class AtlasWindow(QMainWindow):
 
                 msg = wintypes.MSG.from_address(int(message))
                 if msg.message == WM_NCHITTEST:
-                    gx = ctypes.c_short(msg.lParam & 0xFFFF).value
-                    gy = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
-                    local = self.mapFromGlobal(QPoint(gx, gy))
+                    x = msg.lParam & 0xFFFF
+                    y = (msg.lParam >> 16) & 0xFFFF
+                    if x >= 32768:
+                        x -= 65536
+                    if y >= 32768:
+                        y -= 65536
+                    local = self.mapFromGlobal(QPoint(int(x), int(y)))
                     if not self.rect().contains(local):
                         return super().nativeEvent(eventType, message)
                     if self._is_floating:
@@ -3805,7 +3866,7 @@ class AtlasWindow(QMainWindow):
         if hasattr(self, "chat_view"):
             self._append_response(msg)
         self.bridge.set_status.emit(msg)
-        QTimer.singleShot(3000, lambda: self.bridge.set_status.emit("  Ready"))
+        QTimer.singleShot(3000, lambda: self.bridge.set_status.emit("  Atlas online"))
 
     def _on_focus_mode_changed(self, enabled: bool) -> None:
         """Interview / Focus mode side effects — UI sync, stealth, mic, reminders."""
@@ -4536,36 +4597,37 @@ class AtlasWindow(QMainWindow):
     # ═════════════════════════════════════════════════════════════════════════
 
     def _bind_hotkeys(self):
-        keyboard.add_hotkey("ctrl+shift+s", lambda: (
-            self.bridge.set_status.emit("Triggering Capture"), self._do_capture()
-        ))
-        keyboard.add_hotkey("ctrl+shift+h", lambda: (
-            self.bridge.set_status.emit("Triggering Highlight"), self._toggle_highlight()
-        ))
-        keyboard.add_hotkey("ctrl+shift+w", lambda: (
-            self.bridge.set_status.emit("Triggering Watcher"), self._toggle_watch()
-        ))
-        keyboard.add_hotkey("ctrl+r", lambda: self._do_reload())
-        keyboard.add_hotkey("ctrl+comma", lambda: self._open_settings())
-        keyboard.add_hotkey("ctrl+l", lambda: self._clear_text())
-        keyboard.add_hotkey("ctrl+e", lambda: self._export_session())
+        try:
+            keyboard.add_hotkey("ctrl+shift+s", lambda: (
+                self.bridge.set_status.emit("Triggering Capture"), self._do_capture()
+            ))
+            keyboard.add_hotkey("ctrl+shift+h", lambda: (
+                self.bridge.set_status.emit("Triggering Highlight"), self._toggle_highlight()
+            ))
+            keyboard.add_hotkey("ctrl+shift+w", lambda: (
+                self.bridge.set_status.emit("Triggering Watcher"), self._toggle_watch()
+            ))
+            keyboard.add_hotkey("ctrl+r", lambda: self._do_reload())
+            keyboard.add_hotkey("ctrl+comma", lambda: self._open_settings())
+            keyboard.add_hotkey("ctrl+l", lambda: self._clear_text())
+            keyboard.add_hotkey("ctrl+e", lambda: self._export_session())
 
-        # Emergency stop for autonomous TASK / routine loops — works globally,
-        # even when another app has keyboard focus.
-        keyboard.add_hotkey(
-            "ctrl+shift+escape",
-            lambda: self.bridge.task_stop.emit(),
-        )
+            # Emergency stop for autonomous TASK / routine loops — works globally,
+            # even when another app has keyboard focus.
+            keyboard.add_hotkey(
+                "ctrl+shift+escape",
+                lambda: self.bridge.task_stop.emit(),
+            )
 
-        # ── Talk hotkey: dedicated global shortcut (Ctrl+Space / Alt+Space) ───
-        # TAP to start a listening session; Atlas auto-responds after a ~1.5s pause.
-        # Tap again while it is thinking/talking to interrupt and start listening
-        # anew. A single low-level Space hook keeps the gesture from getting stuck
-        # when the UI loses focus; the modifier is checked at press time. These
-        # callbacks run on the keyboard listener thread, so all Qt/engine work is
-        # marshalled to the main thread through SignalBridge.
-        keyboard.on_press_key("space", self._ptt_key_down, suppress=False)
-        keyboard.on_release_key("space", self._ptt_key_up, suppress=False)
+            # ── Talk hotkey: dedicated global shortcut (Ctrl+Space / Alt+Space) ───
+            keyboard.on_press_key("space", self._ptt_key_down, suppress=False)
+            keyboard.on_release_key("space", self._ptt_key_up, suppress=False)
+        except Exception as exc:
+            if HAS_LOGGING:
+                get_logger("atlas.ui").warning("Global hotkeys unavailable: %s", exc)
+            self.bridge.set_status.emit(
+                "  Atlas online (some hotkeys unavailable — run as admin?)"
+            )
 
     # ═════════════════════════════════════════════════════════════════════════
     # QUERY PIPELINE
@@ -6092,7 +6154,17 @@ if __name__ == "__main__":
         if chosen_name:
             os.environ["ATLAS_USER"] = chosen_name
 
-    win = AtlasWindow(daemon_client=daemon_client)
+    try:
+        win = AtlasWindow(daemon_client=daemon_client)
+    except Exception as exc:
+        _global_excepthook(type(exc), exc, exc.__traceback__)
+        QMessageBox.critical(
+            None,
+            "Atlas could not start",
+            "The main window failed to open. Atlas will exit.\n\n"
+            f"{exc}",
+        )
+        sys.exit(1)
     win.account = account
     if account and chosen_uid and win.state:
         win.state.set_user(chosen_uid, chosen_name)
@@ -6117,5 +6189,6 @@ if __name__ == "__main__":
             win._on_license_update(st)
         win.telemetry.start_daily_check(email, on_update=win._on_license_update)
     win.show()
+    win.bridge.set_status.emit("  Atlas online")
     app.aboutToQuit.connect(win._shutdown_session)
     sys.exit(app.exec())

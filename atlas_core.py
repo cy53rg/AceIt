@@ -2629,7 +2629,8 @@ class StateEngine:
         "look at my", "look at my screen", "this page", "this window",
         "right now on", "what's on", "whats on", "what's happening",
         "whats happening", "can you see", "are you seeing", "what am i looking",
-        "help with this error",
+        "what i'm working", "what im working", "what i am working",
+        "see what i'm", "see what im", "working on", "help with this error",
     )
 
     def set_screen_vision(self, enabled: bool) -> None:
@@ -3283,7 +3284,9 @@ class StateEngine:
         # Strips [[GUIDE/DO:…]] tokens from the visible/spoken stream in real time
         # and surfaces them to the action dispatcher (Section 6).
         bracket    = _StreamBracketFilter()
-        harmony    = HarmonyStreamFilter(wait_for_final=str(model).startswith("openai/gpt-oss"))
+        # Groq's API already splits reasoning vs content on gpt-oss models
+        # (see provider_router); do not wait for harmony channel markers in content.
+        harmony    = HarmonyStreamFilter(wait_for_final=False)
         coord_filt = StreamCoordinateFilter()
         coord_tag: dict | None = None
 
@@ -3399,9 +3402,7 @@ class StateEngine:
                 cont_raw = self._continue_after_research(raw_user_text)
                 if cont_raw:
                     cont_bracket = _StreamBracketFilter()
-                    cont_harmony = HarmonyStreamFilter(
-                        wait_for_final=str(model).startswith("openai/gpt-oss"),
-                    )
+                    cont_harmony = HarmonyStreamFilter(wait_for_final=False)
                     cont_visible, cont_tokens = cont_bracket.feed(cont_raw)
                     cont_tail, cont_tail_tokens = cont_bracket.flush()
                     cont_visible = (
