@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import wave
+from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -52,6 +53,18 @@ _CAPTURE_SYSTEM_AUDIO = os.environ.get("ATLAS_CAPTURE_SYSTEM_AUDIO", "").strip()
     "1", "true", "yes", "on",
 )
 
+_AUDIO_CONTEXT_MAXLEN = 100
+
+
+def _audio_context_ttl_s() -> float:
+    """How long speaker-context snippets stay in the passive audio ring buffer."""
+    raw = (os.environ.get("ATLAS_AUDIO_CONTEXT_TTL_SECONDS") or "300").strip()
+    try:
+        return max(30.0, min(7200.0, float(raw)))
+    except ValueError:
+        return 300.0
+
+
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
 
@@ -62,7 +75,6 @@ class AudioWatcher:
     """
 
     _USER_TYPED_GRACE_S = 5.0
-    _BUFFER_MAX_S = 60.0
 
     def __init__(
         self,
@@ -73,11 +85,19 @@ class AudioWatcher:
         self._copilot_active = False
         self._voice_always_on = _VOICE_ALWAYS_ON
         self._system_audio = _CAPTURE_SYSTEM_AUDIO
-        self._buffer: list[tuple[float, str]] = []
+        self._buffer_ttl_s = _audio_context_ttl_s()
+        self._buffer: deque[tuple[float, str]] = deque(maxlen=_AUDIO_CONTEXT_MAXLEN)
         self._user_typed_at = 0.0
         self._mic_started = False
         self._spk_started = False
         self._lock = threading.Lock()
+
+    def _prune_buffer(self, now: float | None = None) -> None:
+        """Drop speaker-context entries older than the configured TTL."""
+        current = now if now is not None else time.time()
+        cutoff = current - self._buffer_ttl_s
+        while self._buffer and self._buffer[0][0] < cutoff:
+            self._buffer.popleft()
 
     def bind_audio(self, engine: "AudioEngine") -> None:
         self._audio = engine
@@ -134,6 +154,7 @@ class AudioWatcher:
             return False
         cutoff = time.time() - max(2.0, float(window_s))
         with self._lock:
+            self._prune_buffer()
             recent = [t for ts, t in self._buffer if ts >= cutoff and t]
         for spk in recent:
             spk_l = spk.lower()
@@ -155,6 +176,7 @@ class AudioWatcher:
         """Speaker / loopback channel only — never merged with mic."""
         cutoff = time.time() - max(1.0, float(seconds))
         with self._lock:
+            self._prune_buffer()
             parts = [t for ts, t in self._buffer if ts >= cutoff]
         return " ".join(parts).strip()
 
@@ -166,11 +188,13 @@ class AudioWatcher:
         }
 
     def _append_buffer(self, text: str) -> None:
+        clean = (text or "").strip()
+        if not clean:
+            return
         now = time.time()
         with self._lock:
-            self._buffer.append((now, text.strip()))
-            cutoff = now - self._BUFFER_MAX_S
-            self._buffer = [(ts, t) for ts, t in self._buffer if ts >= cutoff and t]
+            self._prune_buffer(now)
+            self._buffer.append((now, clean))
 
     def _start_passive_audio(self) -> None:
         if not self._audio:
@@ -838,9 +862,26 @@ class KokoroVoiceEngine:
         self._skip_event  = threading.Event()
         self._ready       = False
         self._kokoro      = None
+        self._Kokoro_cls  = None
         self._sd          = None
         self._cur_stream  = None
         self._is_speaking = False
+        self._event_listeners: list[Callable[[str, dict], None]] = []
+
+        try:
+            from kokoro_onnx import Kokoro  # type: ignore
+
+            self._Kokoro_cls = Kokoro
+            self._kokoro_available = True
+        except ImportError:
+            log.warning("Kokoro TTS not available; audio disabled.")
+            self._kokoro_available = False
+        except Exception as exc:
+            log.warning("Kokoro TTS not available; audio disabled. (%s)", exc)
+            self._kokoro_available = False
+        else:
+            if self._Kokoro_cls is None:
+                self._kokoro_available = False
 
         self._worker_thread = threading.Thread(
             target = self._worker,
@@ -850,9 +891,20 @@ class KokoroVoiceEngine:
         self._worker_thread.start()
         KokoroVoiceEngine._instance = self
 
+    def on_event(self, listener: Callable[[str, dict], None]) -> None:
+        """Register ``listener(event_type, payload)`` for TTS lifecycle hooks."""
+        self._event_listeners.append(listener)
+
+    def _emit(self, event_type: str, payload: dict) -> None:
+        for listener in self._event_listeners:
+            try:
+                listener(event_type, payload)
+            except Exception:
+                log.debug("Kokoro event listener failed", exc_info=True)
+
     def preload(self) -> None:
         """Load Kokoro models in the background so the first speak() is instant."""
-        if self._ready:
+        if self._ready or not self._kokoro_available:
             return
         threading.Thread(
             target=self._ensure_kokoro_loaded,
@@ -862,6 +914,10 @@ class KokoroVoiceEngine:
 
     def speak(self, text: str) -> None:
         if self._muted or not text or not text.strip():
+            return
+        if not self._kokoro_available:
+            log.debug("TTS disabled; skipping audio.")
+            self._emit("speak_complete", {})
             return
         clean = _sanitize_for_speech(text)
         if clean:
@@ -952,13 +1008,14 @@ class KokoroVoiceEngine:
     def _ensure_kokoro_loaded(self) -> bool:
         if self._ready:
             return True
+        if not self._kokoro_available or self._Kokoro_cls is None:
+            return False
         if self._kokoro is not None and not self._ready:
             return False
         try:
-            from kokoro_onnx import Kokoro  # type: ignore
             import sounddevice as _sd
 
-            self._kokoro = Kokoro(self._model_path, self._voices_path)
+            self._kokoro = self._Kokoro_cls(self._model_path, self._voices_path)
             self._sd = _sd
 
             try:
@@ -983,6 +1040,7 @@ class KokoroVoiceEngine:
             return True
         except Exception as exc:
             self._kokoro = None
+            self._kokoro_available = False
             log.warning(
                 "KokoroVoiceEngine: load failed (%s). TTS disabled.",
                 exc,
@@ -999,10 +1057,16 @@ class KokoroVoiceEngine:
             if self._muted:
                 continue
 
+            if not self._kokoro_available:
+                log.debug("TTS disabled; skipping audio.")
+                self._emit("speak_complete", {})
+                continue
+
             if not self._ready:
                 if not self._ensure_kokoro_loaded():
                     if not load_failed_logged:
                         load_failed_logged = True
+                    self._emit("speak_complete", {})
                     continue
 
             self._skip_event.clear()
@@ -1055,6 +1119,7 @@ class KokoroVoiceEngine:
             log.warning("Kokoro synthesis/playback error: %s", exc)
         finally:
             self._is_speaking = False
+            self._emit("speak_complete", {})
 
 
 _ELEVEN_MODEL       = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")

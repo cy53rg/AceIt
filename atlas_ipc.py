@@ -32,6 +32,14 @@ class DaemonError(RuntimeError):
     pass
 
 
+def _compute_ipc_timeout(payload: dict | None, *, minimum: float = 30.0) -> tuple[float, float]:
+    """Return (timeout_seconds, payload_size_mb) for IPC requests."""
+    raw = json.dumps(payload or {})
+    payload_size_mb = len(raw) / 1_000_000
+    timeout = max(minimum, payload_size_mb * 10 + minimum)
+    return timeout, payload_size_mb
+
+
 def _daemon_port_open() -> bool:
     import socket
     host = daemon_host()
@@ -53,7 +61,9 @@ def ensure_daemon_running(timeout: float = 30.0) -> DaemonClient:
     import sys
 
     client = DaemonClient(auto_connect=False)
-    if client.health():
+    health = client.health()
+    if health is not None:
+        client._verify_protocol_response(health)
         client.start_event_stream()
         return client
 
@@ -95,12 +105,15 @@ def ensure_daemon_running(timeout: float = 30.0) -> DaemonClient:
             f"Start manually: python -m atlas_daemon\n"
             f"Details: {log_path}"
         )
+    client._verify_protocol_response(client.health())
     client.start_event_stream()
     return client
 
 
 class DaemonClient:
     """HTTP + WebSocket client for atlas_daemon."""
+
+    PROTOCOL_VERSION = 1
 
     def __init__(self, base_url: str | None = None, *, auto_connect: bool = True) -> None:
         self.base_url = (base_url or daemon_base_url()).rstrip("/")
@@ -111,8 +124,16 @@ class DaemonClient:
         self._pending: dict[str, threading.Event] = {}
         self._responses: dict[str, Any] = {}
         self._lock = threading.Lock()
+        self._verify_protocol_response(self.health())
         if auto_connect:
             self.start_event_stream()
+
+    def _verify_protocol_response(self, response: dict | None) -> None:
+        if response is None:
+            return
+        if response.get("protocol_version", 0) != self.PROTOCOL_VERSION:
+            log.error("Daemon protocol version mismatch. Restart daemon after update.")
+            raise DaemonError("Protocol version mismatch.")
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -120,17 +141,22 @@ class DaemonClient:
     def wait_for_health(self, timeout: float = 15.0) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.health():
+            if self.health() is not None:
                 return True
             time.sleep(0.35)
         return False
 
-    def health(self) -> bool:
+    def health(self) -> dict | None:
         try:
             r = self._session.get(self._url("/health"), timeout=2.0)
-            return r.status_code == 200 and r.json().get("ok")
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            if data.get("ok"):
+                return data
         except Exception:
-            return False
+            return None
+        return None
 
     def on_message(self, fn: Callable[[dict], None]) -> None:
         self._listeners.append(fn)
@@ -150,27 +176,50 @@ class DaemonClient:
             except Exception:
                 log.exception("ipc listener error")
 
-    def send_ws(self, payload: dict) -> None:
+    def send_ws(
+        self,
+        payload: dict,
+        *,
+        on_progress: Callable[[float], None] | None = None,
+    ) -> None:
         """Best-effort WebSocket send (no-op if disconnected)."""
-        # Stored on ws thread via module-level ref set by _ws_loop
         ws = getattr(self, "_ws", None)
         if ws is None:
             return
         try:
-            ws.send(json.dumps(payload))
+            raw = json.dumps(payload)
+            if on_progress:
+                on_progress(0.0)
+            ws.send(raw)
+            if on_progress:
+                on_progress(1.0)
         except Exception:
             log.debug("ws send failed", exc_info=True)
 
-    def request_ui(self, payload: dict, *, timeout: float = 300.0) -> dict:
-        """Send a request to daemon that expects a UI response round-trip."""
+    def request(
+        self,
+        payload: dict,
+        *,
+        timeout: float | None = None,
+        on_send_progress: Callable[[float], None] | None = None,
+    ) -> dict:
+        """Send a WebSocket request and wait for a matching *_response message."""
         req_id = str(uuid.uuid4())
         payload = dict(payload)
         payload["id"] = req_id
+        wait_s, payload_size_mb = _compute_ipc_timeout(payload)
+        if timeout is not None:
+            wait_s = max(wait_s, float(timeout))
+        log.debug(
+            "IPC request timeout: %.1f seconds for %.2f MB payload",
+            wait_s,
+            payload_size_mb,
+        )
         ev = threading.Event()
         with self._lock:
             self._pending[req_id] = ev
-        self.send_ws(payload)
-        if not ev.wait(timeout=timeout):
+        self.send_ws(payload, on_progress=on_send_progress)
+        if not ev.wait(timeout=wait_s):
             with self._lock:
                 self._pending.pop(req_id, None)
             return {"approved": False, "timeout": True}
@@ -178,6 +227,20 @@ class DaemonClient:
             resp = self._responses.pop(req_id, {})
             self._pending.pop(req_id, None)
         return resp
+
+    def request_ui(
+        self,
+        payload: dict,
+        *,
+        timeout: float | None = None,
+        on_send_progress: Callable[[float], None] | None = None,
+    ) -> dict:
+        """Send a request to daemon that expects a UI response round-trip."""
+        return self.request(
+            payload,
+            timeout=timeout,
+            on_send_progress=on_send_progress,
+        )
 
     def respond(self, req_id: str, payload: dict) -> None:
         out = dict(payload)
@@ -232,10 +295,17 @@ class DaemonClient:
     # ── HTTP RPC ──────────────────────────────────────────────────────────────
 
     def _post(self, path: str, body: dict | None = None) -> Any:
+        payload = body or {}
+        timeout, payload_size_mb = _compute_ipc_timeout(payload)
+        log.debug(
+            "IPC request timeout: %.1f seconds for %.2f MB payload",
+            timeout,
+            payload_size_mb,
+        )
         r = self._session.post(
             self._url(path),
-            json=body or {},
-            timeout=120.0,
+            json=payload,
+            timeout=timeout,
         )
         if r.status_code >= 400:
             raise DaemonError(r.text or f"HTTP {r.status_code}")

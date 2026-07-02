@@ -99,6 +99,7 @@ load_dotenv()
 # ATLAS_CHAT_MODEL   — default chat model for queries
 # ATLAS_VISION_MODEL — vision model for screen locate / GUIDE / DO / TASK
 _default_chat = "openai/gpt-oss-120b"
+GROQ_DEFAULT_MODEL = _default_chat
 GROQ_MODEL = (os.environ.get("ATLAS_CHAT_MODEL") or _default_chat).strip() or _default_chat
 
 _default_fast_model = "llama-3.1-8b-instant"
@@ -175,7 +176,12 @@ from atlas_do.constants import (
 from atlas_do.guide import verify_step_completion
 from atlas_do.hands import AtlasHands
 from atlas_mind.modes import MODE_SYSTEMS, ModeState
-from atlas_mind.model_health import probe_groq_model as _probe_groq_model_impl
+from atlas_mind.model_health import (
+    get_available_groq_models,
+    groq_completions_create,
+    probe_groq_model as _probe_groq_model_impl,
+    resolve_groq_model,
+)
 from atlas_mind.prompts import (
     RESPONSE_STYLES,
     _ATLAS_FOCUS_SUFFIX,
@@ -190,6 +196,53 @@ _StreamBracketFilter = StreamBracketFilter
 
 def _probe_groq_model(model: str, *, vision: bool = False) -> bool:
     return _probe_groq_model_impl(groq_client, model, vision=vision)
+
+
+def validate_groq_models_at_startup(groq_client_override=None) -> None:
+    """
+    Log and correct configured Groq models that are no longer listed by the API.
+
+    Called from application entry points before the first user query.
+    """
+    client = groq_client_override if groq_client_override is not None else groq_client
+    if not (os.environ.get("GROQ_API_KEY") or "").strip():
+        return
+
+    available = get_available_groq_models(client)
+    if not available:
+        log.debug("Groq model list unavailable at startup; skipping catalog validation")
+        return
+
+    global GROQ_MODEL
+
+    env_chat = (os.environ.get("ATLAS_CHAT_MODEL") or "").strip()
+    if env_chat and env_chat not in available:
+        log.warning(
+            "ATLAS_CHAT_MODEL=%r is deprecated or unavailable; falling back to %r",
+            env_chat,
+            _default_chat,
+        )
+    GROQ_MODEL = resolve_groq_model(
+        GROQ_MODEL,
+        fallback=_default_chat,
+        groq_client=client,
+    )
+
+    import atlas_vision as vision_mod
+
+    vision_default = "qwen/qwen3.6-27b"
+    env_vision = (os.environ.get("ATLAS_VISION_MODEL") or "").strip()
+    if env_vision and env_vision not in available:
+        log.warning(
+            "ATLAS_VISION_MODEL=%r is deprecated or unavailable; falling back to %r",
+            env_vision,
+            vision_default,
+        )
+    vision_mod.GROQ_VISION_MODEL = resolve_groq_model(
+        vision_mod.GROQ_VISION_MODEL,
+        fallback=vision_default,
+        groq_client=client,
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -333,14 +386,16 @@ class StateEngine:
       routes to build_messages_with_vision() when present.
     - Query dispatch: _on_ai_query() owns the Groq streaming call and fires
       voice_engine.speak() sentence-by-sentence (FIX-1).
-    - Concurrent input guard: a Semaphore(1) drops overlapping handle_input()
-      calls from mic, OCR, and manual typing (FIX-2).
+    - Concurrent input guard: a Semaphore(1) serializes queries; the latest
+      overlapping call is queued and dispatched when the current turn finishes.
 
     Events
     ------
     Register listeners with on_event(fn).  Emitted events:
         "mode_changed"   — {"from": str, "to": str}
-        "session_reset"  — {"mode": str}
+        "session_reset"  — {} on account switch; {"mode": str} on manual reset
+        "account_switched" — {"user_id": int, "user_name": str}
+        "query_queued"   — {"source": str, "text": str}
     """
 
     # Maximum entries held in the silent ambient ring buffer
@@ -446,8 +501,9 @@ class StateEngine:
             ),
         })
         try:
-            resp = groq_client.chat.completions.create(
+            resp = self._groq_completions_create(
                 model=GROQ_MODEL,
+                fallback=_default_chat,
                 messages=messages,
                 temperature=0.3,
                 max_tokens=800,
@@ -738,6 +794,19 @@ class StateEngine:
 
     def _prepare_task_start(self, task: str) -> bool:
         """Goal allowlist + mode-specific start gate. False → do not start thread."""
+        from atlas_policy import PolicyEngine
+
+        policy = PolicyEngine(self.memory.db_path, user_id=self.user_id)
+        gate = policy.can_execute_goal(task)
+        if not gate.get("approved"):
+            reason = str(gate.get("reason") or "policy")
+            detail = str(gate.get("error") or "")
+            msg = f"Task blocked: {reason}"
+            if detail and detail not in msg:
+                msg = f"{msg} ({detail})"
+            self._emit("task_status", {"text": msg})
+            return False
+
         mode = (getattr(self, "safety_mode", "off") or "off").lower()
         trusted_gate = mode == "trusted"
         allowed, reason = check_task_goal_allowed(task, trusted_only=trusted_gate)
@@ -785,9 +854,20 @@ class StateEngine:
             return
 
         if not force_fresh and not use_playbook:
-            proposal = self.playbooks.check_proposal(task)
+            try:
+                proposal = self.playbooks.check_proposal(task)
+            except Exception as exc:
+                log.error(
+                    "Playbook check failed; continuing without proposal.",
+                    exc_info=exc,
+                )
+                proposal = None
             if proposal:
                 self._playbook_proposal = proposal
+                self._emit("playbook_proposal", {
+                    "message": proposal["message"],
+                    "goal": proposal.get("goal", task),
+                })
                 self._announce(proposal["message"])
                 return
 
@@ -810,6 +890,13 @@ class StateEngine:
             return
 
         self._start_task_thread(task)
+
+    def skip_playbook(self) -> None:
+        """Dismiss a pending playbook offer and continue GUIDED mode manually."""
+        with self._lock:
+            self._playbook_proposal = None
+            self._playbook_force_fresh = True
+        self._emit("playbook_skipped", {})
 
     def _start_task_thread(
         self,
@@ -1068,6 +1155,11 @@ class StateEngine:
             return {"intent": "shell_run", "command": t[7:].strip()}
         if getattr(self, "_playbook_proposal", None):
             if any(p in tl for p in (
+                "skip playbook", "skip the playbook", "without playbook",
+                "no playbook", "manual guide", "guide me manually",
+            )) or tl in ("skip", "skip it"):
+                return {"intent": "playbook_skip"}
+            if any(p in tl for p in (
                 "look up fresh", "from scratch", "figure it out fresh",
                 "something changed", "look it up fresh",
             )) or tl in ("fresh", "no", "nope", "start fresh"):
@@ -1300,6 +1392,10 @@ class StateEngine:
             if kind == "playbook_fresh":
                 self._playbook_proposal = None
                 self.run_task(intent.get("task", ""), force_fresh=True)
+                return True
+            if kind == "playbook_skip":
+                self.skip_playbook()
+                self._announce("Okay — I'll guide you manually without the saved playbook.")
                 return True
             if kind == "diagnose":
                 summary = self.learning.format_teaching_summary_for_user()
@@ -1637,8 +1733,9 @@ class StateEngine:
         if not crop_b64:
             return "the clicked element"
         try:
-            resp = groq_client.chat.completions.create(
+            resp = self._groq_completions_create(
                 model=GROQ_VISION_MODEL,
+                fallback="qwen/qwen3.6-27b",
                 messages=[{"role": "user", "content": [
                     {"type": "image_url",
                      "image_url": {"url": f"data:image/png;base64,{crop_b64}"}},
@@ -1969,8 +2066,9 @@ class StateEngine:
             })
         content.append({"type": "text", "text": user_text})
         try:
-            resp = groq_client.chat.completions.create(
+            resp = self._groq_completions_create(
                 model=GROQ_VISION_MODEL,
+                fallback="qwen/qwen3.6-27b",
                 messages=[
                     {"role": "system", "content": _ATLAS_TASK_AGENT},
                     {"role": "user", "content": content},
@@ -1994,8 +2092,9 @@ class StateEngine:
                     "type": "text",
                     "text": user_text + "\n\nYour last reply was not valid JSON. Return ONE JSON object only.",
                 }
-                resp2 = groq_client.chat.completions.create(
+                resp2 = self._groq_completions_create(
                     model=GROQ_VISION_MODEL,
+                    fallback="qwen/qwen3.6-27b",
                     messages=[
                         {"role": "system", "content": _ATLAS_TASK_AGENT},
                         {"role": "user", "content": retry_content},
@@ -2301,10 +2400,12 @@ class StateEngine:
         self._listeners:  list[Callable] = []
         self._lock        = threading.Lock()
 
-        # FIX-2: Semaphore(1) — ensures only one concurrent query can run.
-        # Concurrent calls from mic, OCR, and manual typing are dropped
-        # immediately rather than racing against each other.
+        # FIX-2: Semaphore(1) — one query in flight; overlapping inputs queue.
         self._query_semaphore = threading.Semaphore(1)
+        self._pending_query: Optional[tuple[str, str, Optional[str]]] = None
+
+        # Serializes physical screen grabs (prefetch vs wants_screen vs overlap).
+        self._screen_capture_semaphore = threading.Semaphore(1)
 
         # Set while learning.on_turn_complete runs; handle_input waits briefly so
         # a fast follow-up query sees freshly extracted facts in build_memory_prompt.
@@ -2314,6 +2415,8 @@ class StateEngine:
         # stream so a user can interrupt Atlas mid-reply (conversational break-in).
         self._cancel = threading.Event()
         self._research_this_turn = False
+        self._groq_failures = 0
+        self._groq_circuit_open_at: Optional[float] = None
         self._pending_guide: Optional[dict] = None
         self._session_task_goal: str = ""
         self._procedure_steps: list[dict] = []
@@ -2404,6 +2507,45 @@ class StateEngine:
             daemon=True,
             name="atlas-model-health",
         ).start()
+
+    # Groq circuit breaker — trip after consecutive API failures.
+    _GROQ_CIRCUIT_FAILURE_THRESHOLD = 3
+    _GROQ_CIRCUIT_COOLDOWN_S = 30.0
+
+    def _check_groq_circuit(self) -> None:
+        """Raise when the breaker is open; allow a half-open attempt after cooldown."""
+        with self._lock:
+            if self._groq_circuit_open_at is None:
+                return
+            elapsed = time.time() - self._groq_circuit_open_at
+            if elapsed < self._GROQ_CIRCUIT_COOLDOWN_S:
+                remaining = int(self._GROQ_CIRCUIT_COOLDOWN_S - elapsed)
+                raise RuntimeError(
+                    "Groq API circuit breaker is open; retry in %d seconds." % remaining
+                )
+            self._groq_circuit_open_at = None
+
+    def _record_groq_success(self) -> None:
+        with self._lock:
+            self._groq_failures = 0
+
+    def _record_groq_failure(self, exc: Exception) -> None:
+        with self._lock:
+            self._groq_failures += 1
+            if self._groq_failures >= self._GROQ_CIRCUIT_FAILURE_THRESHOLD:
+                log.error("Groq API circuit breaker OPEN; will retry in 30s.")
+                self._groq_circuit_open_at = time.time()
+
+    def _groq_completions_create(self, **kwargs):
+        """Groq chat completion with model validation and circuit-breaker protection."""
+        self._check_groq_circuit()
+        try:
+            response = groq_completions_create(groq_client, **kwargs)
+        except Exception as exc:
+            self._record_groq_failure(exc)
+            raise
+        self._record_groq_success()
+        return response
 
     def _model_health_check(self) -> None:
         """Once per session: probe chat + vision models off the UI thread."""
@@ -2504,15 +2646,29 @@ class StateEngine:
                     self.user_id, self.mode.name, hist)
             self.user_id = int(user_id)
             self.learning = LearningEngine(self.memory, self.user_id)
+            from atlas_playbooks import PlaybookManager
+
+            self.playbooks = PlaybookManager(self.memory, self.user_id)
             self.glass.set_user(self.user_id)
             self.memory.migrate_legacy_json_store(self.user_id)
             self.memory.ensure_local_session(self.user_id)
             self.session.start(self.get_system_prompt())
+            self._clear_context_buffer()
+            self._pending_guide = None
+            self._session_task_goal = ""
+            self._guide_playbook_offered = False
+            self._playbook_proposal = None
+            self.learning.reset_teaching_session()
             self.load_user_prefs()
             try:
                 self.memory._invalidate_cache()
             except Exception:
                 pass
+        self._emit("session_reset", {})
+        self._emit("account_switched", {
+            "user_id": self.user_id,
+            "user_name": user_name or "",
+        })
         log.info("Active account switched to user_id=%s (%s)",
                  self.user_id, user_name or "?")
 
@@ -2721,7 +2877,30 @@ class StateEngine:
             self._pending_screen_b64 = None
         return val
 
+    def _try_acquire_screen_capture(self) -> bool:
+        """Non-blocking grab of the screen-capture slot (prefetch / wants_screen)."""
+        return self._screen_capture_semaphore.acquire(blocking=False)
+
+    def _release_screen_capture(self) -> None:
+        self._screen_capture_semaphore.release()
+
     # ── Input routing ─────────────────────────────────────────────────────────
+
+    def _release_query_and_dispatch_pending(self) -> None:
+        """Release the in-flight query slot and run any queued follow-up."""
+        self._query_semaphore.release()
+        pending: Optional[tuple[str, str, Optional[str]]] = None
+        with self._lock:
+            if self._pending_query is not None:
+                pending = self._pending_query
+                self._pending_query = None
+        if pending:
+            text, source, webcam_b64 = pending
+            log.debug("handle_input: dispatching queued query from source=%r", source)
+            try:
+                self.handle_input(text, source, webcam_b64=webcam_b64)
+            except Exception as exc:
+                log.warning("Queued handle_input dispatch failed: %s", exc)
 
     def handle_input(
         self,
@@ -2737,9 +2916,9 @@ class StateEngine:
 
         source == anything else (e.g. "user", "mic", "speaker", "highlight")
             Attempt to acquire the query semaphore (FIX-2).  If another query
-            is already in flight, this call is dropped immediately with a debug
-            log rather than queuing a racing duplicate.  On acquisition, build a
-            full messages list — enriched with ambient context and any pending /
+            is already in flight, the latest call is queued and dispatched
+            after the current turn completes.  On acquisition, build a full
+            messages list — enriched with ambient context and any pending /
             supplied vision frames — and dispatch to _on_ai_query on a daemon
             thread.
 
@@ -2765,15 +2944,17 @@ class StateEngine:
         if self.glass.active:
             self.ingest_glass_transcript(text, source)
 
-        # FIX-2: Non-blocking semaphore acquisition — drop concurrent overlaps.
+        # FIX-2: Non-blocking semaphore — queue overlapping follow-ups.
         acquired = self._query_semaphore.acquire(blocking=False)
         if not acquired:
+            with self._lock:
+                self._pending_query = (text, source, webcam_b64)
             log.debug(
-                "handle_input: dropped concurrent query from source=%r — "
-                "a query is already in flight.",
+                "handle_input: query queued from source=%r — "
+                "will dispatch after current query.",
                 source,
             )
-            self._emit("query_rejected", {"source": source, "reason": "busy"})
+            self._emit("query_queued", {"source": source, "text": text})
             return
 
         try:
@@ -2811,9 +2992,20 @@ class StateEngine:
                 self.learning.teaching.set_task_context(self._session_task_goal)
                 if not self._guide_playbook_offered:
                     self._guide_playbook_offered = True
-                    proposal = self.playbooks.check_proposal(self._session_task_goal)
+                    try:
+                        proposal = self.playbooks.check_proposal(self._session_task_goal)
+                    except Exception as exc:
+                        log.error(
+                            "Playbook check failed; continuing without proposal.",
+                            exc_info=exc,
+                        )
+                        proposal = None
                     if proposal and not self._playbook_force_fresh:
                         self._playbook_proposal = proposal
+                        self._emit("playbook_proposal", {
+                            "message": proposal["message"],
+                            "goal": proposal.get("goal", self._session_task_goal),
+                        })
                         self._finish_direct_response(text, proposal["message"])
                         return
 
@@ -2843,12 +3035,37 @@ class StateEngine:
                 )
 
             screen_analyzed = False
+            screen_capture_attempted = False
+            prefetch_thread: Optional[threading.Thread] = None
+            prefetch_holder: dict[str, Optional[str]] = {"analysis": None}
             if (
                 os.environ.get("ATLAS_SCREEN_PREFETCH", "").strip().lower() in ("1", "true", "yes", "on")
                 and source in ("user", "mic", "highlight", "capture")
                 and self._mentions_screen(text)
             ):
-                analysis = self.screen_watcher.take_and_analyze(text)
+                if self._try_acquire_screen_capture():
+                    screen_capture_attempted = True
+
+                    def _prefetch_worker() -> None:
+                        try:
+                            prefetch_holder["analysis"] = self.screen_watcher.take_and_analyze(text)
+                        finally:
+                            self._release_screen_capture()
+
+                    prefetch_thread = threading.Thread(
+                        target=_prefetch_worker,
+                        daemon=True,
+                        name="atlas-prefetch",
+                    )
+                    prefetch_thread.start()
+                else:
+                    log.debug(
+                        "handle_input: screen prefetch skipped — capture in progress",
+                    )
+
+            if prefetch_thread is not None:
+                prefetch_thread.join(timeout=60.0)
+                analysis = prefetch_holder["analysis"]
                 if analysis:
                     enriched_input = f"[SCREEN ANALYSIS]\n{analysis}\n\n{enriched_input}"
                     screen_analyzed = True
@@ -2869,10 +3086,18 @@ class StateEngine:
                     )
                 )
             )
-            if wants_screen and self._pending_screen_b64 is None:
-                frame = capture_screen_b64()
-                if frame:
-                    self.inject_screen_capture(frame.b64)
+            if wants_screen and self._pending_screen_b64 is None and not screen_capture_attempted:
+                if self._try_acquire_screen_capture():
+                    try:
+                        frame = capture_screen_b64()
+                        if frame:
+                            self.inject_screen_capture(frame.b64)
+                    finally:
+                        self._release_screen_capture()
+                else:
+                    log.debug(
+                        "handle_input: wants_screen capture skipped — capture in progress",
+                    )
 
             screen_b64 = self._consume_screen_capture()
 
@@ -2996,7 +3221,7 @@ class StateEngine:
 
         except Exception as exc:
             log.warning("handle_input failed before query dispatch: %s", exc)
-            self._query_semaphore.release()
+            self._release_query_and_dispatch_pending()
             self._emit("query_failed", {"source": source, "error": str(exc)})
 
     def _resolve_skill(self, text: str) -> Optional[str]:
@@ -3137,7 +3362,7 @@ class StateEngine:
         except Exception as exc:
             self._on_error(str(exc))
         finally:
-            self._query_semaphore.release()
+            self._release_query_and_dispatch_pending()
 
     def _finish_router_response(
         self,
@@ -3162,7 +3387,7 @@ class StateEngine:
         except Exception as exc:
             self._on_error(str(exc))
         finally:
-            self._query_semaphore.release()
+            self._release_query_and_dispatch_pending()
 
     def _finish_skill_response(self, raw_user_text: str, skill_name: str, result: dict) -> None:
         """Complete a skill-only turn without LLM streaming."""
@@ -3192,7 +3417,7 @@ class StateEngine:
         except Exception as exc:
             self._on_error(str(exc))
         finally:
-            self._query_semaphore.release()
+            self._release_query_and_dispatch_pending()
 
     def _schedule_learning_on_turn_complete(self, user_text: str, ai_text: str) -> None:
         """Run fact extraction off-thread; gate the next prompt build briefly."""
@@ -3481,7 +3706,7 @@ class StateEngine:
                 log.debug("on_error callback raised: %s", cb_exc)
         finally:
             # FIX-2: Always release the semaphore so the next query can proceed.
-            self._query_semaphore.release()
+            self._release_query_and_dispatch_pending()
 
     # ── Multimodal vision message builder ─────────────────────────────────────
 
@@ -3873,7 +4098,7 @@ class StateEngine:
             ).start()
         except Exception as exc:
             log.warning("handle_glass_interview_question failed: %s", exc)
-            self._query_semaphore.release()
+            self._release_query_and_dispatch_pending()
             self._emit("query_failed", {"source": source, "error": str(exc)})
 
     def set_copilot_mode(self, active: bool) -> None:

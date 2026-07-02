@@ -145,6 +145,34 @@ def test_tokens_encrypted_at_rest(connector_db):
     assert b"gho_super_secret_token" not in blob
 
 
+def test_tokens_rejects_sql_injection_in_connector_id(connector_db):
+    """Malicious connector IDs must be stored literally, not executed as SQL."""
+    from atlas_connectors.tokens import TokenStore
+
+    malicious = "'; DROP TABLE connector_tokens; --"
+    store = TokenStore(connector_db)
+    store.save_token(malicious, {"access_token": "injected-name-token"})
+
+    with sqlite3.connect(connector_db) as conn:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='connector_tokens'"
+        ).fetchone()
+        row = conn.execute(
+            "SELECT connector_id FROM connector_tokens WHERE connector_id = ?",
+            (malicious,),
+        ).fetchone()
+
+    assert table is not None
+    assert row is not None
+    assert row[0] == malicious
+    loaded = store.load_token(malicious)
+    assert loaded is not None
+    assert loaded["access_token"] == "injected-name-token"
+    assert malicious in store.list_connected()
+    store.delete_token(malicious)
+    assert malicious not in store.list_connected()
+
+
 def test_scope_descriptions_plain_language(registry):
     gh = registry.get("github")
     desc = gh.scope_boundary_text()

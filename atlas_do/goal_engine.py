@@ -36,6 +36,16 @@ class GoalEngine:
         goal_text = (goal_text or "").strip()
         if not goal_text:
             raise ValueError("goal text required")
+        from atlas_policy import PolicyEngine
+
+        policy = PolicyEngine(self._state.memory.db_path, user_id=self._state.user_id)
+        gate = policy.can_execute_goal(goal_text)
+        if not gate.get("approved"):
+            reason = str(gate.get("reason") or "goal blocked")
+            detail = str(gate.get("error") or "")
+            msg = reason if not detail else f"{reason}: {detail}"
+            self._state._emit("goal_error", {"error": msg, "goal": goal_text})
+            raise ValueError(msg)
         memory = self._state.memory
         user_id = self._state.user_id
         steps = self._plan_steps(goal_text)

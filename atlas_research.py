@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import threading
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -18,12 +19,26 @@ log = logging.getLogger("atlas_research")
 
 MAX_EXTRACT_CHARS = 2500
 MAX_GROUNDING_CHARS = 6000
+DEFAULT_RESEARCH_TOKEN_BUDGET = 5000
 SEARCH_TIMEOUT_S = 12
 FETCH_TIMEOUT_S = 15
 
 _search_cache: dict[str, list[dict[str, str]]] = {}
 _grounding_cache: dict[str, str] = {}
 _cache_lock = threading.Lock()
+_research_engine: Optional["ResearchEngine"] = None
+_research_engine_lock = threading.Lock()
+
+
+def research_token_budget() -> int:
+    """Total Groq token budget for research summarization in this session."""
+    raw = (os.environ.get("ATLAS_RESEARCH_TOKEN_BUDGET") or "").strip()
+    if not raw:
+        return DEFAULT_RESEARCH_TOKEN_BUDGET
+    try:
+        return max(1000, int(raw))
+    except ValueError:
+        return DEFAULT_RESEARCH_TOKEN_BUDGET
 
 
 def normalize_query(query: str) -> str:
@@ -36,6 +51,15 @@ def clear_research_cache() -> None:
     with _cache_lock:
         _search_cache.clear()
         _grounding_cache.clear()
+    get_research_engine()._research_token_usage = 0
+
+
+def get_research_engine() -> "ResearchEngine":
+    global _research_engine
+    with _research_engine_lock:
+        if _research_engine is None:
+            _research_engine = ResearchEngine()
+        return _research_engine
 
 
 def search_task_docs(query: str, *, max_results: int = 5) -> list[dict[str, str]]:
@@ -164,6 +188,208 @@ def ground_query(query: str, *, max_pages: int = 2) -> str:
     with _cache_lock:
         _grounding_cache[key] = grounding
     return grounding
+
+
+class ResearchEngine:
+    """
+    Multi-step research with Groq summarization and a session token budget.
+
+    Token usage is tracked per thread so overlapping research jobs do not
+    corrupt each other's counters.
+    """
+
+    def __init__(self) -> None:
+        self._research_token_local = threading.local()
+        self._research_token_usage = 0
+
+    @property
+    def _research_token_usage(self) -> int:
+        return int(getattr(self._research_token_local, "value", 0))
+
+    @_research_token_usage.setter
+    def _research_token_usage(self, value: int) -> None:
+        self._research_token_local.value = int(value)
+
+    def _remaining_budget(self) -> int:
+        return research_token_budget() - self._research_token_usage
+
+    def _groq_research_call(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        max_tokens: int = 800,
+    ) -> tuple[Optional[str], Optional[dict[str, str]]]:
+        """Run one budget-checked Groq completion for research summarization."""
+        budget = research_token_budget()
+        remaining = budget - self._research_token_usage
+        if remaining < 1000:
+            return None, {"error": "Research budget exhausted."}
+
+        from atlas_core import GROQ_MODEL, _default_chat, groq_client
+        from atlas_mind.model_health import groq_completions_create
+
+        resp = groq_completions_create(
+            groq_client,
+            model=GROQ_MODEL,
+            fallback=_default_chat,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=min(max_tokens, 1200),
+        )
+        usage = getattr(resp, "usage", None)
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        self._research_token_usage += total_tokens
+        remaining_after = budget - self._research_token_usage
+        log.info(
+            "Research call used %d tokens; remaining: %d / %d",
+            total_tokens,
+            max(remaining_after, 0),
+            budget,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        return content, None
+
+    @staticmethod
+    def _search_queries_for_topic(topic: str, max_searches: int) -> list[str]:
+        topic = (topic or "").strip()
+        if max_searches <= 1:
+            return [topic]
+        return [
+            topic,
+            f"{topic} official documentation",
+        ][:max_searches]
+
+    @staticmethod
+    def _format_hits_for_groq(
+        hits: list[dict[str, str]],
+        query: str,
+        *,
+        max_pages: int = 2,
+    ) -> str:
+        blocks: list[str] = []
+        for hit in hits:
+            if len(blocks) >= max_pages:
+                break
+            url = hit.get("url", "")
+            if not url:
+                continue
+            body = fetch_and_extract(url)
+            if not body:
+                snippet = (hit.get("snippet") or "").strip()
+                if snippet:
+                    body = snippet
+                else:
+                    continue
+            title = hit.get("title") or url
+            blocks.append(f"Source: {title}\nURL: {url}\n{body}")
+        if blocks:
+            return "\n\n---\n\n".join(blocks)
+        if hits:
+            lines = [f"Search hits for {query!r} (no full page text retrieved):"]
+            for hit in hits[:max_pages]:
+                lines.append(
+                    f"- {hit.get('title') or 'Untitled'}: "
+                    f"{(hit.get('snippet') or '')[:220]}"
+                )
+            return "\n".join(lines)
+        return f"No web results found for {query!r}."
+
+    @staticmethod
+    def _merge_summaries(topic: str, summaries: list[dict[str, str]]) -> str:
+        if not summaries:
+            return (
+                f"Research query: {topic}\n"
+                "No usable documentation excerpts were retrieved."
+            )
+        parts = [f"Research query: {topic}", ""]
+        for item in summaries:
+            parts.append(f"Search: {item.get('query', topic)}")
+            parts.append(str(item.get("summary") or "").strip())
+            parts.append("")
+        parts.append(
+            "(Grounding notes — summarize in your own words; do not reproduce "
+            "large verbatim passages in chat.)"
+        )
+        grounding = "\n".join(parts).strip()
+        if len(grounding) > MAX_GROUNDING_CHARS:
+            grounding = grounding[: MAX_GROUNDING_CHARS - 1].rstrip() + "…"
+        return grounding
+
+    def explore_topic(self, topic: str, *, max_searches: int = 2) -> dict[str, Any]:
+        """
+        Search the web and summarize findings with Groq under a token budget.
+
+        Returns a dict with ``grounding`` on success or ``error`` when the
+        budget is exhausted.
+        """
+        topic = (topic or "").strip()
+        if not topic:
+            return {"error": "Empty research topic."}
+
+        budget = research_token_budget()
+        remaining = budget - self._research_token_usage
+        if remaining < 1000:
+            return {"error": "Research budget exhausted."}
+
+        summaries: list[dict[str, str]] = []
+        for query in self._search_queries_for_topic(topic, max_searches):
+            remaining = budget - self._research_token_usage
+            if remaining < 1000:
+                if summaries:
+                    return {
+                        "topic": topic,
+                        "summaries": summaries,
+                        "grounding": self._merge_summaries(topic, summaries),
+                        "usage": self._research_token_usage,
+                        "error": "Research budget exhausted.",
+                    }
+                return {"error": "Research budget exhausted."}
+
+            hits = search_task_docs(query, max_results=3)
+            excerpt = self._format_hits_for_groq(hits, query)
+            summary, err = self._groq_research_call(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize task documentation for guided desktop help. "
+                            "Be concise and actionable."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Topic: {topic}\n"
+                            f"Search query: {query}\n\n"
+                            f"Sources:\n{excerpt}"
+                        ),
+                    },
+                ],
+            )
+            if err:
+                if summaries:
+                    return {
+                        "topic": topic,
+                        "summaries": summaries,
+                        "grounding": self._merge_summaries(topic, summaries),
+                        "usage": self._research_token_usage,
+                        **err,
+                    }
+                return err
+            summaries.append({"query": query, "summary": summary or ""})
+
+        grounding = self._merge_summaries(topic, summaries)
+        return {
+            "topic": topic,
+            "summaries": summaries,
+            "grounding": grounding,
+            "usage": self._research_token_usage,
+        }
+
+
+def explore_topic(topic: str, *, max_searches: int = 2) -> dict[str, Any]:
+    """Module-level helper using the shared ResearchEngine instance."""
+    return get_research_engine().explore_topic(topic, max_searches=max_searches)
 
 
 def _url_allowed(url: str) -> bool:

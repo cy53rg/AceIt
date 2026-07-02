@@ -1,4 +1,8 @@
-"""Encrypted connector token storage (Fernet + Windows DPAPI)."""
+"""Encrypted connector token storage (Fernet + Windows DPAPI).
+
+All SQL in this module uses ``?`` placeholders — never interpolate connector IDs
+or other user-controlled values into query strings.
+"""
 from __future__ import annotations
 
 import json

@@ -82,6 +82,8 @@ class ProviderRouter:
                     messages,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    vision=vision,
+                    engine=engine,
                 ):
                     self._last_provider = "groq"
                     yield chunk
@@ -141,13 +143,24 @@ class ProviderRouter:
         *,
         model: str,
         reasoning_effort: Optional[str],
+        vision: bool = False,
+        engine: Any = None,
     ) -> Iterator[str]:
-        from groq import Groq
         import time
 
+        from groq import Groq
+
+        from atlas_core import GROQ_DEFAULT_MODEL
+        from atlas_mind.model_health import groq_completions_create
+
+        if engine is not None and hasattr(engine, "_check_groq_circuit"):
+            engine._check_groq_circuit()
+
         client = Groq(api_key=resolve_groq_api_key())
+        fallback = "qwen/qwen3.6-27b" if vision else GROQ_DEFAULT_MODEL
         kwargs: dict[str, Any] = {
             "model": model,
+            "fallback": fallback,
             "messages": messages,
             "stream": True,
         }
@@ -157,19 +170,27 @@ class ProviderRouter:
         last_exc: Exception | None = None
         for attempt in range(_GROQ_RATE_LIMIT_RETRIES):
             try:
-                stream = client.chat.completions.create(**kwargs)
+                stream = groq_completions_create(client, **kwargs)
                 for chunk in stream:
-                    if not getattr(chunk, "choices", None):
+                    choices = getattr(chunk, "choices", None)
+                    if choices is None and isinstance(chunk, dict):
+                        choices = chunk.get("choices")
+                    if not choices or len(choices) == 0:
+                        log.warning("Empty Groq response chunk; skipping.")
                         continue
-                    delta_obj = chunk.choices[0].delta
+                    delta_obj = choices[0].delta
                     if getattr(delta_obj, "reasoning", None):
                         continue
                     text = delta_obj.content or ""
                     if text:
                         yield text
+                if engine is not None and hasattr(engine, "_record_groq_success"):
+                    engine._record_groq_success()
                 return
             except Exception as exc:
                 last_exc = exc
+                if engine is not None and hasattr(engine, "_record_groq_failure"):
+                    engine._record_groq_failure(exc)
                 if _is_rate_limit_error(exc) and attempt < _GROQ_RATE_LIMIT_RETRIES - 1:
                     delay = _GROQ_RATE_LIMIT_BASE_S * (2 ** attempt)
                     log.warning(
@@ -304,7 +325,8 @@ class ProviderRouter:
             except json.JSONDecodeError:
                 continue
             choices = data.get("choices") or []
-            if not choices:
+            if not choices or len(choices) == 0:
+                log.warning("Empty OpenRouter response chunk; skipping.")
                 continue
             delta = (choices[0].get("delta") or {}).get("content") or ""
             if delta:

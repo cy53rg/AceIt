@@ -26,7 +26,7 @@ from PySide6.QtCore import (
     QPoint,
 )
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QPushButton, QVBoxLayout, QWidget
 
 _log = logging.getLogger("atlas.overlay")
 
@@ -70,19 +70,54 @@ def apply_capture_exclusion(hwnd_int: int, enable: bool = True) -> bool:
         return False
 
 
+def _capture_exclusion_targets(root: QWidget) -> list[QWidget]:
+    """Return *root* plus any nested QMainWindow / QDialog HWND targets."""
+    targets: list[QWidget] = [root]
+    targets.extend(root.findChildren(QMainWindow))
+    targets.extend(root.findChildren(QDialog))
+    return targets
+
+
+def apply_capture_exclusion_to_widget(widget: QWidget, enable: bool = True) -> list[bool]:
+    """
+    Apply or remove WDA_EXCLUDEFROMCAPTURE on *widget* and child windows.
+
+    Child QMainWindow / QDialog instances are included so stealth mode does not
+    flicker partial UI into screen recordings.
+    """
+    results: list[bool] = []
+    seen_hwnds: set[int] = set()
+    for target in _capture_exclusion_targets(widget):
+        if not hasattr(target, "winId"):
+            continue
+        try:
+            hwnd = int(target.winId())
+        except Exception:
+            continue
+        if hwnd <= 0 or hwnd in seen_hwnds:
+            continue
+        seen_hwnds.add(hwnd)
+        results.append(apply_capture_exclusion(hwnd, enable))
+    return results
+
+
 class _CaptureExclusionMixin:
     """Re-apply WDA_EXCLUDEFROMCAPTURE when the overlay HWND is shown."""
 
     _capture_excluded: bool
 
     def set_capture_excluded(self, excluded: bool) -> None:
-        self._capture_excluded = bool(excluded)
+        self.set_stealth(excluded)
+
+    def set_stealth(self, enable: bool) -> None:
+        """Apply or remove capture exclusion on this widget and child windows."""
+        self._capture_excluded = bool(enable)
         if self.isVisible():
-            self._apply_capture_exclusion_now(excluded)
+            self._apply_capture_exclusion_now(enable)
 
     def _apply_capture_exclusion_now(self, enable: bool) -> None:
         try:
-            apply_capture_exclusion(int(self.winId()), enable)
+            apply_capture_exclusion_to_widget(self, enable)
         except Exception as exc:
             _log.debug("overlay capture exclusion failed: %s", exc)
 
@@ -92,7 +127,86 @@ class _CaptureExclusionMixin:
             self._apply_capture_exclusion_now(True)
 
 
-class HoloOverlay(_CaptureExclusionMixin, QWidget):
+class _OverlayLifecycleMixin:
+    """
+    Tear down top-level overlay widgets so HWNDs do not accumulate across
+    long UI sessions (show/hide cycles, mode toggles, account switches).
+    """
+
+    _overlay_teardown_done: bool = False
+
+    def _stop_overlay_timers(self) -> None:
+        """Subclasses stop animations/timers here."""
+
+    def _disconnect_overlay_signals(self) -> None:
+        try:
+            self.blockSignals(True)
+        except Exception:
+            pass
+        try:
+            for child in self.children():
+                try:
+                    if hasattr(child, "blockSignals"):
+                        child.blockSignals(True)
+                    if hasattr(child, "disconnect"):
+                        child.disconnect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _release_overlay_resources(self) -> None:
+        if getattr(self, "_overlay_teardown_done", False):
+            return
+        self._overlay_teardown_done = True
+        self._stop_overlay_timers()
+        try:
+            self.hide()
+        except Exception:
+            pass
+        self._disconnect_overlay_signals()
+        try:
+            for child in self.findChildren(QWidget):
+                child.setParent(None)
+                child.deleteLater()
+        except Exception:
+            pass
+        try:
+            if QApplication.instance() is not None:
+                self.deleteLater()
+        except Exception:
+            pass
+
+    def _finalize_overlay_destruction(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        for _ in range(8):
+            app.processEvents()
+        try:
+            import shiboken6
+
+            if shiboken6.isValid(self):
+                shiboken6.delete(self)
+        except Exception:
+            pass
+
+    def close(self) -> bool:
+        if not getattr(self, "_overlay_teardown_done", False):
+            self._release_overlay_resources()
+        result = super().close()
+        self._finalize_overlay_destruction()
+        return result
+
+    def __del__(self) -> None:
+        try:
+            if not getattr(self, "_overlay_teardown_done", False):
+                self._release_overlay_resources()
+        except Exception:
+            pass
+
+
+class HoloOverlay(_CaptureExclusionMixin, _OverlayLifecycleMixin, QWidget):
     """Full-screen transparent overlay with animated focus ring."""
 
     def __init__(self) -> None:
@@ -105,6 +219,7 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
 
         self._origin_x = 0
         self._origin_y = 0
@@ -127,6 +242,15 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
         self._marker_timer.setSingleShot(True)
         self._marker_timer.timeout.connect(self.clear_markers)
         self._capture_excluded = False
+
+    def _stop_overlay_timers(self) -> None:
+        self._cancel_anims()
+        for timer in (self._hide_timer, self._marker_timer):
+            try:
+                timer.stop()
+                timer.timeout.disconnect()
+            except Exception:
+                pass
 
     def showEvent(self, event) -> None:  # noqa: ANN001
         _CaptureExclusionMixin.showEvent(self, event)
@@ -162,9 +286,17 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
         self._hide_timer.stop()
         for anim in self._anims:
             anim.stop()
+            try:
+                anim.finished.disconnect()
+            except Exception:
+                pass
         self._anims.clear()
         if self._seq is not None:
             self._seq.stop()
+            try:
+                self._seq.finished.disconnect()
+            except Exception:
+                pass
             self._seq = None
 
     def _sync_desktop_geometry(self) -> None:
@@ -375,7 +507,7 @@ class HoloOverlay(_CaptureExclusionMixin, QWidget):
             painter.drawEllipse(self._path[-1], 5, 5)
 
 
-class AgentCursorOverlay(_CaptureExclusionMixin, QWidget):
+class AgentCursorOverlay(_CaptureExclusionMixin, _OverlayLifecycleMixin, QWidget):
     """
     Animated agent cursor for DO-mode steps — visible only while a task step
     is running.  Moves smoothly between targets; hidden when idle.
@@ -393,6 +525,7 @@ class AgentCursorOverlay(_CaptureExclusionMixin, QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setFixedSize(self.CURSOR_W, self.CURSOR_H)
 
         self._cursor_x = 100.0
@@ -410,6 +543,21 @@ class AgentCursorOverlay(_CaptureExclusionMixin, QWidget):
             self._cursor_x = g.width() / 2.0
             self._cursor_y = g.height() / 2.0
         self._sync_geometry()
+
+    def _stop_overlay_timers(self) -> None:
+        if self._move_grp:
+            try:
+                self._move_grp.stop()
+            except Exception:
+                pass
+            self._move_grp = None
+        if self._pulse_anim:
+            try:
+                self._pulse_anim.stop()
+            except Exception:
+                pass
+            self._pulse_anim = None
+        self._on_move_done = None
 
     def showEvent(self, event) -> None:  # noqa: ANN001
         _CaptureExclusionMixin.showEvent(self, event)

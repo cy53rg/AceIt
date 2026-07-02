@@ -36,6 +36,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 
+# Serialize permission callback resolution (approve/deny must run at most once).
+_PERMISSION_APPROVAL_LOCK = threading.Lock()
+
 # Desktop Integration
 import keyboard
 import pyperclip
@@ -321,6 +324,7 @@ class PermissionDialog(QDialog):
         super().__init__(parent)
         self._approve_fn = approve_fn
         self._deny_fn    = deny_fn
+        self._resolved   = False
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -392,13 +396,29 @@ class PermissionDialog(QDialog):
 
         lay.addLayout(btn_row)
 
+    def _resolve(self, approved: bool) -> None:
+        with _PERMISSION_APPROVAL_LOCK:
+            if self._resolved:
+                return
+            self._resolved = True
+            approve_fn = self._approve_fn
+            deny_fn = self._deny_fn
+        if approved:
+            self.accept()
+            threading.Thread(
+                target=approve_fn,
+                daemon=True,
+                name="atlas-perm-approve",
+            ).start()
+        else:
+            self.reject()
+            deny_fn()
+
     def _on_approve(self):
-        self.accept()
-        threading.Thread(target=self._approve_fn, daemon=True).start()
+        self._resolve(True)
 
     def _on_deny(self):
-        self.reject()
-        self._deny_fn()
+        self._resolve(False)
 
 
 class TypedConfirmDialog(QDialog):
@@ -2890,6 +2910,8 @@ class AtlasWindow(QMainWindow):
         self._watch_sensitivity = "Medium"
         self._typed_confirm_event = threading.Event()
         self._typed_confirm_answer = False
+        self._approval_lock = threading.Lock()
+        self._permission_dialog_open = False
 
         if self.state:
             try:
@@ -3279,6 +3301,38 @@ class AtlasWindow(QMainWindow):
         self.status_lbl = QLabel("  Atlas online")
         self.status_lbl.setStyleSheet(f"color: {PAL['muted']}; font-size: 10px; padding: 4px 14px;")
         ws_lay.addWidget(self.status_lbl)
+
+        self._playbook_prompt_bar = QFrame()
+        self._playbook_prompt_bar.setObjectName("playbook_prompt_bar")
+        self._playbook_prompt_bar.setStyleSheet(
+            f"QFrame#playbook_prompt_bar {{ background: {PAL['surface_2']}; "
+            f"border: 1px solid {PAL['gold_dim']}; border-radius: 10px; }}"
+        )
+        pb_lay = QHBoxLayout(self._playbook_prompt_bar)
+        pb_lay.setContentsMargins(10, 6, 10, 6)
+        pb_lay.setSpacing(8)
+        self._playbook_prompt_lbl = QLabel(
+            "Saved playbook available — reuse it or continue manually."
+        )
+        self._playbook_prompt_lbl.setWordWrap(True)
+        self._playbook_prompt_lbl.setStyleSheet(
+            f"color: {PAL['text']}; font-size: 11px; background: transparent; border: none;"
+        )
+        pb_lay.addWidget(self._playbook_prompt_lbl, 1)
+        self._btn_skip_playbook = QPushButton("Skip playbook")
+        self._btn_skip_playbook.setToolTip(
+            "Dismiss the saved playbook and continue in guided mode manually."
+        )
+        self._btn_skip_playbook.setStyleSheet(
+            f"QPushButton {{ background: {PAL['surface']}; color: {PAL['gold']}; "
+            f"border: 1px solid {PAL['gold_dim']}; border-radius: 8px; "
+            f"padding: 4px 10px; font-size: 11px; font-weight: 600; }}"
+            f"QPushButton:hover {{ background: {PAL['border']}; }}"
+        )
+        self._btn_skip_playbook.clicked.connect(self._on_skip_playbook_clicked)
+        pb_lay.addWidget(self._btn_skip_playbook, 0)
+        self._playbook_prompt_bar.hide()
+        ws_lay.addWidget(self._playbook_prompt_bar)
 
         self.chat_composer = ChatComposer(self)
         self.chat_composer.setObjectName("action_dock")
@@ -3801,15 +3855,21 @@ class AtlasWindow(QMainWindow):
 
     def _set_stealth_active(self, active: bool, *, update_ui: bool = True) -> None:
         """Apply capture exclusion to every Atlas HWND."""
+        from atlas_overlay import apply_capture_exclusion_to_widget
+
         results: list[bool] = []
-        for widget in self._stealth_widgets():
+        for widget in (self, self._bubble, self._pill_win):
             try:
-                results.append(self._apply_stealth_to_hwnd(int(widget.winId()), active))
+                results.extend(apply_capture_exclusion_to_widget(widget, active))
             except Exception:
                 results.append(False)
-        if self.overlay and hasattr(self.overlay, "set_capture_excluded"):
+        if self.overlay and hasattr(self.overlay, "set_stealth"):
+            self.overlay.set_stealth(active)
+        elif self.overlay and hasattr(self.overlay, "set_capture_excluded"):
             self.overlay.set_capture_excluded(active)
-        if self.agent_cursor and hasattr(self.agent_cursor, "set_capture_excluded"):
+        if self.agent_cursor and hasattr(self.agent_cursor, "set_stealth"):
+            self.agent_cursor.set_stealth(active)
+        elif self.agent_cursor and hasattr(self.agent_cursor, "set_capture_excluded"):
             self.agent_cursor.set_capture_excluded(active)
 
         if active:
@@ -3889,6 +3949,26 @@ class AtlasWindow(QMainWindow):
     # PERMISSION INTERCEPTOR  (Requirement 7)
     # ═════════════════════════════════════════════════════════════════════════
 
+    def _show_permission_dialog(
+        self,
+        action: str,
+        path: str,
+        approve_fn: Callable,
+        deny_fn: Callable,
+    ) -> None:
+        """Show one PermissionDialog at a time; concurrent requests are denied."""
+        with self._approval_lock:
+            if self._permission_dialog_open:
+                deny_fn()
+                return
+            self._permission_dialog_open = True
+        try:
+            dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
+            dlg.exec()
+        finally:
+            with self._approval_lock:
+                self._permission_dialog_open = False
+
     def _daemon_fs_permission(self, action: str, path: str) -> bool:
         """IPC permission gate — runs dialog on Qt main thread, returns bool."""
         if threading.current_thread() is threading.main_thread():
@@ -3911,38 +3991,44 @@ class AtlasWindow(QMainWindow):
             approved = {"v": False}
 
             def _approve():
-                approved["v"] = True
+                with self._approval_lock:
+                    approved["v"] = True
 
             def _deny():
-                approved["v"] = False
+                with self._approval_lock:
+                    approved["v"] = False
 
-            dlg = PermissionDialog(action, path, _approve, _deny, parent=self)
-            dlg.exec()
-            return approved["v"]
+            self._show_permission_dialog(action, path, _approve, _deny)
+            with self._approval_lock:
+                return bool(approved["v"])
         if p.startswith("atlas-hands://"):
             approved = {"v": False}
 
             def _approve():
-                approved["v"] = True
+                with self._approval_lock:
+                    approved["v"] = True
 
             def _deny():
-                approved["v"] = False
+                with self._approval_lock:
+                    approved["v"] = False
 
-            dlg = PermissionDialog(action, path, _approve, _deny, parent=self)
-            dlg.exec()
-            return approved["v"]
+            self._show_permission_dialog(action, path, _approve, _deny)
+            with self._approval_lock:
+                return bool(approved["v"])
         if p.startswith("atlas-routine://"):
             approved = {"v": False}
 
             def _approve():
-                approved["v"] = True
+                with self._approval_lock:
+                    approved["v"] = True
 
             def _deny():
-                approved["v"] = False
+                with self._approval_lock:
+                    approved["v"] = False
 
-            dlg = PermissionDialog(action, path, _approve, _deny, parent=self)
-            dlg.exec()
-            return approved["v"]
+            self._show_permission_dialog(action, path, _approve, _deny)
+            with self._approval_lock:
+                return bool(approved["v"])
         if not self.fs_access_active:
             self.bridge.set_status.emit(
                 "⛔ File system access is OFF — enable it in the control panel"
@@ -3951,14 +4037,16 @@ class AtlasWindow(QMainWindow):
         approved = {"v": False}
 
         def _approve():
-            approved["v"] = True
+            with self._approval_lock:
+                approved["v"] = True
 
         def _deny():
-            approved["v"] = False
+            with self._approval_lock:
+                approved["v"] = False
 
-        dlg = PermissionDialog(action, path, _approve, _deny, parent=self)
-        dlg.exec()
-        return approved["v"]
+        self._show_permission_dialog(action, path, _approve, _deny)
+        with self._approval_lock:
+            return bool(approved["v"])
 
     def _daemon_typed_confirm(self, msg: dict) -> bool:
         from types import SimpleNamespace
@@ -4037,16 +4125,13 @@ class AtlasWindow(QMainWindow):
         """Gate file writes on fs_access; show PermissionDialog for task steps."""
         p = str(path)
         if p.startswith("atlas-task://"):
-            dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
-            dlg.exec()
+            self._show_permission_dialog(action, path, approve_fn, deny_fn)
             return
         if p.startswith("atlas-hands://"):
-            dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
-            dlg.exec()
+            self._show_permission_dialog(action, path, approve_fn, deny_fn)
             return
         if p.startswith("atlas-routine://"):
-            dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
-            dlg.exec()
+            self._show_permission_dialog(action, path, approve_fn, deny_fn)
             return
         if not self.fs_access_active:
             deny_fn()
@@ -4054,8 +4139,7 @@ class AtlasWindow(QMainWindow):
                 "File system access is off — enable it in settings for file operations."
             )
             return
-        dlg = PermissionDialog(action, path, approve_fn, deny_fn, parent=self)
-        dlg.exec()
+        self._show_permission_dialog(action, path, approve_fn, deny_fn)
 
     def _post_step_pending(self, pending) -> None:
         """Called from worker threads — marshal step sync to the Qt main thread."""
@@ -4387,6 +4471,13 @@ class AtlasWindow(QMainWindow):
             QTimer.singleShot(0, lambda e=err: self._release_companion_mode(
                 error=f"⚠ {friendly_error('generic', e)}",
             ))
+        elif event_type == "session_reset":
+            QTimer.singleShot(0, self._on_session_reset)
+        elif event_type == "playbook_proposal":
+            message = str(payload.get("message") or "")
+            QTimer.singleShot(0, lambda m=message: self._show_playbook_prompt_bar(m))
+        elif event_type == "playbook_skipped":
+            QTimer.singleShot(0, self._hide_playbook_prompt_bar)
         elif event_type == "guide_step_started":
             idx = int(payload.get("step_index", 0))
             if idx:
@@ -4418,6 +4509,23 @@ class AtlasWindow(QMainWindow):
                 msg["verified"] = passed
                 msg["verification_note"] = discrepancy
                 break
+
+    def _show_playbook_prompt_bar(self, message: str = "") -> None:
+        if not hasattr(self, "_playbook_prompt_bar"):
+            return
+        if message:
+            self._playbook_prompt_lbl.setText(message)
+        self._playbook_prompt_bar.show()
+
+    def _hide_playbook_prompt_bar(self) -> None:
+        if hasattr(self, "_playbook_prompt_bar"):
+            self._playbook_prompt_bar.hide()
+
+    def _on_skip_playbook_clicked(self) -> None:
+        if self.state:
+            self.state.skip_playbook()
+        self._hide_playbook_prompt_bar()
+        self.bridge.set_status.emit("Continuing guided help without playbook")
 
     def _on_copilot_toggled(self, checked: bool) -> None:
         self.copilot_active = checked
@@ -4487,6 +4595,7 @@ class AtlasWindow(QMainWindow):
 
     def _sync_mode_ui(self, mode_name: str):
         """Legacy hook — maps old mode names to focus toggle."""
+        self._hide_playbook_prompt_bar()
         if str(mode_name).upper() in ("INTERVIEW", "FOCUS"):
             self._sync_focus_ui(True)
         else:
@@ -5528,6 +5637,15 @@ class AtlasWindow(QMainWindow):
         if voice_engine:
             voice_engine.flush()
             voice_engine.skip()
+        self._reset_chat_view(clear_session=True)
+        self.bridge.set_status.emit("Cleared ✓")
+
+    def _on_session_reset(self) -> None:
+        """Drop visible chat when the daemon switches accounts or resets history."""
+        self._hide_playbook_prompt_bar()
+        self._reset_chat_view(clear_session=False)
+
+    def _reset_chat_view(self, *, clear_session: bool) -> None:
         self.chat_view.clear()
         self.chat_composer.set_streaming(False)
         self._md_plain_prefix = ""
@@ -5539,10 +5657,11 @@ class AtlasWindow(QMainWindow):
         self.chat_composer.set_attach_label("")
         self._token_prompt = 0
         self._token_completion = 0
-        if self.state:
+        if clear_session and self.state:
             self.state.session.end()
-        self.token_footer.setText(" Tokens: 0 prompt · 0 completion | Session: 00:00 · 0 turns")
-        self.bridge.set_status.emit("Cleared ✓")
+        self.token_footer.setText(
+            " Tokens: 0 prompt · 0 completion | Session: 00:00 · 0 turns"
+        )
 
     # ═════════════════════════════════════════════════════════════════════════
     # AUDIO / CAMERA TOGGLES
@@ -6143,6 +6262,11 @@ if __name__ == "__main__":
         install_thread_exception_hook(
             lambda t, v, tb: _global_excepthook(t, v, tb)
         )
+
+    if _CORE:
+        from atlas_core import validate_groq_models_at_startup
+
+        validate_groq_models_at_startup()
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

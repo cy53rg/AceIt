@@ -514,6 +514,7 @@ def create_app():
     def health():
         return {
             "ok": True,
+            "protocol_version": 1,
             "state_ready": _state is not None,
             "scheduler_ready": _scheduler is not None,
             "apscheduler_ready": _apscheduler is not None,
@@ -1018,6 +1019,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--user", default=os.environ.get("ATLAS_USER", "default"))
     args = parser.parse_args(argv)
 
+    from atlas_core import validate_groq_models_at_startup
+
+    validate_groq_models_at_startup()
     _init_services(user_name=args.user)
 
     import uvicorn

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from atlas_data import DEFAULT_SAFETY_MODE
 
+import json
+import os
 import re
 import sqlite3
 import time
@@ -16,11 +18,83 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from atlas_logging import get_logger
 
 log = get_logger("policy")
+
+_DEFAULT_GOAL_RISK_MODEL = (
+    Path(__file__).resolve().parent / "data" / "goal_risk_model.json"
+)
+
+_goal_risk_model: Any | None = None
+_goal_risk_model_error: str | None = None
+_goal_risk_model_loaded = False
+
+
+class GoalRiskModel:
+    """JSON-backed goal classifier — loaded from disk, not prompt-trusted."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("risk model root must be a JSON object")
+        self._deny_patterns: list[re.Pattern[str]] = []
+        for expr in data.get("deny_regex") or []:
+            self._deny_patterns.append(re.compile(str(expr), re.I))
+        for phrase in data.get("deny_substrings") or []:
+            token = str(phrase or "").strip().lower()
+            if token:
+                self._deny_patterns.append(
+                    re.compile(re.escape(token), re.I),
+                )
+
+    def evaluate(self, goal: str) -> dict[str, Any]:
+        text = (goal or "").strip()
+        if not text:
+            return {"approved": False, "reason": "empty_goal", "error": ""}
+        for pat in self._deny_patterns:
+            if pat.search(text):
+                return {
+                    "approved": False,
+                    "reason": "goal_denied_by_risk_model",
+                    "error": pat.pattern[:120],
+                }
+        return {"approved": True, "reason": "ok", "error": ""}
+
+
+def _goal_risk_model_path() -> Path:
+    override = (os.environ.get("ATLAS_GOAL_RISK_MODEL") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _DEFAULT_GOAL_RISK_MODEL
+
+
+def _load_goal_risk_model() -> tuple[GoalRiskModel | None, str | None]:
+    global _goal_risk_model, _goal_risk_model_error, _goal_risk_model_loaded
+    if _goal_risk_model_loaded:
+        return _goal_risk_model, _goal_risk_model_error
+    _goal_risk_model_loaded = True
+    path = _goal_risk_model_path()
+    try:
+        _goal_risk_model = GoalRiskModel(path)
+        _goal_risk_model_error = None
+        return _goal_risk_model, None
+    except Exception as exc:
+        _goal_risk_model = None
+        _goal_risk_model_error = str(exc)
+        return None, _goal_risk_model_error
+
+
+def reset_goal_risk_model_cache() -> None:
+    """Test helper — force the next can_execute_goal() call to reload the model."""
+    global _goal_risk_model, _goal_risk_model_error, _goal_risk_model_loaded
+    _goal_risk_model = None
+    _goal_risk_model_error = None
+    _goal_risk_model_loaded = False
 
 # Phrases the user must type verbatim for CONFIRM_TYPED actions (never click-only).
 TYPED_CONFIRM_PHRASES: dict[str, str] = {
@@ -573,6 +647,45 @@ class PolicyEngine:
             audit_id=auth.audit_id,
             request=request,
         )
+
+    def can_execute_goal(self, goal: str) -> dict[str, Any]:
+        """
+        Policy gate for autonomous task/goal text before execution.
+
+        Fail-closed when the on-disk risk model cannot be loaded.  Emergency
+        auto-approval is allowed only when ``ATLAS_ADMIN_PASSWORD`` is set.
+        """
+        text = (goal or "").strip()
+        if not text:
+            return {"approved": False, "reason": "empty_goal", "error": ""}
+
+        model, err = _load_goal_risk_model()
+        if model is None:
+            log.error("Goal risk model unavailable: %s", err)
+            if (os.environ.get("ATLAS_ADMIN_PASSWORD") or "").strip():
+                log.warning(
+                    "ATLAS_ADMIN_PASSWORD set — allowing goal despite missing risk model",
+                )
+                return {
+                    "approved": True,
+                    "reason": "admin_override",
+                    "error": str(err or ""),
+                }
+            return {
+                "approved": False,
+                "reason": "risk_model_unavailable",
+                "error": str(err or "unknown"),
+            }
+
+        result = model.evaluate(text)
+        if not result.get("approved"):
+            log.info(
+                "Goal rejected by risk model user_id=%s reason=%s goal=%r",
+                self._user_id,
+                result.get("reason"),
+                text[:120],
+            )
+        return result
 
 
 def evaluate_action(

@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Optional
 
 from atlas_glass.interview import (
@@ -23,6 +24,8 @@ _COOLDOWN_S = 45.0
 _MIN_VISION_INTERVAL_S = float(
     __import__("os").environ.get("ATLAS_GLASS_VISION_MIN_INTERVAL") or 8.0
 )
+_FRAME_TTL_S = 120.0
+_FRAME_MAXLEN = 200
 
 
 class InterviewScreenWatcher:
@@ -43,6 +46,7 @@ class InterviewScreenWatcher:
         self._last_frame_hash: tuple | str = ()
         self._last_vision_at = 0.0
         self._screen_watcher: Any = None
+        self.frames: deque[tuple[float, str]] = deque(maxlen=_FRAME_MAXLEN)
 
     def bind_screen_watcher(self, watcher: Any) -> None:
         self._screen_watcher = watcher
@@ -65,6 +69,16 @@ class InterviewScreenWatcher:
 
     def stop(self) -> None:
         self._stop.set()
+        self.frames.clear()
+
+    def _store_frame(self, frame_data: str) -> None:
+        """Keep recent captures bounded by age and count."""
+        current_time = time.time()
+        fresh = [
+            (t, f) for t, f in self.frames if current_time - t < _FRAME_TTL_S
+        ]
+        self.frames = deque(fresh, maxlen=_FRAME_MAXLEN)
+        self.frames.append((current_time, frame_data))
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -87,6 +101,7 @@ class InterviewScreenWatcher:
             b64 = None
         if not b64:
             return
+        self._store_frame(b64)
         frame_hash: tuple | str = b64[:256]
         if watcher is not None and hasattr(watcher, "_compute_hash"):
             frame_hash = watcher._compute_hash(b64)
