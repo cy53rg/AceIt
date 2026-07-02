@@ -5917,6 +5917,28 @@ class AtlasWindow(QMainWindow):
             QPoint(self.orb.width() // 2, self.orb.height() // 2),
         )
 
+    def _stop_vortex_animation(self) -> None:
+        grp = getattr(self, "_vortex_group", None)
+        if grp is not None:
+            try:
+                grp.stop()
+            except RuntimeError:
+                pass
+            self._vortex_group = None
+
+    def _clear_workspace_vortex_effect(self) -> None:
+        ws = self.workspace
+        try:
+            ws.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+        self._ws_vortex_effect = None
+        self.main_lay.setEnabled(True)
+        try:
+            self.main_lay.activate()
+        except RuntimeError:
+            pass
+
     def _run_vortex(self, collapsing: bool, on_done: Optional[Callable] = None) -> None:
         """
         Warp the workspace card into / out of the central StatusOrb.
@@ -5929,14 +5951,12 @@ class AtlasWindow(QMainWindow):
         frozen for the duration so it can't fight the geometry animation.
         """
         ws = self.workspace
-        old = getattr(self, "_vortex_group", None)
-        if old is not None:
-            old.stop()
+        self._stop_vortex_animation()
+        if not collapsing:
+            self._clear_workspace_vortex_effect()
 
-        eff = getattr(self, "_ws_vortex_effect", None)
-        if eff is None:
-            eff = QGraphicsOpacityEffect(ws)
-            self._ws_vortex_effect = eff
+        eff = QGraphicsOpacityEffect(ws)
+        self._ws_vortex_effect = eff
         ws.setGraphicsEffect(eff)
 
         # Freeze the layout so it doesn't reassert the card's geometry mid-warp.
@@ -5974,10 +5994,7 @@ class AtlasWindow(QMainWindow):
 
         def _cleanup() -> None:
             if not collapsing:
-                # Hand geometry management back to the layout and drop the effect.
-                self.main_lay.setEnabled(True)
-                self.main_lay.activate()
-                ws.setGraphicsEffect(None)
+                self._clear_workspace_vortex_effect()
             if on_done:
                 on_done()
 
@@ -6022,10 +6039,20 @@ class AtlasWindow(QMainWindow):
         )
 
     def _toggle_float(self):
-        if self._is_floating:
-            self._leave_float()
-        else:
-            self._enter_float()
+        try:
+            if self._is_floating:
+                self._leave_float()
+            else:
+                self._enter_float()
+        except RuntimeError as exc:
+            if HAS_LOGGING:
+                get_logger("atlas.ui").warning("Float mode failed: %s", exc)
+            self._stop_vortex_animation()
+            self._clear_workspace_vortex_effect()
+            self._is_floating = False
+            self.show()
+            self.raise_()
+            self.bridge.set_status.emit("  Float mode unavailable right now")
 
     def _start_pulse(self):
         self._stop_pulse()

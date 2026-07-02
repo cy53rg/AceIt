@@ -2814,7 +2814,7 @@ class StateEngine:
                     proposal = self.playbooks.check_proposal(self._session_task_goal)
                     if proposal and not self._playbook_force_fresh:
                         self._playbook_proposal = proposal
-                        self._announce(proposal["message"])
+                        self._finish_direct_response(text, proposal["message"])
                         return
 
             # ── Enrich the user input with ambient screen context ─────────────────

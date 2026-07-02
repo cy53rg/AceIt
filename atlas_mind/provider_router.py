@@ -12,6 +12,15 @@ import requests
 
 log = logging.getLogger("atlas_mind.provider_router")
 
+_GROQ_RATE_LIMIT_RETRIES = 3
+_GROQ_RATE_LIMIT_BASE_S = 2.0
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    code = getattr(exc, "status_code", None)
+    return code == 429 or "429" in msg or "rate limit" in msg or "too many requests" in msg
+
 _DEFAULT_GEMINI_MODEL = (os.environ.get("ATLAS_GEMINI_MODEL") or "gemini-2.0-flash").strip()
 _DEFAULT_OLLAMA_MODEL = (os.environ.get("ATLAS_OLLAMA_MODEL") or "llama3.2").strip()
 _OLLAMA_BASE = (os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
@@ -134,6 +143,7 @@ class ProviderRouter:
         reasoning_effort: Optional[str],
     ) -> Iterator[str]:
         from groq import Groq
+        import time
 
         client = Groq(api_key=resolve_groq_api_key())
         kwargs: dict[str, Any] = {
@@ -143,16 +153,36 @@ class ProviderRouter:
         }
         if str(model).startswith("openai/gpt-oss") and reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
-        stream = client.chat.completions.create(**kwargs)
-        for chunk in stream:
-            if not getattr(chunk, "choices", None):
-                continue
-            delta_obj = chunk.choices[0].delta
-            if getattr(delta_obj, "reasoning", None):
-                continue
-            text = delta_obj.content or ""
-            if text:
-                yield text
+
+        last_exc: Exception | None = None
+        for attempt in range(_GROQ_RATE_LIMIT_RETRIES):
+            try:
+                stream = client.chat.completions.create(**kwargs)
+                for chunk in stream:
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    delta_obj = chunk.choices[0].delta
+                    if getattr(delta_obj, "reasoning", None):
+                        continue
+                    text = delta_obj.content or ""
+                    if text:
+                        yield text
+                return
+            except Exception as exc:
+                last_exc = exc
+                if _is_rate_limit_error(exc) and attempt < _GROQ_RATE_LIMIT_RETRIES - 1:
+                    delay = _GROQ_RATE_LIMIT_BASE_S * (2 ** attempt)
+                    log.warning(
+                        "Groq rate limited; retrying in %.1fs (attempt %d/%d)",
+                        delay,
+                        attempt + 1,
+                        _GROQ_RATE_LIMIT_RETRIES,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
 
     def _stream_gemini(
         self,

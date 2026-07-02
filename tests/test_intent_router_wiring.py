@@ -166,3 +166,22 @@ def test_ordinary_chat_reaches_groq(monkeypatch):
     engine.skill_registry.execute.assert_not_called()
     assert any(t == "query_started" for t, _ in engine._events)
     assert not any(t == "command_handled" for t, _ in engine._events)
+
+
+def test_guide_playbook_proposal_releases_semaphore(monkeypatch):
+    """Guided playbook offer must not leave _query_semaphore locked."""
+    engine = _engine_with_events()
+    engine.mode = atlas_core.ModeState.GUIDED
+    engine._guide_playbook_offered = False
+    engine._playbook_force_fresh = False
+    engine.playbooks.check_proposal = MagicMock(
+        return_value={"message": "I have a saved playbook for this — use it?"},
+    )
+    finish = MagicMock(wraps=engine._finish_direct_response)
+    monkeypatch.setattr(engine, "_finish_direct_response", finish)
+
+    _run_handle_input(engine, "install docker on windows", source="user")
+
+    finish.assert_called_once()
+    assert engine._query_semaphore.acquire(blocking=False)
+    engine._query_semaphore.release()

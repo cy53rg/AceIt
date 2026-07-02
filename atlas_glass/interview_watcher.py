@@ -20,6 +20,9 @@ _DEFAULT_INTERVAL_S = float(
     __import__("os").environ.get("ATLAS_GLASS_POLL_INTERVAL") or 2.5
 )
 _COOLDOWN_S = 45.0
+_MIN_VISION_INTERVAL_S = float(
+    __import__("os").environ.get("ATLAS_GLASS_VISION_MIN_INTERVAL") or 8.0
+)
 
 
 class InterviewScreenWatcher:
@@ -37,6 +40,8 @@ class InterviewScreenWatcher:
         self._thread: Optional[threading.Thread] = None
         self._last_hash = ""
         self._last_fire_at = 0.0
+        self._last_frame_hash: tuple | str = ()
+        self._last_vision_at = 0.0
         self._screen_watcher: Any = None
 
     def bind_screen_watcher(self, watcher: Any) -> None:
@@ -82,6 +87,16 @@ class InterviewScreenWatcher:
             b64 = None
         if not b64:
             return
+        frame_hash: tuple | str = b64[:256]
+        if watcher is not None and hasattr(watcher, "_compute_hash"):
+            frame_hash = watcher._compute_hash(b64)
+        if frame_hash == self._last_frame_hash:
+            return
+        now = time.time()
+        if (now - self._last_vision_at) < _MIN_VISION_INTERVAL_S:
+            return
+        self._last_frame_hash = frame_hash
+        self._last_vision_at = now
         raw = ""
         try:
             if hasattr(watcher, "_vision_query"):
