@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "deny_substrings": [
+    "delete all files",
+    "remove all files",
+    "wipe all files",
+    "erase all files",
+    "format c:",
+    "format the drive",
+    "whole disk",
+    "entire drive",
+    "system32"
+  ],
+  "deny_regex": [
+    "\\b(delete|remove|wipe|erase|uninstall|format)\\b.*\\b(all|every|entire)\\b",
+    "\\b(rm\\s+-rf|rm\\s+-r|del\\s+/|rmdir\\s+/s)\\b",
+    "\\b(reg\\s+(add|delete|import|export)|diskpart|shutdown)\\b"
+  ]
+}
