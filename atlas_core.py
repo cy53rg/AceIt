@@ -340,6 +340,19 @@ class SessionManager:
         messages.append({"role": "user", "content": user_input})
         return messages
 
+    def build_minimal_messages(self, user_input: str) -> list[dict]:
+        """Minimal prompt for fast Q&A — no history or memory blocks."""
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are Atlas. Answer directly and concisely in 1-4 sentences. "
+                    "For math or logic, state the final answer with brief reasoning only."
+                ),
+            },
+            {"role": "user", "content": user_input},
+        ]
+
     def push_user(self, content: str) -> None:
         """Record a user turn into history."""
         self._history.append({"role": "user", "content": content})
@@ -1207,7 +1220,8 @@ class StateEngine:
                                 "normal mode", "exit interview")):
             return {"intent": "toggle_focus", "enabled": False}
         for m in self._FOCUS_WORDS:
-            if f"{m} mode" in t or t == m or (m in t and len(t.split()) <= 4):
+            # Only intercept explicit "X mode" or standalone X, not generic phrases containing X
+            if f"{m} mode" in t or t == m:
                 return {"intent": "toggle_focus", "enabled": True}
         for m in self._AMBIENT_WORDS:
             if m in t and any(w in t for w in
@@ -2548,10 +2562,9 @@ class StateEngine:
         return response
 
     def _model_health_check(self) -> None:
-        """Once per session: probe chat + vision models off the UI thread."""
+        """Once per session: probe chat model off the UI thread (skip vision — saves TPM)."""
         probes = (
             ("chat", GROQ_MODEL, False),
-            ("vision", GROQ_VISION_MODEL, True),
         )
         for role, model_id, is_vision in probes:
             if _probe_groq_model(model_id, vision=is_vision):
@@ -2596,7 +2609,7 @@ class StateEngine:
                         "text": brief,
                         "event_title": str(ctx.get("event_title") or ""),
                     })
-                self.set_copilot_mode(True)
+                # Do not auto-enable copilot — vision polling competes with fast Q&A.
             else:
                 if self.glass.active:
                     result = self.glass.end()
@@ -2627,7 +2640,7 @@ class StateEngine:
             self.mode = ModeState.INTERVIEW
             if not self.glass.active:
                 self.glass.start(title="Focus session")
-            self.set_copilot_mode(True)
+            # Copilot stays off unless user enables it — keeps Groq TPM for Q&A.
 
     # ── Account switching ──────────────────────────────────────────────────────
 
@@ -2902,6 +2915,59 @@ class StateEngine:
             except Exception as exc:
                 log.warning("Queued handle_input dispatch failed: %s", exc)
 
+    @staticmethod
+    def _debug_bypass_routing_enabled() -> bool:
+        return os.environ.get("ATLAS_DEBUG_BYPASS_ROUTING", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    def _handle_input_bypass_routing(
+        self,
+        text: str,
+        *,
+        source: str,
+        webcam_b64: Optional[str],
+    ) -> None:
+        """Skip command/tool routing interceptors and send text straight to the LLM."""
+        log.info(
+            "BYPASS_ROUTING active: skipping all interceptors, sending to LLM directly",
+        )
+        if source == "user":
+            self.audio_watcher.mark_user_typed()
+
+        acquired = self._query_semaphore.acquire(blocking=False)
+        if not acquired:
+            with self._lock:
+                self._pending_query = (text, source, webcam_b64)
+            self._emit("query_queued", {"source": source, "text": text})
+            return
+
+        try:
+            self._emit("query_started", {"source": source, "text": text})
+            if not self.session.is_active:
+                self.session.start(self.get_system_prompt())
+
+            if webcam_b64:
+                messages = self.build_messages_with_vision(
+                    user_text=text,
+                    webcam_b64=webcam_b64,
+                    screen_b64=None,
+                )
+            else:
+                messages = self.session.build_messages(text)
+
+            threading.Thread(
+                target=self._on_ai_query,
+                args=(messages, text, False),
+                daemon=True,
+                name="atlas-ai-bypass",
+            ).start()
+        except Exception as exc:
+            log.error("bypass query failed: %s", exc)
+            self._release_query_and_dispatch_pending()
+
     def handle_input(
         self,
         text:       str,
@@ -2934,6 +3000,10 @@ class StateEngine:
             self._push_context(text)
             return
 
+        if self._debug_bypass_routing_enabled():
+            self._handle_input_bypass_routing(text, source=source, webcam_b64=webcam_b64)
+            return
+
         if self.try_handle_command(text):
             self._emit("command_handled", {"text": text, "source": source})
             return
@@ -2961,6 +3031,10 @@ class StateEngine:
             self._emit("query_started", {"source": source, "text": text})
             if not self.session.is_active:
                 self.session.start(self.get_system_prompt())
+
+            if source == "highlight" or self._should_use_fast_text_query(text, source):
+                self._dispatch_fast_text_query(text)
+                return
 
             verify_mode, verify_prefix = self._try_verify_guide_step(text)
             if verify_mode == "handled":
@@ -3075,13 +3149,13 @@ class StateEngine:
                 and (
                     source == "capture"
                     or self._mentions_screen(text)
-                    or self.focus_mode
+                    or (self.focus_mode and source != "highlight")
                     or self.mode in (ModeState.INTERVIEW, ModeState.GUIDED)
                     or (
                         getattr(self, "_copilot_active", False)
                         and (
                             getattr(self, "screen_vision", False)
-                            or source in ("user", "mic", "highlight")
+                            or source in ("user", "mic")
                         )
                     )
                 )
@@ -3223,6 +3297,71 @@ class StateEngine:
             log.warning("handle_input failed before query dispatch: %s", exc)
             self._release_query_and_dispatch_pending()
             self._emit("query_failed", {"source": source, "error": str(exc)})
+
+    @staticmethod
+    def _fast_answers_enabled() -> bool:
+        return os.environ.get("ATLAS_FAST_ANSWERS", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    def _pause_background_jobs(self) -> dict[str, bool]:
+        """Pause vision polling and other background Groq consumers during fast Q&A."""
+        paused: dict[str, bool] = {}
+        watcher = getattr(self, "_interview_watcher", None)
+        if watcher is not None and watcher.running:
+            watcher.stop()
+            paused["interview_watcher"] = True
+        sw = getattr(self, "screen_watcher", None)
+        if sw is not None and sw.is_watching:
+            try:
+                sw.stop_watching()
+                paused["screen_watcher"] = True
+            except Exception:
+                pass
+        if getattr(self, "_copilot_active", False):
+            self.set_copilot_mode(False)
+            paused["copilot"] = True
+        return paused
+
+    def _resume_background_jobs(self, paused: dict[str, bool]) -> None:
+        if paused.get("copilot"):
+            self.set_copilot_mode(True)
+        if paused.get("screen_watcher"):
+            sw = getattr(self, "screen_watcher", None)
+            if sw is not None:
+                try:
+                    sw.start_watching()
+                except Exception:
+                    pass
+        if paused.get("interview_watcher"):
+            self._sync_interview_watcher()
+
+    def _should_use_fast_text_query(self, text: str, source: str) -> bool:
+        if not self._fast_answers_enabled():
+            return source == "highlight"
+        if source == "highlight":
+            return True
+        if source in ("user", "mic") and (text or "").strip():
+            t = (text or "").strip()
+            if t.startswith("/") or self._mentions_screen(t):
+                return False
+            return True
+        return False
+
+    def _dispatch_fast_text_query(self, text: str) -> None:
+        """Fast path: pause background jobs, minimal prompt, fast Groq model."""
+        self._bg_pause_state = self._pause_background_jobs()
+        self._emit("fast_query_started", {"text": text[:120]})
+        messages = self.session.build_minimal_messages((text or "").strip())
+        threading.Thread(
+            target=self._on_ai_query,
+            args=(messages, text, False),
+            kwargs={"fast_fail": True},
+            daemon=True,
+            name="atlas-fast-query",
+        ).start()
 
     def _resolve_skill(self, text: str) -> Optional[str]:
         """Match @skill_name prefix or trigger keywords."""
@@ -3469,7 +3608,14 @@ class StateEngine:
         except Exception as exc:
             log.debug("on_coordinates callback raised: %s", exc)
 
-    def _on_ai_query(self, messages: list[dict], raw_user_text: str, had_screen: bool = False) -> None:
+    def _on_ai_query(
+        self,
+        messages: list[dict],
+        raw_user_text: str,
+        had_screen: bool = False,
+        *,
+        fast_fail: bool = False,
+    ) -> None:
         """
         Execute a Groq streaming API call, pipe text deltas to the UI and to
         the TTS sentence buffer, then commit both history turns on success.
@@ -3505,7 +3651,10 @@ class StateEngine:
         # text model.  Interview Mode streams voice in short word-window chunks.
         use_vision = self._messages_have_image(messages)
         model      = GROQ_VISION_MODEL if use_vision else GROQ_MODEL
-        word_mode  = self.mode == ModeState.INTERVIEW
+        if fast_fail:
+            use_vision = False
+            model = ATLAS_FAST_MODEL
+        word_mode  = self.mode == ModeState.INTERVIEW and not fast_fail
         # Strips [[GUIDE/DO:…]] tokens from the visible/spoken stream in real time
         # and surfaces them to the action dispatcher (Section 6).
         bracket    = _StreamBracketFilter()
@@ -3531,6 +3680,7 @@ class StateEngine:
                 vision=use_vision,
                 engine=self,
                 reasoning_effort=effort,
+                fast_fail=fast_fail,
             )
             provider_announced = False
 
@@ -3568,7 +3718,7 @@ class StateEngine:
                 full_response += visible
                 sentence_buf  += visible
 
-                if word_mode:
+                if word_mode and not fast_fail:
                     words = sentence_buf.split(" ")
                     while (len(words) - 1) >= self._VOICE_WORD_CHUNK:
                         phrase = " ".join(words[: self._VOICE_WORD_CHUNK])
@@ -3583,15 +3733,14 @@ class StateEngine:
                     sentence_buf = " ".join(words)
                 else:
                     # FIX-1: Flush the TTS buffer on every sentence boundary.
-                    # A boundary is one of [.!?] followed by a space; the last
-                    # (possibly incomplete) fragment stays buffered.
-                    parts = self._SENTENCE_BOUNDARY_RE.split(sentence_buf)
-                    if len(parts) > 1:
-                        for sentence in parts[:-1]:
-                            sentence = _strip_markdown(sentence.strip())
-                            if sentence:
-                                voice_engine.speak(sentence)
-                        sentence_buf = parts[-1]
+                    if not fast_fail:
+                        parts = self._SENTENCE_BOUNDARY_RE.split(sentence_buf)
+                        if len(parts) > 1:
+                            for sentence in parts[:-1]:
+                                sentence = _strip_markdown(sentence.strip())
+                                if sentence:
+                                    voice_engine.speak(sentence)
+                            sentence_buf = parts[-1]
 
             # Release any text the bracket filter was holding at stream end.
             tail, tail_tokens = bracket.flush()
@@ -3617,9 +3766,10 @@ class StateEngine:
                 sentence_buf  += tail
 
             # FIX-1: Speak any residual text left in the buffer after stream end.
-            residual = _strip_markdown(sentence_buf.strip())
-            if residual:
-                voice_engine.speak(residual)
+            if not fast_fail:
+                residual = _strip_markdown(sentence_buf.strip())
+                if residual:
+                    voice_engine.speak(residual)
 
             # After inline research, continue the guided walkthrough if the model
             # stopped after emitting [[RESEARCH:]] with little visible prose.
@@ -3673,28 +3823,38 @@ class StateEngine:
                     self._on_token_usage(usage)
                 except Exception as exc:
                     log.debug("on_token_usage callback raised: %s", exc)
-                # Single cognition pipeline: on_turn_complete extracts durable
-                # facts (with reinforcement) AND drives persona-drift checks on
-                # one daemon thread — no duplicate extraction call.
-                self._schedule_learning_on_turn_complete(raw_user_text, full_response)
-                self.memory.record_takeaway_from_turn(
-                    self.user_id,
-                    raw_user_text,
-                    full_response,
-                    user_goal_hint=getattr(self, "_last_turn_goal_hint", ""),
-                )
-                if self.active_skill:
-                    skill = self.active_skill
-                    threading.Thread(
-                        target=self._evaluate_skill,
-                        args=(raw_user_text, full_response, skill),
-                        daemon=True,
-                    ).start()
+                if not fast_fail:
+                    self._schedule_learning_on_turn_complete(raw_user_text, full_response)
+                    self.memory.record_takeaway_from_turn(
+                        self.user_id,
+                        raw_user_text,
+                        full_response,
+                        user_goal_hint=getattr(self, "_last_turn_goal_hint", ""),
+                    )
+                    if self.active_skill:
+                        skill = self.active_skill
+                        threading.Thread(
+                            target=self._evaluate_skill,
+                            args=(raw_user_text, full_response, skill),
+                            daemon=True,
+                        ).start()
 
             try:
                 self._on_complete(full_response)
             except Exception as exc:
                 log.debug("on_complete callback raised: %s", exc)
+
+            if not full_response.strip() and not first_chunk_received:
+                try:
+                    from atlas_interaction import friendly_error
+                    self._on_error(
+                        friendly_error(
+                            "api",
+                            "No response from Groq — rate limit or timeout. Wait 30s and retry.",
+                        )
+                    )
+                except Exception as cb_exc:
+                    log.debug("on_error callback raised: %s", cb_exc)
 
         except Exception as exc:
             log.error("_on_ai_query: Groq stream error: %s", exc)
@@ -3705,6 +3865,10 @@ class StateEngine:
             except Exception as cb_exc:
                 log.debug("on_error callback raised: %s", cb_exc)
         finally:
+            if fast_fail:
+                self._resume_background_jobs(getattr(self, "_bg_pause_state", {}) or {})
+                self._bg_pause_state = {}
+                self._emit("fast_query_done", {})
             # FIX-2: Always release the semaphore so the next query can proceed.
             self._release_query_and_dispatch_pending()
 

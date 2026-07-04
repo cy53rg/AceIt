@@ -74,6 +74,7 @@ class ProviderRouter:
         vision: bool = False,
         engine: Any = None,
         reasoning_effort: Optional[str] = None,
+        fast_fail: bool = False,
     ) -> Iterator[str]:
         errors: list[str] = []
         if resolve_groq_api_key(engine):
@@ -84,12 +85,15 @@ class ProviderRouter:
                     reasoning_effort=reasoning_effort,
                     vision=vision,
                     engine=engine,
+                    fast_fail=fast_fail,
                 ):
                     self._last_provider = "groq"
                     yield chunk
                 return
             except Exception as exc:
                 errors.append(f"Groq: {exc}")
+                if fast_fail:
+                    raise RuntimeError(errors[-1]) from exc
                 log.warning("Groq stream failed, trying fallback: %s", exc)
 
         if resolve_openrouter_api_key() and not vision:
@@ -145,6 +149,7 @@ class ProviderRouter:
         reasoning_effort: Optional[str],
         vision: bool = False,
         engine: Any = None,
+        fast_fail: bool = False,
     ) -> Iterator[str]:
         import time
 
@@ -166,9 +171,12 @@ class ProviderRouter:
         }
         if str(model).startswith("openai/gpt-oss") and reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
+        if "qwen" in str(model).lower():
+            kwargs["reasoning_format"] = "hidden"
 
         last_exc: Exception | None = None
-        for attempt in range(_GROQ_RATE_LIMIT_RETRIES):
+        max_attempts = 1 if fast_fail else _GROQ_RATE_LIMIT_RETRIES
+        for attempt in range(max_attempts):
             try:
                 stream = groq_completions_create(client, **kwargs)
                 for chunk in stream:
@@ -191,7 +199,7 @@ class ProviderRouter:
                 last_exc = exc
                 if engine is not None and hasattr(engine, "_record_groq_failure"):
                     engine._record_groq_failure(exc)
-                if _is_rate_limit_error(exc) and attempt < _GROQ_RATE_LIMIT_RETRIES - 1:
+                if _is_rate_limit_error(exc) and attempt < max_attempts - 1:
                     delay = _GROQ_RATE_LIMIT_BASE_S * (2 ** attempt)
                     log.warning(
                         "Groq rate limited; retrying in %.1fs (attempt %d/%d)",
@@ -351,7 +359,7 @@ class ProviderRouter:
             f"{_OLLAMA_BASE}/api/chat",
             json=payload,
             stream=True,
-            timeout=120,
+            timeout=8,
         )
         resp.raise_for_status()
         for line in resp.iter_lines(decode_unicode=True):

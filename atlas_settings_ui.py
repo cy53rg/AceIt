@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -154,6 +155,13 @@ class SettingsDialog(QDialog):
         row.addStretch()
         row.addWidget(done)
         outer.addLayout(row)
+
+        close_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        close_shortcut.activated.connect(self.hide)
+
+    def closeEvent(self, event) -> None:
+        event.accept()
+        self.hide()
 
     def show_tab(self, index: int) -> None:
         self.tabs.setCurrentIndex(index)

@@ -38,6 +38,28 @@ _dispatcher = None
 _playbooks = None
 _file_indexer = None
 _ui_bridge: Optional["UIBridge"] = None
+_query_status_lock = threading.Lock()
+_query_status: dict[str, Any] = {
+    "status": "idle",
+    "text": "",
+    "error": "",
+    "updated_at": 0.0,
+}
+
+
+def _set_query_status(status: str, *, text: str = "", error: str = "") -> None:
+    with _query_status_lock:
+        _query_status.update({
+            "status": status,
+            "text": text,
+            "error": error,
+            "updated_at": time.time(),
+        })
+
+
+def _get_query_status() -> dict[str, Any]:
+    with _query_status_lock:
+        return dict(_query_status)
 
 
 async def _daemon_websocket_endpoint(websocket) -> None:
@@ -206,9 +228,11 @@ def _init_services(user_name: str = "default") -> None:
         _ui_bridge.broadcast({"type": "chunk", "text": text})
 
     def _on_complete(text: str) -> None:
+        _set_query_status("complete", text=text)
         _ui_bridge.broadcast({"type": "complete", "text": text})
 
     def _on_error(text: str) -> None:
+        _set_query_status("error", error=text)
         _ui_bridge.broadcast({"type": "error", "text": text})
 
     def _on_coordinates(coord: dict) -> None:
@@ -248,6 +272,10 @@ def _init_services(user_name: str = "default") -> None:
     set_policy_context_provider(_policy_ctx)
 
     def _on_state_event(event_type: str, payload: dict) -> None:
+        if event_type == "query_started":
+            _set_query_status("running")
+        elif event_type in ("query_failed", "query_rejected"):
+            _set_query_status("error", error=str(payload.get("error") or payload.get("reason") or ""))
         _ui_bridge.broadcast({
             "type": "state_event",
             "event_type": event_type,
@@ -520,6 +548,10 @@ def create_app():
             "apscheduler_ready": _apscheduler is not None,
         }
 
+    @app.get("/api/query_status")
+    def query_status():
+        return _get_query_status()
+
     @app.post("/api/handle_input")
     def api_handle_input(body: dict):
         if _state is None:
@@ -532,14 +564,9 @@ def create_app():
         screen_b64 = body.get("screen_b64")
         if screen_b64:
             _state.inject_screen_capture(screen_b64)
-        if source == "highlight" and _state.glass.active:
-            target = _state.handle_glass_interview_question
-            thread_args: tuple = (text,)
-            thread_kwargs = {"source": "highlight"}
-        else:
-            target = _state.handle_input
-            thread_args = (text,)
-            thread_kwargs = {"source": source, "webcam_b64": webcam_b64}
+        target = _state.handle_input
+        thread_args: tuple = (text,)
+        thread_kwargs = {"source": source, "webcam_b64": webcam_b64}
         threading.Thread(
             target=target,
             args=thread_args,

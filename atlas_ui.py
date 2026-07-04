@@ -2899,6 +2899,7 @@ class AtlasWindow(QMainWindow):
         self.copilot_active       = False
         self.watch_active       = False
         self.highlight_active   = False
+        self._watch_paused_for_query = False
         self.stealth_active     = False
         self._stealth_before_interview = False
         self._interview_headphone_shown = False
@@ -2912,6 +2913,7 @@ class AtlasWindow(QMainWindow):
         self._typed_confirm_answer = False
         self._approval_lock = threading.Lock()
         self._permission_dialog_open = False
+        self._query_watchdog: QTimer | None = None
 
         if self.state:
             try:
@@ -3177,7 +3179,6 @@ class AtlasWindow(QMainWindow):
             f"QPushButton#profile_btn:hover {{ background: {PAL['text']}; }}")
         self.btn_profile.clicked.connect(self._show_profile_menu)
         hdr_lay.addWidget(self.btn_profile)
-        self.header.installEventFilter(self)
         self.header.setStyleSheet(
             f"QFrame#titlebar {{ background: rgba(14,14,16,0.94); "
             f"border: 1px solid {PAL['border']}; border-radius: 8px; }}"
@@ -3588,10 +3589,59 @@ class AtlasWindow(QMainWindow):
         self._interaction_source = source
         self._stop_gen.clear()
         self._stream_start_ts = time.time()
+        already_active = self._is_streaming
         self._is_streaming = True
         self.lock_mouse_capture(False)
         self.unsetCursor()
-        self.bridge.start_thinking.emit()
+        if not already_active:
+            self.bridge.start_thinking.emit()
+        self._arm_query_watchdog()
+
+    def _arm_query_watchdog(self, timeout_ms: int = 45000) -> None:
+        if self._query_watchdog is None:
+            self._query_watchdog = QTimer(self)
+            self._query_watchdog.setSingleShot(True)
+            self._query_watchdog.timeout.connect(self._on_query_watchdog_timeout)
+        self._query_watchdog.stop()
+        self._query_watchdog.start(timeout_ms)
+
+    def _disarm_query_watchdog(self) -> None:
+        if self._query_watchdog is not None:
+            self._query_watchdog.stop()
+
+    def _on_query_watchdog_timeout(self) -> None:
+        if not self._is_streaming:
+            return
+        if self.state:
+            try:
+                self.state.cancel_current()
+            except Exception:
+                pass
+        self._finish_query_with_error(
+            "Request timed out — Groq may be rate-limited or the daemon lost connection. "
+            "Wait ~30s and try again."
+        )
+
+    def _append_chat_error(self, message: str) -> None:
+        clean = (message or "").strip()
+        if not clean:
+            return
+        if not clean.startswith("⚠"):
+            clean = f"⚠ {clean}"
+        msg = self.chat_view.add_message("assistant", clean)
+        self._chat_messages.append(msg)
+
+    def _finish_query_with_error(self, message: str) -> None:
+        self._append_chat_error(message)
+        self._release_companion_mode(
+            error=message if message.startswith("⚠") else f"⚠ {message}",
+            finalize_thinking=True,
+            show_error_in_chat=False,
+        )
+
+    def _hide_settings_for_capture(self) -> None:
+        if self.settings_dialog and self.settings_dialog.isVisible():
+            self.settings_dialog.hide()
 
     def _sync_companion_visual_idle(self) -> None:
         """Return orb/accent/float bubble to idle when nothing is active."""
@@ -3612,6 +3662,7 @@ class AtlasWindow(QMainWindow):
         status: str = "Atlas online",
         error: str = "",
         finalize_thinking: bool = True,
+        show_error_in_chat: bool = True,
     ) -> None:
         """
         Gracefully exit an interaction — non-obstructive companion layer restored.
@@ -3619,6 +3670,7 @@ class AtlasWindow(QMainWindow):
         Clears streaming flags, mouse capture lock, and stray cursors so the
         desktop passthrough layer behaves correctly after every turn.
         """
+        self._disarm_query_watchdog()
         self._is_streaming = False
         self._md_ai_streaming = False
         self._md_ai_buffer = ""
@@ -3632,6 +3684,8 @@ class AtlasWindow(QMainWindow):
             self.thinking_bar.hide()
             self.bridge.thinking_done.emit()
         if error:
+            if show_error_in_chat:
+                self._append_chat_error(error)
             self.bridge.set_status.emit(f"  {error}")
             self._show_pill(error[:72])
         else:
@@ -3646,7 +3700,7 @@ class AtlasWindow(QMainWindow):
     def _on_interaction_error(self, msg: str) -> None:
         from atlas_interaction import friendly_error
         text = msg if msg.startswith("⚠") or "Couldn't" in msg else friendly_error("api", msg)
-        self._release_companion_mode(error=f"⚠ {text.lstrip('⚠ ')}", finalize_thinking=True)
+        self._finish_query_with_error(text.lstrip("⚠ ").strip() or "Something went wrong.")
 
     def _install_resize_tracking(self) -> None:
         """Edge resize works on child widgets, not only the bare window rect."""
@@ -3664,6 +3718,12 @@ class AtlasWindow(QMainWindow):
         if self._is_floating:
             return False
         et = event.type()
+        if et not in (
+            QEvent.MouseButtonPress,
+            QEvent.MouseMove,
+            QEvent.MouseButtonRelease,
+        ):
+            return False
         local = self._map_event_to_window(obj, event)
         if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
             edge = self._resize_edge_at(local)
@@ -3684,7 +3744,11 @@ class AtlasWindow(QMainWindow):
         return False
 
     def eventFilter(self, obj, event) -> bool:
-        if obj in (self.root_widget, self.workspace) and self._handle_resize_event(obj, event):
+        resize_targets = [
+            w for w in (getattr(self, "root_widget", None), getattr(self, "workspace", None))
+            if w is not None
+        ]
+        if obj in resize_targets and self._handle_resize_event(obj, event):
             return True
         if obj is getattr(self, "header", None):
             et = event.type()
@@ -4455,22 +4519,41 @@ class AtlasWindow(QMainWindow):
                 self.bridge.set_status.emit("Thinking…")
 
             QTimer.singleShot(0, _start_query)
+        elif event_type == "fast_query_started":
+            def _pause_ui_background() -> None:
+                self._watch_paused_for_query = bool(getattr(self, "watch_active", False))
+                if self._watch_paused_for_query:
+                    self._stop_watch()
+
+            QTimer.singleShot(0, _pause_ui_background)
+        elif event_type == "fast_query_done":
+            def _resume_ui_background() -> None:
+                if getattr(self, "_watch_paused_for_query", False):
+                    self._watch_paused_for_query = False
+                    self._start_watch()
+
+            QTimer.singleShot(0, _resume_ui_background)
         elif event_type == "command_handled":
             QTimer.singleShot(0, lambda: self._release_companion_mode(
                 status="Done ✓",
                 finalize_thinking=False,
             ))
-        elif event_type == "query_rejected":
-            from atlas_interaction import friendly_error
-            QTimer.singleShot(0, lambda: self._release_companion_mode(
-                error=f"⚠ {friendly_error('busy')}",
-            ))
         elif event_type == "query_failed":
             from atlas_interaction import friendly_error
             err = str(payload.get("error", ""))
-            QTimer.singleShot(0, lambda e=err: self._release_companion_mode(
-                error=f"⚠ {friendly_error('generic', e)}",
-            ))
+            msg = friendly_error("generic", err)
+
+            def _fail(e: str = msg) -> None:
+                self._finish_query_with_error(e)
+
+            QTimer.singleShot(0, _fail)
+        elif event_type == "query_rejected":
+            from atlas_interaction import friendly_error
+
+            def _reject() -> None:
+                self._finish_query_with_error(friendly_error("busy"))
+
+            QTimer.singleShot(0, _reject)
         elif event_type == "session_reset":
             QTimer.singleShot(0, self._on_session_reset)
         elif event_type == "playbook_proposal":
@@ -4778,6 +4861,7 @@ class AtlasWindow(QMainWindow):
                 self.state.inject_screen_capture(screen_b64)
             if not self.chat_composer.tts_enabled_for_next() and voice_engine:
                 voice_engine.flush()
+            self._begin_interaction("user")
             threading.Thread(
                 target=self.state.handle_input,
                 args=(text,),
@@ -4818,6 +4902,11 @@ class AtlasWindow(QMainWindow):
 
     @Slot(str)
     def _on_stream_complete_slot(self, full_text: str) -> None:
+        if not (full_text or "").strip():
+            self._finish_query_with_error(
+                "No answer returned — Groq may be rate-limited. Wait ~30s and try again."
+            )
+            return
         elapsed = time.time() - self._stream_start_ts if self._stream_start_ts else 0.0
         step_idx = None
         stream_card = getattr(self.chat_view, "_streaming_card", None)
@@ -4977,6 +5066,7 @@ class AtlasWindow(QMainWindow):
         self._attach_path(path)
 
     def _on_composer_screenshot(self) -> None:
+        self._hide_settings_for_capture()
         try:
             from atlas_core import capture_screen_b64_str
             b64 = capture_screen_b64_str()
@@ -5180,9 +5270,17 @@ class AtlasWindow(QMainWindow):
 
     def _open_settings(self) -> None:
         if self.settings_dialog:
+            if self.settings_dialog.isVisible():
+                self.settings_dialog.hide()
+                return
             self.settings_dialog.show()
             self.settings_dialog.raise_()
             self.settings_dialog.activateWindow()
+
+    def hideEvent(self, event) -> None:
+        if self.settings_dialog and self.settings_dialog.isVisible():
+            self.settings_dialog.hide()
+        super().hideEvent(event)
 
     def _open_settings_skills_tab(self) -> None:
         if self.settings_dialog:
@@ -5759,6 +5857,7 @@ class AtlasWindow(QMainWindow):
     # ═════════════════════════════════════════════════════════════════════════
 
     def _do_capture(self):
+        self._hide_settings_for_capture()
         self.hide()
         self.lock_mouse_capture(False)
         self.bridge.set_status.emit("📷 Capturing screen…")
@@ -5842,20 +5941,15 @@ class AtlasWindow(QMainWindow):
             self._last_clipboard = text
             self._append_user_bubble(f"[clipboard] {text[:120]}…")
             if self.state:
-                if getattr(self.state, "glass", None) and self.state.glass.active:
-                    threading.Thread(
-                        target=self.state.handle_glass_interview_question,
-                        args=(text,),
-                        kwargs={"source": "highlight"},
-                        daemon=True,
-                    ).start()
-                else:
-                    threading.Thread(
-                        target=self.state.handle_input,
-                        args=(text,),
-                        kwargs={"source": "highlight"},
-                        daemon=True,
-                    ).start()
+                self._begin_interaction("highlight")
+                self.bridge.set_status.emit("Answering highlighted question…")
+                # Clipboard text is the question — use text path, not vision interview.
+                threading.Thread(
+                    target=self.state.handle_input,
+                    args=(text,),
+                    kwargs={"source": "highlight"},
+                    daemon=True,
+                ).start()
 
     # ═════════════════════════════════════════════════════════════════════════
     # SCREEN WATCHER

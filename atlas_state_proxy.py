@@ -173,6 +173,8 @@ class AtlasStateProxy:
         self._safety_session_ok = False
         self._safety_prompt: Callable[[str], bool] | None = None
         self._task_confirm_cb: Callable[[str], bool] | None = None
+        self._query_resolved = False
+        self._query_poll_stop = threading.Event()
         client.on_message(self._on_ws_message)
         self._refresh_session()
 
@@ -212,10 +214,12 @@ class AtlasStateProxy:
         if msg_type == "chunk":
             self._on_chunk(str(msg.get("text", "")))
         elif msg_type == "complete":
-            self._on_complete(str(msg.get("text", "")))
-            self._refresh_session()
+            if self._mark_query_resolved():
+                self._on_complete(str(msg.get("text", "")))
+                self._refresh_session()
         elif msg_type == "error":
-            self._on_error(str(msg.get("text", "")))
+            if self._mark_query_resolved():
+                self._on_error(str(msg.get("text", "")))
         elif msg_type == "coordinates":
             self._on_coordinates(dict(msg.get("coord") or {}))
         elif msg_type == "token_usage":
@@ -248,6 +252,35 @@ class AtlasStateProxy:
             self._handle_task_confirm(msg)
         elif msg_type == "step_done_wait":
             self._handle_step_done_wait(msg)
+
+    def _mark_query_resolved(self) -> bool:
+        if self._query_resolved:
+            return False
+        self._query_resolved = True
+        self._query_poll_stop.set()
+        return True
+
+    def _poll_query_fallback(self) -> None:
+        """HTTP fallback when WebSocket chunks are lost during reconnect."""
+        deadline = time.time() + 90.0
+        while time.time() < deadline and not self._query_poll_stop.is_set():
+            if self._query_resolved:
+                return
+            try:
+                st = self._client.get_query_status()
+            except Exception:
+                time.sleep(0.4)
+                continue
+            status = str(st.get("status") or "idle")
+            if status == "complete" and self._mark_query_resolved():
+                self._on_complete(str(st.get("text") or ""))
+                self._refresh_session()
+                return
+            if status == "error" and self._mark_query_resolved():
+                err = str(st.get("error") or st.get("text") or "Query failed")
+                self._on_error(err)
+                return
+            time.sleep(0.4)
 
     def _handle_permission(self, msg: dict) -> None:
         approved = False
@@ -349,8 +382,16 @@ class AtlasStateProxy:
         clean = (text or "").strip()
         if not clean:
             return
-        self.audio_watcher.mark_user_typed()
+        if source == "user":
+            self.audio_watcher.mark_user_typed()
+        self._query_resolved = False
+        self._query_poll_stop.clear()
         self._client.handle_input(clean, source, webcam_b64=webcam_b64)
+        threading.Thread(
+            target=self._poll_query_fallback,
+            daemon=True,
+            name="atlas-query-poll",
+        ).start()
 
     def cancel_current(self) -> None:
         self._client.cancel_current()

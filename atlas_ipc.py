@@ -272,10 +272,20 @@ class DaemonClient:
 
     def _ws_loop(self) -> None:
         url = self.base_url.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
+        backoff = 1.0
         while not self._ws_stop.is_set():
             try:
-                ws = websocket.create_connection(url, timeout=5)
+                try:
+                    ws = websocket.create_connection(
+                        url,
+                        timeout=10,
+                        ping_interval=20,
+                        ping_timeout=10,
+                    )
+                except TypeError:
+                    ws = websocket.create_connection(url, timeout=10)
                 self._ws = ws
+                backoff = 1.0
                 while not self._ws_stop.is_set():
                     raw = ws.recv()
                     if not raw:
@@ -288,7 +298,8 @@ class DaemonClient:
             except Exception:
                 self._ws = None
                 if not self._ws_stop.is_set():
-                    time.sleep(1.0)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 1.5, 5.0)
             finally:
                 self._ws = None
 
@@ -347,6 +358,12 @@ class DaemonClient:
 
     def cancel_current(self) -> None:
         self._post("/api/cancel")
+
+    def get_query_status(self) -> dict:
+        try:
+            return dict(self._get("/api/query_status") or {})
+        except Exception:
+            return {"status": "idle", "text": "", "error": ""}
 
     def stop_voice(self) -> None:
         """Stop daemon TTS and cancel any in-flight generation."""
